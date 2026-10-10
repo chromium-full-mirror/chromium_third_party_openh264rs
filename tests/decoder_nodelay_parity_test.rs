@@ -1,0 +1,238 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+//! `DecodeFrameNoDelay` is a different entry point from `DecodeFrame2`.
+//!
+//! `welsDecoderExt.cpp:720–725`, the whole of the single-threaded body:
+//!
+//! ```c
+//! iRet  = DecodeFrame2 (kpSrc, kiSrcLen, ppDst, pDstInfo);
+//! iRet |= DecodeFrame2 (NULL, 0, ppDst, pDstInfo);
+//! ```
+//!
+//! The second call is what "no delay" means: it forces reconstruction so the caller
+//! gets its frame on the call that fed the access unit.
+//!
+//! The flow is an annex-B split, `ERROR_CON_SLICE_COPY`, one NAL per call, EOS, a final
+//! `DecodeFrameNoDelay(NULL, 0)`, then `FlushFrame` for what `GetOption` reports
+//! remaining, capped at 24.
+//!
+//! `Error_I_P.264` emits one frame here against `DecodeFrame2`'s five, and
+//! `QCIF_2P_I_allIPCM.264` two against a different call pattern: when the first call
+//! emits a picture and the second does not, the second call's `iBufferStatus = 0`
+//! overwrites it and the frame is lost to that caller.
+
+use openh264rs::api::codec_api::*;
+use openh264rs::split_annexb_units;
+
+#[path = "common/mod.rs"]
+mod common;
+use common::Sha1Hasher;
+
+/// `(asset, frames, first-frame dims, sha1 over every emitted plane, codes, buffer
+/// statuses)`.
+struct Row {
+    asset: &'static str,
+    frames: usize,
+    dims: (i32, i32),
+    sha1: &'static str,
+    codes: &'static [i32],
+    bufs: &'static [i32],
+}
+
+/// Diversity over the axes that change emission timing: CAVLC, CABAC with B-frames, a
+/// one-macroblock frame, all-IPCM, and the resolution-change stream.
+const ROWS: &[Row] = &[
+    Row {
+        asset: "BA_MW_D.264",
+        frames: 100,
+        dims: (176, 144),
+        sha1: "afd7a9765961ca241bb4bdf344b31397bec7465a",
+        codes: &[0; 103],
+        bufs: &[
+            0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+        ],
+    },
+    Row {
+        asset: "Cisco_Men_whisper_640x320_CABAC_Bframe_9.264",
+        frames: 9,
+        dims: (640, 320),
+        sha1: "2b349c1bc806b6e0412008747b2463d77b576476",
+        codes: &[0; 20],
+        bufs: &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+    },
+    Row {
+        asset: "narrow_16x16.264",
+        frames: 24,
+        dims: (16, 16),
+        sha1: "6299ce8a7dc8a86d367dca65ca123eb499fc5ca8",
+        codes: &[0; 31],
+        bufs: &[
+            0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+            1, 0,
+        ],
+    },
+    Row {
+        asset: "QCIF_2P_I_allIPCM.264",
+        frames: 2,
+        dims: (176, 144),
+        sha1: "8724c0866ebdba7ebb7209a0c0c3ae3ae38a0240",
+        codes: &[0; 7],
+        bufs: &[0, 0, 0, 0, 0, 1, 1],
+    },
+    Row {
+        asset: "Error_I_P.264",
+        frames: 1,
+        dims: (640, 480),
+        sha1: "5c1f742798b2c1061cb83ab2f2cddd7929b2fb4e",
+        codes: &[
+            0x0, 0x0, 0x0, 0x20, 0x0, 0x0, 0x20, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x20, 0x20, 0x20,
+            0x0,
+        ],
+        bufs: &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+];
+
+/// Drives one asset through `DecodeFrameNoDelay`.
+///
+/// # Safety
+/// Uses the C ABI as a consumer does; every pointer is valid for its call.
+unsafe fn nodelay_row(data: &[u8]) -> (usize, (i32, i32), String, Vec<i32>, Vec<i32>) {
+    unsafe {
+        let mut dec: *mut ISVCDecoder = std::ptr::null_mut();
+        assert_eq!(WelsCreateDecoder(&mut dec), CM_RESULT_SUCCESS as i64);
+        let mut param = SDecodingParam::default();
+        param.uiTargetDqLayer = u8::MAX;
+        param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+        assert_eq!(
+            ISVCDecoder::Initialize(dec, &param as *const SDecodingParam),
+            CM_RESULT_SUCCESS as i64
+        );
+
+        let mut hasher = Sha1Hasher::new();
+        let mut frames = 0usize;
+        let mut first = (0i32, 0i32);
+        let mut codes = Vec::new();
+        let mut bufs = Vec::new();
+
+        let take = |info: &SBufferInfo,
+                    dst: [*mut u8; 3],
+                    hasher: &mut Sha1Hasher,
+                    frames: &mut usize,
+                    first: &mut (i32, i32)| {
+            if info.iBufferStatus != 1 {
+                return;
+            }
+            let sys = *info.UsrData.sys();
+            let (w, h) = (sys.iWidth as usize, sys.iHeight as usize);
+            let (sy, suv) = (sys.iStride[0] as usize, sys.iStride[1] as usize);
+            let mut plane = |p: *mut u8, w: usize, h: usize, stride: usize| {
+                if p.is_null() || w == 0 || h == 0 || stride == 0 {
+                    return;
+                }
+                for row in 0..h {
+                    hasher.update(std::slice::from_raw_parts(p.add(row * stride), w));
+                }
+            };
+            plane(dst[0], w, h, sy);
+            plane(dst[1], w / 2, h / 2, suv);
+            plane(dst[2], w / 2, h / 2, suv);
+            *frames += 1;
+            if first.0 == 0 {
+                *first = (sys.iWidth, sys.iHeight);
+            }
+        };
+
+        for unit in split_annexb_units(data) {
+            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
+            let mut info = SBufferInfo::default();
+            let st = ISVCDecoder::DecodeFrameNoDelay(
+                dec,
+                unit.as_ptr(),
+                unit.len() as i32,
+                dst.as_mut_ptr(),
+                &mut info,
+            );
+            codes.push(st.0);
+            bufs.push(info.iBufferStatus);
+            take(&info, dst, &mut hasher, &mut frames, &mut first);
+        }
+
+        let mut eos = 1i32;
+        ISVCDecoder::SetOption(
+            dec,
+            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
+            &mut eos as *mut i32 as *mut std::ffi::c_void,
+        );
+        {
+            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
+            let mut info = SBufferInfo::default();
+            let st = ISVCDecoder::DecodeFrameNoDelay(
+                dec,
+                std::ptr::null(),
+                0,
+                dst.as_mut_ptr(),
+                &mut info,
+            );
+            codes.push(st.0);
+            bufs.push(info.iBufferStatus);
+            take(&info, dst, &mut hasher, &mut frames, &mut first);
+        }
+
+        let mut remaining = 0i32;
+        ISVCDecoder::GetOption(
+            dec,
+            DECODER_OPTION::DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER,
+            &mut remaining as *mut i32 as *mut std::ffi::c_void,
+        );
+        for _ in 0..remaining.clamp(0, 24) {
+            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
+            let mut info = SBufferInfo::default();
+            let st = ISVCDecoder::FlushFrame(dec, dst.as_mut_ptr(), &mut info);
+            codes.push(st.0);
+            bufs.push(info.iBufferStatus);
+            take(&info, dst, &mut hasher, &mut frames, &mut first);
+        }
+
+        ISVCDecoder::Uninitialize(dec);
+        WelsDestroyDecoder(dec);
+        (frames, first, hasher.digest(), codes, bufs)
+    }
+}
+
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn decode_frame_no_delay_matches_the_reference_on_every_axis() {
+    for row in ROWS {
+        let data = common::read_stream(row.asset);
+        let (frames, dims, sha1, codes, bufs) = unsafe { nodelay_row(&data) };
+        // Counts before hashes: a mismatch whose count also moved is a different
+        // defect from one whose count held.
+        assert_eq!(frames, row.frames, "{}: emitted frame count", row.asset);
+        assert_eq!(
+            dims, row.dims,
+            "{}: first emitted frame's dimensions",
+            row.asset
+        );
+        assert_eq!(
+            codes, row.codes,
+            "{}: DecodeFrameNoDelay return codes, in call order",
+            row.asset
+        );
+        assert_eq!(
+            bufs, row.bufs,
+            "{}: iBufferStatus, in call order",
+            row.asset
+        );
+        assert_eq!(
+            sha1, row.sha1,
+            "{}: SHA-1 over every emitted plane",
+            row.asset
+        );
+    }
+}

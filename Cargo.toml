@@ -1,0 +1,191 @@
+[package]
+name = "openh264rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of Cisco OpenH264 (H.264/AVC encoder and decoder)"
+license = "BSD-3-Clause AND BSD-2-Clause"
+readme = "README.md"
+repository = "https://chromium.googlesource.com/chromium/third_party/openh264rs"
+
+# `rlib` is what the tests and benches link; `cdylib` is what a C consumer `dlopen`s,
+# exporting exactly upstream's seven symbols; `staticlib` is the same object set for a
+# consumer that links rather than loads.
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+cxx = { version = "1.0", optional = true }
+
+[build-dependencies]
+cxx-build = { version = "1.0", optional = true }
+
+[features]
+default = ["c-api", "cxx-api"]
+# Raw C ABI vtables (`ISVCEncoderVtbl`, `ISVCDecoderVtbl`), thunks, and `#[no_mangle]`
+# exports (`WelsCreateSVCEncoder`, `WelsCreateDecoder`, etc.) matching `codec_api.h`.
+c-api = []
+# Self-contained C++ bridge generated via `cxx` under `namespace openh264rs`.
+cxx-api = ["dep:cxx", "dep:cxx-build"]
+# The scalar build. The reference has no runtime way to turn its SIMD off, so this is
+# that switch: it points `simd::kernels` at `src/simd/scalar/`, which forwards every
+# entry point to the scalar body, and clears the feature word so the `pfXxx` tables
+# install the scalar directly.
+scalar = []
+
+[[bench]]
+name = "encode_bench"
+harness = false
+required-features = ["c-api"]
+
+# Per-kernel scalar / intrinsics timing.
+[[bench]]
+name = "kernel_bench"
+harness = false
+
+[[bench]]
+name = "decode_1080p_bench"
+harness = false
+required-features = ["c-api"]
+
+[[test]]
+name = "api_lifecycle_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "api_param_bounds_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_conformance_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_error_reporting_parity"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_nodelay_parity_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_numref_change_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_options_parity_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_parseonly_parity_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_reachability_sweep"
+required-features = ["c-api"]
+
+[[test]]
+name = "decoder_resolution_change_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "e2e_conformance_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "encode_options_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "encoder_force_idr_ltr_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "encoder_preprocess_plugins_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "error_concealment_api_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "loopback_sha1_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "ltr_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "malformed_stream_parity"
+required-features = ["c-api"]
+
+[[test]]
+name = "multithread_decoder_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "multithread_encoder_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "simple_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "trace_callback_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "trace_default_sink_test"
+required-features = ["c-api"]
+
+# This is a DSP codec, and unoptimised it decodes like one: at Cargo's default
+# `opt-level = 0` a single 1280x720 CABAC conformance asset took 62s, and the large
+# `VID_*_temporal_direct` streams were the whole of the debug suite's tail. `opt-level =
+# 3` cuts that to 4.5s for a few seconds of extra build time.
+#
+# Both check flags stay on, and they are the reason a debug test run exists at all:
+# `overflow-checks` turns a C++ signed overflow into a loud Rust panic, and
+# `debug-assertions` keeps the `debug_assert!` sites live. They cost about 1.4x against
+# release — cost worth keeping, and never to be traded away for speed.
+#
+# `[profile.bench]` inherits from `release`, not from here, so benchmark numbers are
+# untouched. `rust_enc` is its own workspace root with its own identical profile.
+#
+# One consequence to watch: a debug build running at near-release speed widens every
+# thread window, so a load-sensitive race that the old pace held shut can appear here.
+# `multithread_decoder_test` is the exposed surface.
+[profile.dev]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+
+# Clippy lints that argue with C-shaped code: index loops, wide signatures, C-shaped
+# conditionals and declaration-before-assignment.
+[lints.clippy]
+needless_range_loop = "allow"
+collapsible_if = "allow"
+too_many_arguments = "allow"
+manual_range_contains = "allow"
+derivable_impls = "allow"
+field_reassign_with_default = "allow"
+identity_op = "allow"
+missing_safety_doc = "allow"
+needless_late_init = "allow"
+manual_is_multiple_of = "allow"
+int_plus_one = "allow"
+explicit_counter_loop = "allow"
+neg_multiply = "allow"
+if_same_then_else = "allow"
+type_complexity = "allow"
+# `drop()` here ends a borrow so the next statement can reborrow; the type not
+# being Drop is the point, not a mistake.
+drop_non_drop = "allow"
+# The explicit zero-guard is deliberate; `Result<_, ()>` is right when the only
+# failure is an allocation; boxing the big variant adds a per-frame allocation;
+# renaming `as_mut` ripples; the literal groupings mark bitstream field edges.
+manual_checked_ops = "allow"
+result_unit_err = "allow"
+large_enum_variant = "allow"
+should_implement_trait = "allow"
+unusual_byte_groupings = "allow"

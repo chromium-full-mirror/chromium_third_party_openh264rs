@@ -1,0 +1,326 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+//! Inverse Discrete Cosine Transform (IDCT) and Macroblock Reconstruction Auxiliary Functions.
+//!
+//! C++: `codec/decoder/core/src/decode_mb_aux.cpp`,
+//! `codec/decoder/core/inc/decode_mb_aux.h`.
+#![deny(unsafe_code)]
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![forbid(unsafe_code)]
+
+pub use crate::common::macros::WelsClip1;
+
+// Every kernel here writes a fixed-size block and reaches forward only from the
+// block's own (0, 0) — no `-1` column, no `-stride` row — so the reachable span
+// follows from the stride and the block size alone.
+
+use crate::safe::plane::PlaneCursorMut;
+
+pub use crate::decoder::decode_slice::g_kuiScan8;
+/// The kernel set the dispatch sites below call: `simd::x86_64` or `simd::aarch64` by
+/// default, `simd::scalar` under `--features scalar` or on a target with neither.
+use crate::simd::kernels;
+
+/// 4x4 inverse integer DCT of `rs`, added to the prediction block at `pred` and
+/// saturated to `[0, 255]` in place.
+///
+/// C++: `IdctResAddPred_c`, `codec/decoder/core/src/decode_mb_aux.cpp`.
+///
+/// `rs` is read, never written. The horizontal pass truncates its output to `i16`;
+/// sums can exceed that range, so the truncation is observable.
+pub fn idct_res_add_pred(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 16]) {
+    kernels::dct::idct_res_add_pred(pred, rs)
+}
+
+/// Scalar reference body of [`idct_res_add_pred`], never dispatched; used by the
+/// SIMD parity tests.
+pub fn idct_res_add_pred_c(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 16]) {
+    let mut src = [0i16; 16];
+
+    for i in 0..4 {
+        let y = i << 2;
+        let r0 = rs[y] as i32;
+        let r1 = rs[y + 1] as i32;
+        let r2 = rs[y + 2] as i32;
+        let r3 = rs[y + 3] as i32;
+
+        let t0 = r0 + r2;
+        let t1 = r0 - r2;
+        let t2 = (r1 >> 1) - r3;
+        let t3 = r1 + (r3 >> 1);
+
+        src[y] = (t0 + t3) as i16;
+        src[y + 1] = (t1 + t2) as i16;
+        src[y + 2] = (t1 - t2) as i16;
+        src[y + 3] = (t0 - t3) as i16;
+    }
+
+    let mut res = [[0i32; 4]; 4];
+    for i in 0..4 {
+        let s0 = src[i] as i32;
+        let s4 = src[i + 4] as i32;
+        let s8 = src[i + 8] as i32;
+        let s12 = src[i + 12] as i32;
+
+        let t1 = s0 + s8;
+        let t2 = s4 + (s12 >> 1);
+        res[0][i] = (32 + t1 + t2) >> 6;
+        res[3][i] = (32 + t1 - t2) >> 6;
+
+        let t1 = s0 - s8;
+        let t2 = (s4 >> 1) - s12;
+        res[1][i] = (32 + t1 + t2) >> 6;
+        res[2][i] = (32 + t1 - t2) >> 6;
+    }
+
+    for (dy, r) in res.iter().enumerate() {
+        let row = pred.row_mut(dy as isize, 0, 4);
+        for (p, &v) in row.iter_mut().zip(r.iter()) {
+            *p = WelsClip1(v + *p as i32);
+        }
+    }
+}
+
+/// 8x8 inverse integer DCT (High Profile / FRExt) of `rs`, added to the prediction
+/// block at `pred` and saturated to `[0, 255]` in place.
+///
+/// C++: `IdctResAddPred8x8_c`, `codec/decoder/core/src/decode_mb_aux.cpp`.
+pub fn idct_res_add_pred8x8(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 64]) {
+    let mut p = [0i32; 8];
+    let mut b = [0i32; 8];
+    let mut a = [0i32; 4];
+
+    let mut tmp = [0i16; 64];
+    let mut res = [0i16; 64];
+
+    // Horizontal 1D IDCT pass.
+    for i in 0..8 {
+        for j in 0..8 {
+            p[j] = rs[j + (i << 3)] as i32;
+        }
+
+        a[0] = (p[0] + p[4]) as i16 as i32;
+        a[1] = (p[0] - p[4]) as i16 as i32;
+        a[2] = (p[6] - (p[2] >> 1)) as i16 as i32;
+        a[3] = (p[2] + (p[6] >> 1)) as i16 as i32;
+
+        b[0] = (a[0] + a[3]) as i16 as i32;
+        b[2] = (a[1] - a[2]) as i16 as i32;
+        b[4] = (a[1] + a[2]) as i16 as i32;
+        b[6] = (a[0] - a[3]) as i16 as i32;
+
+        a[0] = (-p[3] + p[5] - p[7] - (p[7] >> 1)) as i16 as i32;
+        a[1] = (p[1] + p[7] - p[3] - (p[3] >> 1)) as i16 as i32;
+        a[2] = (-p[1] + p[7] + p[5] + (p[5] >> 1)) as i16 as i32;
+        a[3] = (p[3] + p[5] + p[1] + (p[1] >> 1)) as i16 as i32;
+
+        b[1] = (a[0] + (a[3] >> 2)) as i16 as i32;
+        b[3] = (a[1] + (a[2] >> 2)) as i16 as i32;
+        b[5] = (a[2] - (a[1] >> 2)) as i16 as i32;
+        b[7] = (a[3] - (a[0] >> 2)) as i16 as i32;
+
+        tmp[i << 3] = (b[0] + b[7]) as i16;
+        tmp[1 + (i << 3)] = (b[2] - b[5]) as i16;
+        tmp[2 + (i << 3)] = (b[4] + b[3]) as i16;
+        tmp[3 + (i << 3)] = (b[6] + b[1]) as i16;
+        tmp[4 + (i << 3)] = (b[6] - b[1]) as i16;
+        tmp[5 + (i << 3)] = (b[4] - b[3]) as i16;
+        tmp[6 + (i << 3)] = (b[2] + b[5]) as i16;
+        tmp[7 + (i << 3)] = (b[0] - b[7]) as i16;
+    }
+
+    // Vertical 1D IDCT pass.
+    for i in 0..8 {
+        for j in 0..8 {
+            p[j] = tmp[i + (j << 3)] as i32;
+        }
+
+        a[0] = (p[0] + p[4]) as i16 as i32;
+        a[1] = (p[0] - p[4]) as i16 as i32;
+        a[2] = (p[6] - (p[2] >> 1)) as i16 as i32;
+        a[3] = (p[2] + (p[6] >> 1)) as i16 as i32;
+
+        b[0] = (a[0] + a[3]) as i16 as i32;
+        b[2] = (a[1] - a[2]) as i16 as i32;
+        b[4] = (a[1] + a[2]) as i16 as i32;
+        b[6] = (a[0] - a[3]) as i16 as i32;
+
+        a[0] = (-p[3] + p[5] - p[7] - (p[7] >> 1)) as i16 as i32;
+        a[1] = (p[1] + p[7] - p[3] - (p[3] >> 1)) as i16 as i32;
+        a[2] = (-p[1] + p[7] + p[5] + (p[5] >> 1)) as i16 as i32;
+        a[3] = (p[3] + p[5] + p[1] + (p[1] >> 1)) as i16 as i32;
+
+        b[1] = (a[0] + (a[3] >> 2)) as i16 as i32;
+        b[7] = (a[3] - (a[0] >> 2)) as i16 as i32;
+        b[3] = (a[1] + (a[2] >> 2)) as i16 as i32;
+        b[5] = (a[2] - (a[1] >> 2)) as i16 as i32;
+
+        res[i] = (b[0] + b[7]) as i16;
+        res[(1 << 3) + i] = (b[2] - b[5]) as i16;
+        res[(2 << 3) + i] = (b[4] + b[3]) as i16;
+        res[(3 << 3) + i] = (b[6] + b[1]) as i16;
+        res[(4 << 3) + i] = (b[6] - b[1]) as i16;
+        res[(5 << 3) + i] = (b[4] - b[3]) as i16;
+        res[(6 << 3) + i] = (b[2] + b[5]) as i16;
+        res[(7 << 3) + i] = (b[0] - b[7]) as i16;
+    }
+
+    for i in 0..8 {
+        let row = pred.row_mut(i as isize, 0, 8);
+        for (j, dst) in row.iter_mut().enumerate() {
+            *dst = WelsClip1(((32 + res[(i << 3) + j] as i32) >> 6) + *dst as i32);
+        }
+    }
+}
+
+/// The four 4x4 sub-blocks of one 8x8 quadrant, each IDCT-added if it has any
+/// coefficient worth transforming.
+///
+/// C++: `IdctFourResAddPred_c`, `codec/decoder/core/src/decode_mb_aux.cpp`.
+///
+/// `nzc` is a window onto the macroblock's 8-wide non-zero-count raster, anchored at
+/// this quadrant's top-left 4x4 block: the four sub-blocks sit at `nzc[0]`, `nzc[1]`,
+/// `nzc[4]` and `nzc[5]`. A block also needs the transform when only its DC
+/// coefficient is non-zero (the I16x16 luma DC case).
+pub fn idct_four_res_add_pred(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 64], nzc: &[i8; 6]) {
+    const SUBS: [(isize, isize, usize); 4] = [(0, 0, 0), (4, 0, 1), (0, 4, 4), (4, 4, 5)];
+
+    for (k, &(dx, dy, n)) in SUBS.iter().enumerate() {
+        if nzc[n] != 0 || rs[k << 4] != 0 {
+            let start = k << 4;
+            if let Some(block) = rs.get(start..start + 16).and_then(|s| s.try_into().ok()) {
+                idct_res_add_pred(&mut pred.reborrow(dx, dy), block);
+            }
+        }
+    }
+}
+
+/// Precomputes the 24-element byte-offset table from a macroblock's top-left
+/// corner to each of its 4x4 sub-blocks: 16 luma, then the 4 chroma offsets stored
+/// twice (Cb at 16..20, Cr at 20..24, identical because the two planes share a
+/// geometry).
+///
+/// C++: `GetI4LumaIChromaAddrTable`, `codec/decoder/core/src/decode_mb_aux.cpp`.
+pub fn i4_luma_ichroma_addr_table(block_offset: &mut [i32; 24], stride_y: i32, stride_uv: i32) {
+    let scan0 = g_kuiScan8[0] as u32;
+
+    for i in 0..16 {
+        let a = g_kuiScan8[i] as u32 - scan0;
+        let x = (a & 0x07) as i32;
+        let y = (a >> 3) as i32;
+        block_offset[i] = (x + stride_y * y) << 2;
+    }
+
+    for i in 0..4 {
+        let a = g_kuiScan8[i] as u32 - scan0;
+        let x = (a & 0x07) as i32;
+        let y = (a >> 3) as i32;
+        let offset = (x + stride_uv * y) << 2;
+        block_offset[16 + i] = offset;
+        block_offset[20 + i] = offset;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wels_clip1() {
+        assert_eq!(WelsClip1(-10), 0);
+        assert_eq!(WelsClip1(0), 0);
+        assert_eq!(WelsClip1(128), 128);
+        assert_eq!(WelsClip1(255), 255);
+        assert_eq!(WelsClip1(300), 255);
+    }
+
+    #[test]
+    fn test_idct_res_add_pred_c_zero_residual() {
+        let mut pred = [128u8; 64];
+        let rs = [0i16; 16];
+        idct_res_add_pred(&mut PlaneCursorMut::new(&mut pred, 0, 8), &rs);
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_eq!(pred[row * 8 + col], 128);
+            }
+        }
+    }
+
+    #[test]
+    fn test_idct_res_add_pred_c_dc_residual() {
+        let mut pred = [128u8; 64];
+        let mut rs = [0i16; 16];
+        rs[0] = 64; // DC coeff = 64 -> (32 + 64) >> 6 = 1
+        idct_res_add_pred(&mut PlaneCursorMut::new(&mut pred, 0, 8), &rs);
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_eq!(pred[row * 8 + col], 129);
+            }
+        }
+    }
+
+    #[test]
+    fn blk4_xy_is_the_deleted_offset_table_with_the_stride_factored_out() {
+        use crate::decoder::decode_slice::blk4_xy;
+        assert_eq!(blk4_xy(0), (0, 0));
+        assert_eq!(blk4_xy(1), (4, 0));
+        assert_eq!(blk4_xy(2), (0, 4));
+        assert_eq!(blk4_xy(3), (4, 4));
+        // The whole 4x4 grid of 4x4 blocks is covered exactly once.
+        let mut seen: Vec<(isize, isize)> = (0..16).map(blk4_xy).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 16);
+        assert!(
+            seen.iter()
+                .all(|&(x, y)| (0..16).contains(&x) && (0..16).contains(&y))
+        );
+    }
+
+    #[test]
+    fn test_idct_res_add_pred8x8_does_not_overflow_on_large_or_min_coefficients() {
+        // Spec-valid intermediate sum where p[1] + p[7] > 32767 before subtracting p[3]:
+        // e_{03} = 20000 + 20000 - 20000 - 10000 = 10000 (within [-32768, 32767]).
+        let mut pred = [128u8; 64];
+        let mut rs = [0i16; 64];
+        rs[1] = 20000;
+        rs[3] = 20000;
+        rs[7] = 20000;
+        idct_res_add_pred8x8(&mut PlaneCursorMut::new(&mut pred, 0, 8), &rs);
+
+        // Extreme malformed input with i16::MIN (-32768) and i16::MAX (32767).
+        let mut pred_min = [128u8; 64];
+        let rs_min = [i16::MIN; 64];
+        idct_res_add_pred8x8(&mut PlaneCursorMut::new(&mut pred_min, 0, 8), &rs_min);
+
+        let mut pred_max = [128u8; 64];
+        let rs_max = [i16::MAX; 64];
+        idct_res_add_pred8x8(&mut PlaneCursorMut::new(&mut pred_max, 0, 8), &rs_max);
+    }
+}

@@ -1,0 +1,618 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! VAA (video analysis) statistics — `codec/processing/src/vaacalc/`, the plugin
+//! reached through `METHOD_VAA_STATISTICS`.
+//!
+//! The five kernels (`pfVAACalcSad`, `pfVAACalcSadVar`, `pfVAACalcSadSsd`,
+//! `pfVAACalcSadBgd`, `pfVAACalcSadSsdBgd`) are selected by
+//! `iCalcVar`/`iCalcSsd`/`iCalcBgd`, which `CWelsPreProcess::AnalyzeSpatialPic`
+//! derives from rate control, adaptive quantisation and background detection.
+//!
+//! [`CVAACalculation::Process`] dispatches through [`crate::simd::kernels`]`::vaa`.
+//! The `vaa_calc_*` functions below define what every kernel set must compute and are
+//! what the scalar set forwards to. [`vaa_span`] is what `Process` trims the planes
+//! to, so a kernel that walks the picture wrong panics instead of reading past a
+//! plane.
+
+#![forbid(unsafe_code)]
+
+use crate::encoder::wels_preprocess::{SPixMap, SVAACalcParam, SVAACalcResult};
+use crate::simd::kernels;
+
+/// `EResult` — `codec/processing/interface/IWelsVP.h`.
+pub const RET_SUCCESS: i32 = 0;
+pub const RET_FAILED: i32 = -1;
+pub const RET_INVALIDPARAM: i32 = -2;
+pub const RET_OUTOFMEMORY: i32 = -3;
+pub const RET_NOTSUPPORTED: i32 = -4;
+pub const RET_UNEXPECTED: i32 = -5;
+
+/// `CVAACalculation` — `codec/processing/src/vaacalc/vaacalculation.cpp`. The only
+/// state the class carries across calls is the `SVAACalcParam` its `Set` stores.
+#[derive(Default)]
+pub struct CVAACalculation {
+    pub m_sCalcParam: SVAACalcParam,
+}
+
+//=================== Safe kernels =====================//
+
+// The five `VAACalc*` kernels are one whole-picture walk differing only in which
+// per-block statistics it reports: `walk_picture` over `half_mb_stats`, with three
+// const flags selecting the accumulators. The flags are compile-time, so the unused
+// arithmetic is not emitted.
+
+/// The per-8x8-block statistics the five `VAACalc*` kernels choose between.
+///
+/// Which fields are live is a compile-time decision — see [`accumulate`] — so a kernel
+/// that does not report `sqsum` never emits the multiply. Excluded fields stay zero.
+#[derive(Clone, Copy, Default)]
+struct BlockStats {
+    /// Sum of absolute differences. Every variant computes this one.
+    sad: i32,
+    /// Sum of signed differences (`BGD`).
+    sd: i32,
+    /// Largest absolute difference in the block (`BGD`).
+    mad: i32,
+    /// Sum of squared differences (`SQDIFF`).
+    sqdiff: i32,
+    /// Sum of the current picture's samples (`VAR`).
+    sum: i32,
+    /// Sum of the squares of the current picture's samples (`VAR`).
+    sqsum: i32,
+}
+
+/// Accumulate the eight samples at `c[FROM..FROM+8]` against `r[FROM..FROM+8]` into
+/// one quadrant's statistics.
+///
+/// The innermost loop body of every kernel in
+/// `codec/processing/src/vaacalc/vaacalcfuncs.cpp`, the five copies differing only in
+/// which accumulators they keep — what the three flags select.
+///
+/// `FROM` is a const so both call sites index a compile-time window of a
+/// compile-time-sized array: no bounds check, and the eight iterations vectorise.
+///
+/// Every accumulator is `i32` and nothing is widened.
+#[inline(always)]
+fn accumulate<const VAR: bool, const SQDIFF: bool, const BGD: bool, const FROM: usize>(
+    s: &mut BlockStats,
+    c: &[u8; 16],
+    r: &[u8; 16],
+) {
+    for i in FROM..FROM + 8 {
+        let cur_sample = c[i] as i32;
+        let diff = cur_sample - r[i] as i32;
+        let abs_diff = diff.abs();
+        s.sad += abs_diff;
+        if BGD {
+            s.sd += diff;
+            if abs_diff > s.mad {
+                s.mad = abs_diff;
+            }
+        }
+        if SQDIFF {
+            s.sqdiff += abs_diff * abs_diff;
+        }
+        if VAR {
+            s.sum += cur_sample;
+            s.sqsum += cur_sample * cur_sample;
+        }
+    }
+}
+
+/// The statistics of the two 8x8 quadrants sitting side by side in one half of a
+/// macroblock, from plane slices anchored at that half's top-left sample.
+///
+/// Each row is read once, sixteen samples wide, and split in registers: the two
+/// quadrants share the read rather than walking rows 0..8 twice, which halves the range
+/// checks to 32 per macroblock and makes each window a fixed-size `[u8; 16]` whose
+/// inner loops need none.
+///
+/// Still exact: regrouping changes only the order in which a quadrant's own samples
+/// accumulate, and every accumulator is an associative, commutative `i32` sum (`mad` is
+/// a max). No sample moves between quadrants and no accumulator mixes with another; the
+/// frame total is summed in quadrant order by [`walk_picture`].
+#[inline(always)]
+fn half_mb_stats<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+    cur: &[u8],
+    refp: &[u8],
+    stride: usize,
+) -> (BlockStats, BlockStats) {
+    let mut left = BlockStats::default();
+    let mut right = BlockStats::default();
+    // Trim both planes to exactly the eight rows this half reads, once, before the
+    // loop: with a known length of `7 * stride + 16` the eight per-row checks collapse
+    // into these two. Same reads either way.
+    let cur = &cur[..7 * stride + 16];
+    let refp = &refp[..7 * stride + 16];
+    for k in 0..8 {
+        let base = k * stride;
+        let (Some(c), Some(r)) = (
+            cur[base..].first_chunk::<16>(),
+            refp[base..].first_chunk::<16>(),
+        ) else {
+            break;
+        };
+        accumulate::<VAR, SQDIFF, BGD, 0>(&mut left, c, r);
+        accumulate::<VAR, SQDIFF, BGD, 8>(&mut right, c, r);
+    }
+    (left, right)
+}
+
+/// Walks the picture macroblock by macroblock, handing each macroblock's four
+/// quadrant statistics to `on_mb`, and returns the frame's total SAD.
+///
+/// The `for (i) for (j)` nest shared by all five kernels in `vaacalcfuncs.cpp`.
+/// `iFrameSad` sums in quadrant-within-macroblock-within-row order.
+///
+/// Between macroblock rows the cursors advance by `(iPicStride << 4) - iPicWidth`,
+/// after having advanced 16 per macroblock, so a picture whose width is not a multiple
+/// of 16 shifts left by the remainder on every macroblock row rather than landing on
+/// the next row's first sample. [`vaa_span`] derives the read span from this same walk.
+#[inline(always)]
+fn walk_picture<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    mut on_mb: impl FnMut(usize, &[BlockStats; 4]),
+) -> i32 {
+    let mb_width = pic_width >> 4;
+    let mb_height = pic_height >> 4;
+    if mb_width <= 0 || mb_height <= 0 {
+        return 0;
+    }
+    let (Ok(stride), Ok(step)) = (
+        usize::try_from(pic_stride),
+        usize::try_from((pic_stride << 4) - pic_width),
+    ) else {
+        return 0;
+    };
+    let span = vaa_span(pic_width, pic_height, pic_stride);
+    let (Some(cur), Some(refp)) = (cur.get(..span), refp.get(..span)) else {
+        return 0;
+    };
+    let bottom = stride * 8;
+
+    let mut frame_sad = 0i32;
+    let mut mb_index = 0usize;
+    let mut row_origin = 0usize;
+    for _ in 0..mb_height {
+        let mut mb_origin = row_origin;
+        for _ in 0..mb_width {
+            let (q0, q1) =
+                half_mb_stats::<VAR, SQDIFF, BGD>(&cur[mb_origin..], &refp[mb_origin..], stride);
+            let (q2, q3) = half_mb_stats::<VAR, SQDIFF, BGD>(
+                &cur[mb_origin + bottom..],
+                &refp[mb_origin + bottom..],
+                stride,
+            );
+            let stats = [q0, q1, q2, q3];
+            // The frame total still accumulates in the C++'s quadrant order.
+            for q in &stats {
+                frame_sad = frame_sad.wrapping_add(q.sad);
+            }
+            on_mb(mb_index, &stats);
+            mb_index += 1;
+            mb_origin += 16;
+        }
+        row_origin = mb_origin + step;
+    }
+    frame_sad
+}
+
+/// The exact number of bytes a `VAACalc*` walk reads from each plane, counted from
+/// the origin the caller hands it.
+///
+/// The last sample read is the bottom-right corner of the bottom-right macroblock's
+/// bottom-right quadrant, `15 * stride + 15` past that macroblock's origin — so a
+/// picture whose height is a multiple of 16 needs no row below its last macroblock and
+/// no padding at all.
+pub fn vaa_span(pic_width: i32, pic_height: i32, pic_stride: i32) -> usize {
+    let mb_width = pic_width >> 4;
+    let mb_height = pic_height >> 4;
+    if mb_width <= 0 || mb_height <= 0 {
+        return 0;
+    }
+    let (mb_width, mb_height) = (mb_width as usize, mb_height as usize);
+    let (Ok(stride), Ok(step)) = (
+        usize::try_from(pic_stride),
+        usize::try_from((pic_stride << 4) - pic_width),
+    ) else {
+        return 0;
+    };
+    // The same walk `walk_picture` performs, run to the last macroblock's origin.
+    let last_mb = (mb_height - 1) * (mb_width * 16 + step) + (mb_width - 1) * 16;
+    last_mb + 15 * stride + 16
+}
+
+/// C++: `VAACalcSad_c`, `codec/processing/src/vaacalc/vaacalcfuncs.cpp`.
+///
+/// Writes each macroblock's four 8x8 sums of absolute differences to `sad8x8[mb]` and
+/// returns the frame total. Reads `vaa_span(..)` bytes of each plane and nothing
+/// outside it; `sad8x8` needs one entry per macroblock.
+pub fn vaa_calc_sad(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    sad8x8: &mut [[i32; 4]],
+) -> i32 {
+    walk_picture::<false, false, false>(cur, refp, pic_width, pic_height, pic_stride, |mb, s| {
+        sad8x8[mb] = [s[0].sad, s[1].sad, s[2].sad, s[3].sad]
+    })
+}
+
+/// C++: `VAACalcSadVar_c`, `vaacalcfuncs.cpp`.
+///
+/// [`vaa_calc_sad`] plus, per macroblock, the sum and the sum of squares of the
+/// current picture's 256 luma samples — the two quantities `AnalyzeGomComplexityViaVar`
+/// derives each GOM's variance from. `sum16x16` and `sqsum16x16` need one entry per
+/// macroblock each.
+pub fn vaa_calc_sad_var(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    sad8x8: &mut [[i32; 4]],
+    sum16x16: &mut [i32],
+    sqsum16x16: &mut [i32],
+) -> i32 {
+    walk_picture::<true, false, false>(cur, refp, pic_width, pic_height, pic_stride, |mb, s| {
+        sad8x8[mb] = [s[0].sad, s[1].sad, s[2].sad, s[3].sad];
+        sum16x16[mb] = s[0].sum + s[1].sum + s[2].sum + s[3].sum;
+        sqsum16x16[mb] = s[0].sqsum + s[1].sqsum + s[2].sqsum + s[3].sqsum;
+    })
+}
+
+/// C++: `VAACalcSadSsd_c`, `vaacalcfuncs.cpp`.
+///
+/// [`vaa_calc_sad_var`] plus the per-macroblock sum of squared *differences*, which
+/// `CAdaptiveQuantization` reads as the motion index.
+#[allow(clippy::too_many_arguments)]
+pub fn vaa_calc_sad_ssd(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    sad8x8: &mut [[i32; 4]],
+    sum16x16: &mut [i32],
+    sqsum16x16: &mut [i32],
+    sqdiff16x16: &mut [i32],
+) -> i32 {
+    walk_picture::<true, true, false>(cur, refp, pic_width, pic_height, pic_stride, |mb, s| {
+        sad8x8[mb] = [s[0].sad, s[1].sad, s[2].sad, s[3].sad];
+        sum16x16[mb] = s[0].sum + s[1].sum + s[2].sum + s[3].sum;
+        sqsum16x16[mb] = s[0].sqsum + s[1].sqsum + s[2].sqsum + s[3].sqsum;
+        sqdiff16x16[mb] = s[0].sqdiff + s[1].sqdiff + s[2].sqdiff + s[3].sqdiff;
+    })
+}
+
+/// C++: `VAACalcSadBgd_c`, `vaacalcfuncs.cpp`.
+///
+/// SAD plus, per 8x8 block, the signed sum of differences and the maximum absolute
+/// difference — both read by `CBackgroundDetection`. The maximum accumulates as an
+/// `i32` and stores as a `u8`; it cannot exceed 255, so the narrowing is exact.
+pub fn vaa_calc_sad_bgd(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    sad8x8: &mut [[i32; 4]],
+    sd8x8: &mut [[i32; 4]],
+    mad8x8: &mut [[u8; 4]],
+) -> i32 {
+    walk_picture::<false, false, true>(cur, refp, pic_width, pic_height, pic_stride, |mb, s| {
+        sad8x8[mb] = [s[0].sad, s[1].sad, s[2].sad, s[3].sad];
+        sd8x8[mb] = [s[0].sd, s[1].sd, s[2].sd, s[3].sd];
+        mad8x8[mb] = [
+            s[0].mad as u8,
+            s[1].mad as u8,
+            s[2].mad as u8,
+            s[3].mad as u8,
+        ];
+    })
+}
+
+/// C++: `VAACalcSadSsdBgd_c`, `vaacalcfuncs.cpp` — everything the other four
+/// compute, in one pass.
+#[allow(clippy::too_many_arguments)]
+pub fn vaa_calc_sad_ssd_bgd(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    sad8x8: &mut [[i32; 4]],
+    sum16x16: &mut [i32],
+    sqsum16x16: &mut [i32],
+    sqdiff16x16: &mut [i32],
+    sd8x8: &mut [[i32; 4]],
+    mad8x8: &mut [[u8; 4]],
+) -> i32 {
+    walk_picture::<true, true, true>(cur, refp, pic_width, pic_height, pic_stride, |mb, s| {
+        sad8x8[mb] = [s[0].sad, s[1].sad, s[2].sad, s[3].sad];
+        sum16x16[mb] = s[0].sum + s[1].sum + s[2].sum + s[3].sum;
+        sqsum16x16[mb] = s[0].sqsum + s[1].sqsum + s[2].sqsum + s[3].sqsum;
+        sqdiff16x16[mb] = s[0].sqdiff + s[1].sqdiff + s[2].sqdiff + s[3].sqdiff;
+        sd8x8[mb] = [s[0].sd, s[1].sd, s[2].sd, s[3].sd];
+        mad8x8[mb] = [
+            s[0].mad as u8,
+            s[1].mad as u8,
+            s[2].mad as u8,
+            s[3].mad as u8,
+        ];
+    })
+}
+
+/// The two luma planes [`CVAACalculation::Process`] reads, from each picture's
+/// logical origin — the family's
+/// [`ScdPlanes`](crate::processing::scene_change_detection::ScdPlanes) shape.
+pub struct VaaCalcPlanes<'a> {
+    pub cur: &'a [u8],
+    pub refp: &'a [u8],
+}
+
+impl CVAACalculation {
+    /// `CVAACalculation::Set` — copies the caller's parameter block.
+    pub fn Set(&mut self, param: &SVAACalcParam) -> i32 {
+        self.m_sCalcParam = *param;
+        RET_SUCCESS
+    }
+
+    /// `CVAACalculation::Process` — `vaacalculation.cpp`. Reads the current picture
+    /// from `planes.cur` and the reference from `planes.refp`, geometry from `src`, and
+    /// writes into `result`, handed over at the call.
+    ///
+    /// `pCurY`/`pRefY` record the planes' addresses: the adaptive-quant pass compares
+    /// them for identity.
+    pub fn Process(
+        &mut self,
+        src: &SPixMap,
+        _ref_pic: &SPixMap,
+        planes: VaaCalcPlanes<'_>,
+        result: &mut SVAACalcResult,
+    ) -> i32 {
+        let (iPicWidth, iPicHeight, iPicStride) =
+            (src.sRect.iRectWidth, src.sRect.iRectHeight, src.iStride[0]);
+        if planes.cur.is_empty() || planes.refp.is_empty() {
+            return RET_INVALIDPARAM;
+        }
+
+        result.pCurY = planes.cur.as_ptr() as usize;
+        result.pRefY = planes.refp.as_ptr() as usize;
+
+        let span = vaa_span(iPicWidth, iPicHeight, iPicStride);
+        let cur = &planes.cur[..span];
+        let refp = &planes.refp[..span];
+
+        // `vaacalculation.cpp` — the same nesting, in the same order.
+        result.iFrameSad = if self.m_sCalcParam.iCalcBgd {
+            if self.m_sCalcParam.iCalcSsd {
+                let SVAACalcResult {
+                    pSad8x8,
+                    pSum16x16,
+                    pSumOfSquare16x16,
+                    pSsd16x16,
+                    pSumOfDiff8x8,
+                    pMad8x8,
+                    ..
+                } = result;
+                kernels::vaa::vaa_calc_sad_ssd_bgd(
+                    cur,
+                    refp,
+                    iPicWidth,
+                    iPicHeight,
+                    iPicStride,
+                    pSad8x8,
+                    pSum16x16,
+                    pSumOfSquare16x16,
+                    pSsd16x16,
+                    pSumOfDiff8x8,
+                    pMad8x8,
+                )
+            } else {
+                let SVAACalcResult {
+                    pSad8x8,
+                    pSumOfDiff8x8,
+                    pMad8x8,
+                    ..
+                } = result;
+                kernels::vaa::vaa_calc_sad_bgd(
+                    cur,
+                    refp,
+                    iPicWidth,
+                    iPicHeight,
+                    iPicStride,
+                    pSad8x8,
+                    pSumOfDiff8x8,
+                    pMad8x8,
+                )
+            }
+        } else if self.m_sCalcParam.iCalcSsd {
+            let SVAACalcResult {
+                pSad8x8,
+                pSum16x16,
+                pSumOfSquare16x16,
+                pSsd16x16,
+                ..
+            } = result;
+            kernels::vaa::vaa_calc_sad_ssd(
+                cur,
+                refp,
+                iPicWidth,
+                iPicHeight,
+                iPicStride,
+                pSad8x8,
+                pSum16x16,
+                pSumOfSquare16x16,
+                pSsd16x16,
+            )
+        } else if self.m_sCalcParam.iCalcVar {
+            let SVAACalcResult {
+                pSad8x8,
+                pSum16x16,
+                pSumOfSquare16x16,
+                ..
+            } = result;
+            kernels::vaa::vaa_calc_sad_var(
+                cur,
+                refp,
+                iPicWidth,
+                iPicHeight,
+                iPicStride,
+                pSad8x8,
+                pSum16x16,
+                pSumOfSquare16x16,
+            )
+        } else {
+            kernels::vaa::vaa_calc_sad(
+                cur,
+                refp,
+                iPicWidth,
+                iPicHeight,
+                iPicStride,
+                &mut result.pSad8x8,
+            )
+        };
+        RET_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 16x16 picture is one macroblock: four 8x8 SADs summing to the frame total. A
+    /// constant difference of `d` over an 8x8 block gives `64 * d`.
+    #[test]
+    fn calc_sad_one_macroblock() {
+        let stride = 16i32;
+        let cur = vec![100u8; 16 * 16];
+        let mut refp = vec![100u8; 16 * 16];
+        // Make the top-right quadrant differ by 3 and the bottom-left by 5.
+        for y in 0..8 {
+            for x in 8..16 {
+                refp[y * 16 + x] = 103;
+            }
+        }
+        for y in 8..16 {
+            for x in 0..8 {
+                refp[y * 16 + x] = 95;
+            }
+        }
+        let mut sad8x8 = [[0i32; 4]; 1];
+        let frame_sad = vaa_calc_sad(&cur, &refp, 16, 16, stride, &mut sad8x8);
+        assert_eq!(sad8x8[0], [0, 64 * 3, 64 * 5, 0]);
+        assert_eq!(frame_sad, 64 * 3 + 64 * 5);
+    }
+
+    /// The kernel must advance by `(iPicStride << 4) - iPicWidth` between
+    /// macroblock rows, so a picture whose stride exceeds its width still lands each
+    /// macroblock's four sums at the right index.
+    #[test]
+    fn calc_sad_honours_stride_step() {
+        let w = 32i32;
+        let h = 32i32;
+        let stride = 48i32;
+        let cur = vec![10u8; (stride * h) as usize];
+        let mut refp = vec![10u8; (stride * h) as usize];
+        // Perturb only the last macroblock's bottom-right 8x8 quadrant.
+        for y in 24..32 {
+            for x in 24..32 {
+                refp[(y * stride + x) as usize] = 11;
+            }
+        }
+        let mut sad8x8 = [[0i32; 4]; 4];
+        let frame_sad = vaa_calc_sad(&cur, &refp, w, h, stride, &mut sad8x8);
+        // mb_index 3 is the bottom-right macroblock; quadrant 3 is its bottom-right.
+        assert_eq!(sad8x8[3][3], 64);
+        assert_eq!(frame_sad, 64);
+        assert_eq!(sad8x8.iter().flatten().filter(|&&v| v != 0).count(), 1);
+    }
+
+    /// A width that is not a multiple of 16 makes the walk's row step observable.
+    ///
+    /// The walk advances 16 bytes per macroblock and then by
+    /// `(iPicStride << 4) - iPicWidth` at the end of the macroblock row. At a width
+    /// that is a multiple of 16 the two cancel to exactly sixteen rows; at width 40,
+    /// where `iMbWidth` is 2 and only 32 of the 40 columns are walked, the row advance
+    /// comes up eight bytes short and every macroblock row after the first starts
+    /// before the row it looks like it should.
+    #[test]
+    fn calc_sad_reproduces_the_step_quirk_at_a_width_that_is_not_a_multiple_of_16() {
+        let (w, h, stride) = (40i32, 32i32, 64i32);
+        let refp = vec![0u8; (h * stride) as usize];
+        let mut cur = vec![0u8; (h * stride) as usize];
+
+        // Macroblock row 1 begins at 1 * (2 * 16 + step) where step = 64*16 - 40,
+        // i.e. byte 1016 — row 15, column 56 — and NOT at byte 1024 (row 16,
+        // column 0). Mark the top-left 8x8 of the macroblock the quirky walk lands
+        // on, and nothing else.
+        let step = ((stride << 4) - w) as usize;
+        let mb_row1 = 2 * 16 + step;
+        assert_eq!(mb_row1, 1016, "the quirk's arithmetic, restated");
+        for row in 0..8 {
+            for col in 0..8 {
+                cur[mb_row1 + row * stride as usize + col] = 7;
+            }
+        }
+
+        let mut sad8x8 = [[0i32; 4]; 4];
+        let frame_sad = vaa_calc_sad(&cur, &refp, w, h, stride, &mut sad8x8);
+
+        // Macroblock 2 is the first of the second row; quadrant 0 is its top-left.
+        assert_eq!(sad8x8[2][0], 64 * 7, "the quirky walk did not land here");
+        assert_eq!(frame_sad, 64 * 7);
+        assert_eq!(
+            sad8x8.iter().flatten().filter(|&&v| v != 0).count(),
+            1,
+            "the marked block leaked into another quadrant"
+        );
+    }
+
+    #[test]
+    fn frame_sad_wraps_on_4k_max_difference() {
+        let (w, h, stride) = (4096i32, 2304i32, 4096i32);
+        let n = (w as usize) * (h as usize);
+        let cur = vec![255u8; n];
+        let refp = vec![0u8; n];
+        let mbs = ((w >> 4) * (h >> 4)) as usize;
+        let mut sad8x8 = vec![[0i32; 4]; mbs];
+        let got = vaa_calc_sad(&cur, &refp, w, h, stride, &mut sad8x8);
+        let expected = ((n as u64) * 255) as u32 as i32;
+        assert_eq!(got, expected);
+    }
+}

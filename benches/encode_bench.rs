@@ -1,0 +1,540 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+//! Side-by-side timing and bitstream SHA-1 comparison, in one process: the dlopen'd
+//! C++ `libopenh264` against this crate's encoder.
+//!
+//! Both encoders are driven through the same call sequence — `GetDefaultParams`,
+//! `InitializeExt`, then `EncodeFrame` per frame — over the same `SSourcePicture`
+//! array, so the only variable is the implementation. Every row reports the SHA-1
+//! of the whole bitstream alongside the timing.
+//!
+//! Environment knobs:
+//!
+//! | variable | effect |
+//! |---|---|
+//! | `FFMPEG` | path to the ffmpeg binary (default: `ffmpeg` on `PATH`) |
+//! | `BENCH_REQUIRE_FFMPEG=1` | abort rather than fall back to the synthetic pattern |
+//! | `BENCH_FRAMES=<n>` | cap every configuration's frame count at `n` |
+//! | `BENCH_THREADS=<a,b>` | `iMultipleThreadIdc` values to sweep (default `1,4`) |
+//! | `BENCH_SLICE_MODE=<m[:n],..>` | slice-mode axis (default `1`, i.e. `SM_FIXEDSLCNUM_SLICE` with one slice per thread) |
+//! | `BENCH_LOAD_BALANCING=0\|1` | `bUseLoadBalancing`, always forced on both sides (default `0`, i.e. off) |
+//! | `BENCH_USAGE=0\|1` | `iUsageType`: 0 camera (default), 1 `SCREEN_CONTENT_REAL_TIME` |
+//!
+//! `bUseLoadBalancing` defaults to `true`, and with `uiSliceMode = 1` and
+//! `iMultipleThreadIdc >= uiSliceNum` it reaches `DynamicAdjustSlicing`, whose slice
+//! boundaries for frame N+1 come from frame N's measured per-slice encode *times*
+//! (`codec_app_def.h:579`) — the bitstream is then a function of the schedule and can
+//! never be bit-identical, so the bench forces it `false` on both sides unless
+//! `BENCH_LOAD_BALANCING=1`.
+//!
+//! Exits non-zero if any configuration's bitstreams disagree, after running and
+//! reporting all of them.
+
+#![allow(non_snake_case)]
+
+use openh264rs::api::codec_api::*;
+use std::fs;
+use std::hint::black_box;
+use std::process::Command;
+use std::ptr;
+use std::time::Instant;
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::Sha1Hasher;
+
+fn compute_sha1(data: &[u8]) -> String {
+    let mut hasher = Sha1Hasher::new();
+    hasher.update(data);
+    hasher.digest()
+}
+
+/// Where a configuration's pixels came from. The synthetic fallback is high-entropy
+/// noise, roughly worst case for an encoder, so rows that use it are tagged.
+#[derive(Clone, Copy, PartialEq)]
+enum InputSource {
+    Ffmpeg,
+    Synthetic,
+}
+
+fn generate_ffmpeg_pattern(
+    pattern_name: &str,
+    width: i32,
+    height: i32,
+    num_frames: usize,
+) -> (Vec<u8>, InputSource) {
+    let temp_file = std::env::temp_dir().join(format!(
+        "bench_lib_{}_{}x{}.yuv",
+        pattern_name, width, height
+    ));
+    let frame_size = (width * height * 3 / 2) as usize;
+
+    let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    // `gradients` defaults `seed=-1` and `c0`/`c1="random"` (resolved via
+    // `av_get_random_seed()` during option parsing, bypassing `seed`), so pin both
+    // the geometry seed and endpoint colors for reproducible bitstreams.
+    let extra = if pattern_name == "gradients" {
+        ":seed=1:c0=black:c1=white"
+    } else {
+        ""
+    };
+    let filter_expr = format!("{pattern_name}=size={width}x{height}:rate=30{extra}");
+    let status = Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &filter_expr,
+            "-frames:v",
+            &num_frames.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            temp_file.to_str().unwrap(),
+        ])
+        .output();
+
+    let reason = match &status {
+        Err(e) => format!("could not run `{ffmpeg}`: {e}"),
+        Ok(output) if !output.status.success() => {
+            format!("`{ffmpeg}` exited {}", output.status)
+        }
+        Ok(_) => match fs::read(&temp_file) {
+            Err(e) => format!("could not read {}: {e}", temp_file.display()),
+            Ok(bytes) => {
+                let _ = fs::remove_file(&temp_file);
+                if bytes.len() == frame_size * num_frames {
+                    return (bytes, InputSource::Ffmpeg);
+                }
+                format!(
+                    "{} produced {} bytes, expected {}",
+                    temp_file.display(),
+                    bytes.len(),
+                    frame_size * num_frames
+                )
+            }
+        },
+    };
+
+    if std::env::var("BENCH_REQUIRE_FFMPEG").is_ok_and(|v| v != "0") {
+        panic!(
+            "BENCH_REQUIRE_FFMPEG is set and lavfi source `{pattern_name}` is unavailable: {reason}"
+        );
+    }
+    eprintln!("  !! lavfi `{pattern_name}` unavailable ({reason}); using the synthetic pattern");
+
+    let mut buffer = vec![128u8; frame_size * num_frames];
+    for f in 0..num_frames {
+        let frame_offset = f * frame_size;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                buffer[frame_offset + y * width as usize + x] =
+                    ((x.wrapping_mul(x) ^ y.wrapping_mul(y) ^ (f * 17)) & 0xFF) as u8;
+            }
+        }
+    }
+    (buffer, InputSource::Synthetic)
+}
+
+/// One entry of the slice-mode axis.
+///
+/// The multi-slice entries are what actually reach the threaded paths:
+/// `SM_FIXEDSLCNUM_SLICE` takes the fork/join dispatch, `SM_SIZELIMITED_SLICE` the
+/// dynamic one.
+#[derive(Clone, Copy, PartialEq)]
+struct SliceSpec {
+    mode: SliceModeEnum,
+    /// `uiSliceNum` for modes 1 and 2 (0 means one slice per thread, resolved per
+    /// row); `uiSliceSizeConstraint` in bytes for mode 3.
+    arg: u32,
+}
+
+impl SliceSpec {
+    const DEFAULT: SliceSpec = SliceSpec {
+        mode: SliceModeEnum::SM_FIXEDSLCNUM_SLICE,
+        arg: 0,
+    };
+
+    /// `m` or `m:n` — `1:4` is four fixed slices, `1` is one per thread, `3` is
+    /// size-limited at the 1500-byte default, `3:600` at 600.
+    fn parse(spec: &str) -> Option<SliceSpec> {
+        let (m, n) = match spec.trim().split_once(':') {
+            Some((m, n)) => (m.trim(), n.trim().parse::<u32>().ok()?),
+            None => (spec.trim(), 0),
+        };
+        let mode = match m {
+            "0" => SliceModeEnum::SM_SINGLE_SLICE,
+            "1" => SliceModeEnum::SM_FIXEDSLCNUM_SLICE,
+            "2" => SliceModeEnum::SM_RASTER_SLICE,
+            "3" => SliceModeEnum::SM_SIZELIMITED_SLICE,
+            _ => return None,
+        };
+        let arg = match (mode, n) {
+            (SliceModeEnum::SM_SINGLE_SLICE, _) => 1,
+            (SliceModeEnum::SM_SIZELIMITED_SLICE, 0) => 1500,
+            (_, n) => n,
+        };
+        Some(SliceSpec { mode, arg })
+    }
+
+    fn label(&self, threads: u16) -> String {
+        match self.mode {
+            SliceModeEnum::SM_SINGLE_SLICE => "sm=0".to_string(),
+            SliceModeEnum::SM_SIZELIMITED_SLICE => format!("sm=3 c={}", self.arg),
+            _ => format!(
+                "sm={} n={}",
+                self.mode as i32,
+                if self.arg == 0 {
+                    threads.max(1) as u32
+                } else {
+                    self.arg
+                }
+            ),
+        }
+    }
+}
+
+/// One measured configuration's result.
+struct RunResult {
+    fps: f64,
+    latency_ms: f64,
+    bytes: usize,
+    sha1: String,
+}
+
+/// The parameter set both encoders are initialized with, kept in one place so the
+/// two sides cannot drift.
+unsafe fn fill_params(
+    enc: *mut ISVCEncoder,
+    width: i32,
+    height: i32,
+    threads: u16,
+    slice: SliceSpec,
+    load_balancing: Option<bool>,
+    usage: EUsageType,
+) -> SEncParamExt {
+    let mut param: SEncParamExt = unsafe { std::mem::zeroed() };
+    let vtbl = unsafe { &*(*enc).lpVtbl };
+    unsafe { (vtbl.GetDefaultParams)(enc, &mut param) };
+    // `GetDefaultParams` writes `CAMERA_VIDEO_REAL_TIME`. Under screen usage
+    // `ParamValidation` (`encoder_ext.cpp:274-290`) then forces `bEnableSceneChangeDetect`
+    // on and `bEnableAdaptiveQuant`/`bEnableBackgroundDetection` off on both sides.
+    param.iUsageType = usage;
+    param.iPicWidth = width;
+    param.iPicHeight = height;
+    param.fMaxFrameRate = 30.0;
+    param.iTargetBitrate = 2_000_000;
+    param.iSpatialLayerNum = 1;
+    param.iMultipleThreadIdc = threads;
+    param.sSpatialLayers[0].iVideoWidth = width;
+    param.sSpatialLayers[0].iVideoHeight = height;
+    param.sSpatialLayers[0].fFrameRate = 30.0;
+    param.sSpatialLayers[0].iSpatialBitrate = 2_000_000;
+    // `GetDefaultParams` leaves `uiSliceMode` at `SM_SINGLE_SLICE`. The arms mirror
+    // `cxx_enc.cpp:144`.
+    if let Some(lb) = load_balancing {
+        param.bUseLoadBalancing = lb;
+    }
+    let arg = &mut param.sSpatialLayers[0].sSliceArgument;
+    arg.uiSliceMode = slice.mode;
+    match slice.mode {
+        SliceModeEnum::SM_SIZELIMITED_SLICE => {
+            arg.uiSliceSizeConstraint = slice.arg;
+        }
+        SliceModeEnum::SM_SINGLE_SLICE => {
+            arg.uiSliceNum = 1;
+        }
+        _ => {
+            // 0 = one slice per thread; anything else is taken literally.
+            arg.uiSliceNum = if slice.arg == 0 {
+                threads.max(1) as u32
+            } else {
+                slice.arg
+            };
+            if slice.mode == SliceModeEnum::SM_RASTER_SLICE {
+                arg.uiSliceMbNum[0] = arg.uiSliceNum;
+            }
+        }
+    }
+    param
+}
+
+/// Initialize `enc`, encode `pics`, and return timing plus the bitstream hash.
+///
+/// Both implementations run through the same `ISVCEncoderVtbl`. For the dlopen'd C++
+/// library that is the real Itanium-ABI vtable of `ISVCEncoder`: nine pure-virtual
+/// methods in slots 0..8 in declaration order, the virtual destructor declared last so
+/// its slots land after them. `ForceIntraFrame` is not call-compatible — the C++
+/// declaration has a defaulted second parameter — and nothing here calls it.
+unsafe fn run_encoder(
+    enc: *mut ISVCEncoder,
+    width: i32,
+    height: i32,
+    threads: u16,
+    slice: SliceSpec,
+    load_balancing: Option<bool>,
+    usage: EUsageType,
+    pics: &[SSourcePicture],
+) -> RunResult {
+    let vtbl = unsafe { &*(*enc).lpVtbl };
+    let param = unsafe { fill_params(enc, width, height, threads, slice, load_balancing, usage) };
+    let init_ret = unsafe { (vtbl.InitializeExt)(enc, &param) };
+    assert_eq!(
+        init_ret,
+        0,
+        "InitializeExt failed for {width}x{height} threads={threads} {}",
+        slice.label(threads)
+    );
+
+    let mut bs_info = SFrameBSInfo::default();
+
+    // Warmup outside the timed loop: primes caches and thread pools, then
+    // re-initializes the encoder so the timed run starts from frame 0 with clean
+    // GOP/IDR phase and rate-control state.
+    for pic in pics.iter().take(3) {
+        let _ = unsafe { (vtbl.EncodeFrame)(enc, black_box(pic), black_box(&mut bs_info)) };
+    }
+    let reinit_ret = unsafe { (vtbl.InitializeExt)(enc, &param) };
+    assert_eq!(
+        reinit_ret,
+        0,
+        "re-InitializeExt after warmup failed for {width}x{height} threads={threads} {}",
+        slice.label(threads)
+    );
+
+    let mut full_bitstream = Vec::new();
+    let start = Instant::now();
+    for pic in pics.iter() {
+        let enc_ret = unsafe { (vtbl.EncodeFrame)(enc, black_box(pic), black_box(&mut bs_info)) };
+        black_box(enc_ret);
+
+        let out_len = bs_info.iFrameSizeInBytes as usize;
+        let p_buf = bs_info.sLayerInfo[0].pBsBuf;
+        if !p_buf.is_null() && out_len > 0 {
+            full_bitstream.extend_from_slice(unsafe { std::slice::from_raw_parts(p_buf, out_len) });
+        }
+    }
+    let elapsed = start.elapsed();
+
+    unsafe { (vtbl.Uninitialize)(enc) };
+
+    let total_secs = elapsed.as_secs_f64();
+    RunResult {
+        fps: (pics.len() as f64) / total_secs,
+        latency_ms: (total_secs * 1_000.0) / (pics.len() as f64),
+        bytes: full_bitstream.len(),
+        sha1: compute_sha1(&full_bitstream),
+    }
+}
+
+fn run_rust_library_encoder(
+    width: i32,
+    height: i32,
+    threads: u16,
+    slice: SliceSpec,
+    load_balancing: Option<bool>,
+    usage: EUsageType,
+    pics: &[SSourcePicture],
+) -> RunResult {
+    unsafe {
+        let mut enc: *mut ISVCEncoder = ptr::null_mut();
+        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
+        assert!(!enc.is_null());
+        let result = run_encoder(
+            enc,
+            width,
+            height,
+            threads,
+            slice,
+            load_balancing,
+            usage,
+            pics,
+        );
+        WelsDestroySVCEncoder(enc);
+        result
+    }
+}
+
+fn main() {
+    println!(
+        "========================================================================================================================"
+    );
+    println!(" In-Memory H.264 Encoder Benchmark: openh264rs");
+    println!(
+        "========================================================================================================================"
+    );
+
+    let test_inputs = [
+        ("testsrc", "320x240 (QVGA Moving Box)", 320, 240, 200),
+        ("testsrc2", "320x240 (QVGA High-Contrast)", 320, 240, 200),
+        ("smptebars", "320x240 (QVGA SMPTE Bars)", 320, 240, 200),
+        ("pal75bars", "320x240 (QVGA PAL 75%)", 320, 240, 200),
+        ("rgbtestsrc", "320x240 (QVGA RGB Test)", 320, 240, 200),
+        ("yuvtestsrc", "320x240 (QVGA YUV Space)", 320, 240, 200),
+        ("gradients", "320x240 (QVGA Spatial Ramps)", 320, 240, 200),
+        ("mandelbrot", "320x240 (QVGA Mandelbrot)", 320, 240, 200),
+        ("mandelbrot", "640x480 (VGA Mandelbrot)", 640, 480, 100),
+        ("smptebars", "640x480 (VGA SMPTE Bars)", 640, 480, 100),
+        ("mandelbrot", "1280x720 (720p HD Mandelbrot)", 1280, 720, 50),
+        (
+            "smptehdbars",
+            "1280x720 (720p HD SMPTE Bars)",
+            1280,
+            720,
+            50,
+        ),
+        (
+            "mandelbrot",
+            "1920x1080 (1080p Full HD Mandelbrot)",
+            1920,
+            1080,
+            30,
+        ),
+        (
+            "smptehdbars",
+            "1920x1080 (1080p Full HD SMPTE Bars)",
+            1920,
+            1080,
+            30,
+        ),
+        (
+            "testsrc",
+            "1920x1080 (1080p Full HD Testsrc)",
+            1920,
+            1080,
+            30,
+        ),
+    ];
+
+    let frame_cap: Option<usize> = std::env::var("BENCH_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let thread_counts: Vec<u16> = std::env::var("BENCH_THREADS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .filter(|v: &Vec<u16>| !v.is_empty())
+        .unwrap_or_else(|| vec![1, 4]);
+    let slice_specs: Vec<SliceSpec> = std::env::var("BENCH_SLICE_MODE")
+        .ok()
+        .map(|v| v.split(',').filter_map(SliceSpec::parse).collect())
+        .filter(|v: &Vec<SliceSpec>| !v.is_empty())
+        .unwrap_or_else(|| vec![SliceSpec::DEFAULT]);
+    let tag_rows = slice_specs.len() > 1 || slice_specs[0] != SliceSpec::DEFAULT;
+    let usage: EUsageType = match std::env::var("BENCH_USAGE").ok().as_deref() {
+        None | Some("") | Some("0") => EUsageType::CAMERA_VIDEO_REAL_TIME,
+        Some("1") => EUsageType::SCREEN_CONTENT_REAL_TIME,
+        Some(other) => panic!(
+            "BENCH_USAGE={other:?} is not one of 0 (CAMERA_VIDEO_REAL_TIME) or 1 (SCREEN_CONTENT_REAL_TIME)"
+        ),
+    };
+    let screen = usage == EUsageType::SCREEN_CONTENT_REAL_TIME;
+    // Off by default, so multi-slice bitstreams stay deterministic.
+    let load_balancing: Option<bool> = Some(
+        std::env::var("BENCH_LOAD_BALANCING")
+            .ok()
+            .is_some_and(|v| v.trim() != "0"),
+    );
+
+    if let Some(cap) = frame_cap {
+        println!(" BENCH_FRAMES={cap}: every configuration capped to {cap} frames.");
+    }
+    println!(" Threads swept: {thread_counts:?}");
+    if tag_rows {
+        let labels: Vec<String> = slice_specs.iter().map(|s| s.label(0)).collect();
+        println!(" Slice modes swept: {}", labels.join(", "));
+    }
+    if let Some(lb) = load_balancing {
+        println!(" bUseLoadBalancing forced to {lb}");
+    }
+    if screen {
+        println!(" Usage type: SCREEN_CONTENT_REAL_TIME");
+    }
+
+    let mut synthetic_used = false;
+
+    for (pattern, label, w, h, nominal_frames) in test_inputs {
+        let frames = frame_cap.map_or(nominal_frames, |c| c.min(nominal_frames));
+        let frame_size = (w * h * 3 / 2) as usize;
+        let (mut raw_yuv, source) = generate_ffmpeg_pattern(pattern, w, h, frames);
+        synthetic_used |= source == InputSource::Synthetic;
+
+        let y_len = (w * h) as usize;
+        let uv_len = (w * h / 4) as usize;
+
+        let mut src_pics = Vec::with_capacity(frames);
+
+        for frame_idx in 0..frames {
+            let offset = frame_idx * frame_size;
+            let mut pic = SSourcePicture::default();
+            pic.iColorFormat = EVideoFormatType::videoFormatI420 as i32;
+            pic.iPicWidth = w;
+            pic.iPicHeight = h;
+            pic.iStride[0] = w;
+            pic.iStride[1] = w / 2;
+            pic.iStride[2] = w / 2;
+            pic.pData[0] = raw_yuv[offset..offset + y_len].as_mut_ptr();
+            pic.pData[1] = raw_yuv[offset + y_len..offset + y_len + uv_len].as_mut_ptr();
+            pic.pData[2] = raw_yuv[offset + y_len + uv_len..offset + frame_size].as_mut_ptr();
+            src_pics.push(pic);
+        }
+
+        let source_tag = match source {
+            InputSource::Ffmpeg => "lavfi",
+            InputSource::Synthetic => "SYNTHETIC",
+        };
+        println!(
+            "------------------------------------------------------------------------------------------------------------------------"
+        );
+        println!(
+            " {:<38} {:>4} frames, {:.2} MB/frame, source: {}",
+            label,
+            frames,
+            (frame_size as f64) / (1024.0 * 1024.0),
+            source_tag
+        );
+        println!(
+            "------------------------------------------------------------------------------------------------------------------------"
+        );
+
+        for spec in &slice_specs {
+            let spec = *spec;
+            for threads in &thread_counts {
+                let threads = *threads;
+                // The tag goes inside the bracket, so it is part of the row key.
+                let usage_tag = if screen { " u=1" } else { "" };
+                let row = if tag_rows {
+                    format!("{:1} thread {}{}", threads, spec.label(threads), usage_tag)
+                } else {
+                    format!("{threads:1} thread{usage_tag}")
+                };
+                let rust =
+                    run_rust_library_encoder(w, h, threads, spec, load_balancing, usage, &src_pics);
+                println!(
+                    "  [{}] Rust: {:8.2} fps ({:6.3} ms) | {} bytes | SHA-1 {}",
+                    row,
+                    rust.fps,
+                    rust.latency_ms,
+                    rust.bytes,
+                    &rust.sha1[..16]
+                );
+            }
+        }
+    }
+    println!(
+        "========================================================================================================================"
+    );
+
+    if synthetic_used {
+        println!(
+            " NOTE: at least one configuration fell back to the synthetic pattern — high-entropy"
+        );
+        println!(
+            "       noise, roughly worst case for an encoder. Install ffmpeg, or set FFMPEG, for"
+        );
+        println!(
+            "       representative throughput. BENCH_REQUIRE_FFMPEG=1 turns the fallback into an error."
+        );
+    }
+}

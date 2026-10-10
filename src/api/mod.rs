@@ -1,0 +1,18 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+pub mod abi_guard;
+#[cfg(feature = "c-api")]
+pub mod c_api;
+pub mod codec_api;
+#[cfg(feature = "cxx-api")]
+pub mod cxx_api;
+pub mod decoder;
+pub mod encoder;
+pub mod encoder_options;
+pub mod types;
+pub mod version;
+
+pub use codec_api::*;
+pub use version::G_ST_CODEC_VERSION;

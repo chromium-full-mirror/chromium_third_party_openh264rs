@@ -1,0 +1,1415 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+#![forbid(unsafe_code)]
+
+//! Detached bit cursors.
+//!
+//! [`BsCursor`] reads and [`BsWriter`] writes; neither holds a buffer. They are
+//! *positions*, passed the bytes on every call, which is what makes them `Copy`.
+//!
+//! The bytes a cursor sees are RBSP: emulation-prevention (`0x03`) insertion and
+//! removal is `nalu.rs`'s business. CABAC keeps its own cursor triple. CAVLC mode —
+//! the absolute bit position the residual path reads while the accumulator is
+//! deliberately stale — is [`BsCursor::start_cavlc`]/[`BsCursor::end_cavlc`] and the
+//! [`cavlc_bit_pos`](BsCursor::cavlc_bit_pos) accessor pair.
+
+use crate::safe::err::ErrInfo;
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+/// A bitstream read position — the reading half of `SBitStringAux`
+/// (C++ `codec/common/inc/wels_common_defs.h:30-46`), with the three pointers replaced by two
+/// offsets.
+///
+/// `len` is state, not a property of the slice passed in: it marks the end of the
+/// *RBSP*, while the allocation legitimately continues past it — see the slack
+/// contract on [`BsCursor::get_bits`].
+#[derive(Clone, Copy, Debug, Default, Eq)]
+pub struct BsCursor {
+    pos: usize,
+    cur_bits: u32,
+    left_bits: i32,
+    len: usize,
+    bits: i32,
+    /// The C++ `iIndex`. See [`start_cavlc`](BsCursor::start_cavlc).
+    cavlc_bit_pos: isize,
+    /// Whether [`start_cavlc`](BsCursor::start_cavlc) has run without a matching
+    /// [`end_cavlc`](BsCursor::end_cavlc) — the coherence guard described there.
+    /// Debug-only, and deliberately **not** part of [`PartialEq`].
+    #[cfg(debug_assertions)]
+    in_cavlc: bool,
+}
+
+/// Equality over the six mirrored fields, and nothing else: `in_cavlc` exists only
+/// under `cfg(debug_assertions)`, and a derived `PartialEq` would make equality mean
+/// different things in the two profiles.
+impl PartialEq for BsCursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos
+            && self.cur_bits == other.cur_bits
+            && self.left_bits == other.left_bits
+            && self.len == other.len
+            && self.bits == other.bits
+            && self.cavlc_bit_pos == other.cavlc_bit_pos
+    }
+}
+
+/// Peeks the top `n` bits of an MSB-aligned accumulator.
+///
+/// Mirrors the `UBITS` macro (`codec/decoder/core/inc/dec_golomb.h`).
+#[inline]
+fn ubits(cur_bits: u32, n: i32) -> u32 {
+    if n <= 0 {
+        0
+    } else if n >= 32 {
+        cur_bits
+    } else {
+        cur_bits >> (32 - n)
+    }
+}
+
+/// Number of leading zero bits in `cur_bits`, or `-1` if it is entirely zero.
+///
+/// Mirrors `GetLeadingZeroBits` (`codec/decoder/core/inc/dec_golomb.h`).
+#[inline]
+fn leading_zero_bits(cur_bits: u32) -> i32 {
+    if cur_bits == 0 {
+        -1
+    } else {
+        cur_bits.leading_zeros() as i32
+    }
+}
+
+/// Two's-complement negation, mirroring the `NEG_NUM` macro (`codec/decoder/core/inc/dec_golomb.h`).
+#[inline]
+fn neg_num(x: i32) -> i32 {
+    1i32.wrapping_add(!x)
+}
+
+/// Number of zero bits before the `rbsp_stop_one_bit` in `byte`; an all-zero byte
+/// returns `0` rather than an error.
+///
+/// Mirrors `BsGetTrailingBits` (`codec/decoder/core/inc/dec_golomb.h`).
+#[inline]
+pub fn trailing_bits(byte: u8) -> i32 {
+    let mut value = byte as u32;
+    let mut n = 0;
+    while n < 9 {
+        if value & 1 != 0 {
+            return n;
+        }
+        value >>= 1;
+        n += 1;
+    }
+    0
+}
+
+impl BsCursor {
+    /// Starts reading an RBSP of `size_bits` bits from the front of `buf` —
+    /// `DecInitBits`, including its initial 4-byte fill
+    /// and the `left_bits = -16` bias.
+    ///
+    /// `buf` should be the whole readable region — RBSP **plus** at least 3 bytes of
+    /// slack, see [`get_bits`](Self::get_bits). Only the first `(size_bits + 7) / 8`
+    /// bytes are treated as payload.
+    pub fn init(buf: &[u8], size_bits: i32) -> Result<Self, ErrInfo> {
+        let end = (size_bits + 7) >> 3;
+        if end <= 0 {
+            // An empty RBSP has no first word to prime the accumulator from.
+            return Err(ErrInfo::INVALID_ACCESS);
+        }
+        let mut cursor = Self {
+            pos: 0,
+            cur_bits: 0,
+            left_bits: 0,
+            len: end as usize,
+            bits: size_bits,
+            cavlc_bit_pos: 0,
+            #[cfg(debug_assertions)]
+            in_cavlc: false,
+        };
+        cursor.init_read_bits(buf, 0)?;
+        Ok(cursor)
+    }
+
+    /// Re-primes the accumulator at the current position, refusing to start within
+    /// `end_offset` bytes of the logical end.
+    ///
+    /// Mirrors `InitReadBits`.
+    pub fn init_read_bits(&mut self, buf: &[u8], end_offset: isize) -> Result<(), ErrInfo> {
+        self.debug_assert_out_of_cavlc("init_read_bits");
+        let end_limit = self.len as isize - end_offset;
+        let kiRemainBytes = end_limit - self.pos as isize;
+        if kiRemainBytes <= 0 {
+            return Err(ErrInfo::INVALID_ACCESS);
+        }
+        let kiSeedBytes = (kiRemainBytes as usize).min(4);
+        if buf.len() < self.pos + kiSeedBytes {
+            return Err(ErrInfo::READ_OVERFLOW);
+        }
+        let mut cur_bits = 0u32;
+        for i in 0..4 {
+            cur_bits <<= 8;
+            if i < kiSeedBytes {
+                cur_bits |= buf[self.pos + i] as u32;
+            }
+        }
+        self.cur_bits = cur_bits;
+        self.pos += 4;
+        self.left_bits = -16;
+        Ok(())
+    }
+
+    /// Byte offset of the next refill — the C++ `pCurBuf - pStartBuf`.
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// The logical end of the RBSP in bytes — the C++ `pEndBuf - pStartBuf`.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Size of the RBSP in bits — the C++ `iBits`.
+    #[inline]
+    pub fn bits(&self) -> i32 {
+        self.bits
+    }
+
+    /// The MSB-aligned accumulator — the C++ `uiCurBits`.
+    #[inline]
+    pub fn cur_bits(&self) -> u32 {
+        self.cur_bits
+    }
+
+    /// Bits available in the accumulator, biased by −16 — the C++ `iLeftBits`.
+    #[inline]
+    pub fn left_bits(&self) -> i32 {
+        self.left_bits
+    }
+
+    /// Moves the byte position, leaving the accumulator alone.
+    ///
+    /// The I_PCM path's seek: PCM samples are byte-aligned raw bytes, so the caller
+    /// rewinds to the alignment point, copies 384 bytes out of the stream, advances
+    /// past them and re-primes with [`init_read_bits`](Self::init_read_bits) — only
+    /// that re-prime makes the accumulator meaningful again.
+    #[inline]
+    pub fn set_pos(&mut self, pos: usize) {
+        self.debug_assert_out_of_cavlc("set_pos");
+        self.pos = pos;
+    }
+
+    /// The top `n` bits of the accumulator, without consuming them.
+    ///
+    /// Mirrors the `UBITS` macro.
+    #[inline]
+    pub fn peek_bits(&self, n: i32) -> u32 {
+        self.debug_assert_out_of_cavlc("peek_bits");
+        ubits(self.cur_bits, n)
+    }
+
+    /// Consumes `n` bits and refills the accumulator.
+    ///
+    /// Mirrors `DUMP_BITS_AUX` (`codec/decoder/core/inc/dec_golomb.h`), the refill under every read
+    /// below — see [`get_bits`](Self::get_bits) for the slack contract.
+    fn dump_bits(&mut self, buf: &[u8], n: i32) -> Result<(), ErrInfo> {
+        self.cur_bits = self.cur_bits.wrapping_shl(n as u32);
+        self.left_bits += n;
+        if self.left_bits > 0 {
+            // The refill may sit one byte past the logical end, no further.
+            if self.pos > self.len + 1 {
+                return Err(ErrInfo::READ_OVERFLOW);
+            }
+            let mut word = 0u32;
+            if self.pos < self.len {
+                let b0 = *buf.get(self.pos).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
+                word = b0 << 8;
+            }
+            if self.pos + 1 < self.len {
+                let b1 = *buf.get(self.pos + 1).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
+                word |= b1;
+            }
+            let shift = self.left_bits as u32;
+            if shift < 32 {
+                self.cur_bits |= word.wrapping_shl(shift);
+            }
+            self.left_bits -= 16;
+            self.pos += 2;
+        }
+        Ok(())
+    }
+
+    /// Reads `n` bits (1..=32), MSB first.
+    ///
+    /// Mirrors `BsGetBits` (`codec/decoder/core/inc/dec_golomb.h`).
+    ///
+    /// The refill tops the accumulator up 16 bits at a time, and only once it has run
+    /// below 16, so at rest it holds **at least** 16 valid bits and no more than 32: a
+    /// single read of more than 16 bits can return stale low bits. No decoder call site
+    /// asks for more — the widths used are 1, 2, 3, 4, 5, 8 and 16 — and `get_ue`
+    /// splits its own long prefixes for the same reason.
+    ///
+    /// The refill may sit **one byte past** the logical end and then reads two bytes
+    /// at it, so a read reaches `len + 2` inclusive: three bytes of slack past the
+    /// RBSP. **Pass `buf` with at least 3 bytes of slack past `size_bits`**; with
+    /// fewer, those loads return [`ErrInfo::READ_OVERFLOW`] instead of reading past
+    /// the allocation.
+    pub fn get_bits(&mut self, buf: &[u8], n: i32) -> Result<u32, ErrInfo> {
+        self.debug_assert_out_of_cavlc("get_bits");
+        let value = ubits(self.cur_bits, n);
+        self.dump_bits(buf, n)?;
+        Ok(value)
+    }
+
+    /// Reads one bit. Mirrors `BsGetOneBit`.
+    #[inline]
+    pub fn get_one_bit(&mut self, buf: &[u8]) -> Result<u32, ErrInfo> {
+        self.get_bits(buf, 1)
+    }
+
+    /// Reads an unsigned Exp-Golomb code, `ue(v)`.
+    ///
+    /// Mirrors `BsGetUe`, including its split refill for
+    /// prefixes longer than 16 bits and its wrapping reconstruction of the value.
+    pub fn get_ue(&mut self, buf: &[u8]) -> Result<u32, ErrInfo> {
+        // `get_se`, `get_te0` and `get_one_bit` reach the accumulator only through this
+        // and `get_bits`, so these two guards cover the whole read family.
+        self.debug_assert_out_of_cavlc("get_ue");
+        let mut value: u32 = 0;
+        let mut lz = leading_zero_bits(self.cur_bits);
+
+        if lz == -1 {
+            if self.left_bits > -16 {
+                let saved = *self;
+                if self.dump_bits(buf, 16).is_err() {
+                    *self = saved;
+                    return Err(ErrInfo::READ_LEADING_ZERO);
+                }
+                let lz2 = leading_zero_bits(self.cur_bits);
+                if lz2 == -1 || lz2 > 15 {
+                    *self = saved;
+                    return Err(ErrInfo::READ_LEADING_ZERO);
+                }
+                lz = 16 + lz2;
+                self.dump_bits(buf, lz2 + 1)?;
+            } else {
+                return Err(ErrInfo::READ_LEADING_ZERO);
+            }
+        } else if lz > 16 {
+            self.dump_bits(buf, 16)?;
+            self.dump_bits(buf, lz + 1 - 16)?;
+        } else {
+            self.dump_bits(buf, lz + 1)?;
+        }
+
+        if lz > 16 {
+            let hi = ubits(self.cur_bits, 16);
+            self.dump_bits(buf, 16)?;
+            let rem = lz - 16;
+            let lo = ubits(self.cur_bits, rem);
+            self.dump_bits(buf, rem)?;
+            value = (hi << rem) | lo;
+        } else if lz != 0 {
+            value = ubits(self.cur_bits, lz);
+            self.dump_bits(buf, lz)?;
+        }
+
+        Ok((1u32.wrapping_shl(lz as u32))
+            .wrapping_sub(1)
+            .wrapping_add(value))
+    }
+
+    /// Reads a signed Exp-Golomb code, `se(v)`.
+    ///
+    /// Mirrors `BsGetSe`.
+    pub fn get_se(&mut self, buf: &[u8]) -> Result<i32, ErrInfo> {
+        let code_num = self.get_ue(buf)?;
+        Ok(if code_num & 0x01 != 0 {
+            (code_num.wrapping_add(1) >> 1) as i32
+        } else {
+            neg_num((code_num >> 1) as i32)
+        })
+    }
+
+    /// Reads a truncated Exp-Golomb code, `te(v)`, over `range` values.
+    ///
+    /// Mirrors `BsGetTe0`.
+    pub fn get_te0(&mut self, buf: &[u8], range: i32) -> Result<u32, ErrInfo> {
+        if range == 1 {
+            Ok(0)
+        } else if range == 2 {
+            Ok(self.get_one_bit(buf)? ^ 1)
+        } else {
+            self.get_ue(buf)
+        }
+    }
+
+    /// Whether more RBSP data precedes `rbsp_trailing_bits()`.
+    ///
+    /// Mirrors `CheckMoreRBSPData`.
+    pub fn check_more_rbsp_data(&self) -> bool {
+        self.debug_assert_out_of_cavlc("check_more_rbsp_data");
+        let offset_bytes = self.pos as isize - 2;
+        let bits_consumed = (offset_bytes << 3) as i32;
+        self.bits - bits_consumed - self.left_bits > 1
+    }
+
+    // -----------------------------------------------------------------------
+    // CAVLC mode
+    // -----------------------------------------------------------------------
+
+    /// Panics in debug builds if the cursor is inside a CAVLC region.
+    ///
+    /// The accumulator is *deliberately stale* between [`start_cavlc`](Self::start_cavlc)
+    /// and [`end_cavlc`](Self::end_cavlc), so reading it there yields bits the residual
+    /// path has already consumed.
+    #[inline(always)]
+    fn debug_assert_out_of_cavlc(&self, op: &str) {
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.in_cavlc,
+            "BsCursor::{op} ran inside a CAVLC region: the accumulator is stale between \
+             start_cavlc and end_cavlc, and `cavlc_bit_pos` is the live position"
+        );
+        let _ = op;
+    }
+
+    /// Panics in debug builds if the cursor is *not* inside a CAVLC region — the
+    /// mirror of [`debug_assert_out_of_cavlc`](Self::debug_assert_out_of_cavlc), for
+    /// the bit-position accessors, whose value is dead outside the mode.
+    #[inline(always)]
+    fn debug_assert_in_cavlc(&self, op: &str) {
+        #[cfg(debug_assertions)]
+        assert!(
+            self.in_cavlc,
+            "BsCursor::{op} ran outside a CAVLC region: `cavlc_bit_pos` is only live \
+             between start_cavlc and end_cavlc"
+        );
+        let _ = op;
+    }
+
+    /// Enters CAVLC mode: projects the cursor onto an absolute bit position.
+    ///
+    /// `BsStartCavlc` (`codec/decoder/core/src/parse_mb_syn_cavlc.cpp:2229`). The accumulator holds
+    /// `16 - left_bits` valid bits (32 immediately after a prime, since `left_bits` is
+    /// biased by −16), so the next unread bit is at `8 * pos - (16 - left_bits)`; the
+    /// `16` is the CAVLC residual machinery's **16-bit half-window**, not a mistyped 32.
+    ///
+    /// While the mode is live, `cavlc_bit_pos` is authoritative and `cur_bits`/
+    /// `left_bits`/`pos` are stale — the residual decoder walks bytes directly from the
+    /// bit position through its own `SReadBitsCache`. [`end_cavlc`](Self::end_cavlc)
+    /// puts the accumulator back.
+    #[inline]
+    pub fn start_cavlc(&mut self) {
+        self.cavlc_bit_pos = ((self.pos as isize) << 3) - (16 - self.left_bits as isize);
+        #[cfg(debug_assertions)]
+        {
+            self.in_cavlc = true;
+        }
+    }
+
+    /// Leaves CAVLC mode: reseats the accumulator at `cavlc_bit_pos`.
+    ///
+    /// `BsEndCavlc` (`codec/decoder/core/src/parse_mb_syn_cavlc.cpp`). `left_bits` goes **negative on
+    /// purpose**: `-16 + (idx & 7)` is the same −16 bias every other prime uses, offset
+    /// by the sub-byte phase the 4-byte load was shifted by.
+    ///
+    /// The 4-byte load at `idx >> 3` indexes the slice, so **`buf` must be the whole
+    /// readable allocation, not the RBSP plus a constant**: `cavlc_bit_pos` is advanced
+    /// by whatever each residual symbol consumed, so on a truncated stream it can run
+    /// past the RBSP end. Out-of-range byte loads are clamped with a `get()` fallback
+    /// returning zero rather than panicking.
+    ///
+    /// Round-tripping restores the *reading position*, not the field values: the
+    /// re-prime can leave the accumulator holding more valid bits than it did before
+    /// [`start_cavlc`](Self::start_cavlc). Since it always holds at least 16, every read
+    /// the codec makes (widths 1..=16) is unaffected — see
+    /// [`get_bits`](Self::get_bits).
+    #[inline]
+    pub fn end_cavlc(&mut self, buf: &[u8]) {
+        let idx = self.cavlc_bit_pos;
+        self.pos = (idx >> 3).max(0) as usize;
+        let b0 = buf.get(self.pos).copied().unwrap_or(0);
+        let b1 = buf.get(self.pos + 1).copied().unwrap_or(0);
+        let b2 = buf.get(self.pos + 2).copied().unwrap_or(0);
+        let b3 = buf.get(self.pos + 3).copied().unwrap_or(0);
+        let cache = u32::from_be_bytes([b0, b1, b2, b3]);
+        self.cur_bits = cache << ((idx & 0x07) as u32);
+        self.pos += 4;
+        self.left_bits = -16 + ((idx & 0x07) as i32);
+        #[cfg(debug_assertions)]
+        {
+            self.in_cavlc = false;
+        }
+    }
+
+    /// The absolute bit position — the C++ `iIndex`. Live only in CAVLC mode.
+    #[inline]
+    pub fn cavlc_bit_pos(&self) -> isize {
+        self.debug_assert_in_cavlc("cavlc_bit_pos");
+        self.cavlc_bit_pos
+    }
+
+    /// Advances the absolute bit position by `bits` — the C++ `pBs->iIndex += n`, which
+    /// is how the residual path reports what it consumed.
+    #[inline]
+    pub fn advance_cavlc_bits(&mut self, bits: isize) {
+        self.debug_assert_in_cavlc("advance_cavlc_bits");
+        self.cavlc_bit_pos += bits;
+    }
+
+    // -----------------------------------------------------------------------
+    // The CAVLC↔CABAC handoff: named operations rather than `set_cur_bits`/
+    // `set_left_bits` setters, because each of these writes is only coherent as
+    // part of a whole handoff.
+    // -----------------------------------------------------------------------
+
+    /// Marks the accumulator spent because the CABAC engine has taken over the
+    /// position.
+    ///
+    /// `InitCabacDecEngineFromBS`'s closing `iLeftBits = 0`.
+    /// The engine reads from the shared buffer from here on; the cursor's accumulator
+    /// is meaningless until [`restore_from_cabac`] or a re-prime.
+    ///
+    /// [`restore_from_cabac`]: Self::restore_from_cabac
+    #[inline]
+    pub fn hand_off_to_cabac(&mut self) {
+        self.debug_assert_out_of_cavlc("hand_off_to_cabac");
+        self.left_bits = 0;
+    }
+
+    /// Takes the position back from the CABAC engine, at byte offset `pos`.
+    ///
+    /// `RestoreCabacDecEngineToBS`'s four writes:
+    /// position, a cleared accumulator, and `cavlc_bit_pos` zeroed. That last write
+    /// happens *outside* any CAVLC region, so it is part of the handoff rather than a
+    /// mode operation and does not assert.
+    #[inline]
+    pub fn restore_from_cabac(&mut self, pos: usize) {
+        self.pos = pos;
+        self.cur_bits = 0;
+        self.left_bits = 0;
+        self.cavlc_bit_pos = 0;
+        #[cfg(debug_assertions)]
+        {
+            self.in_cavlc = false;
+        }
+    }
+
+    /// The raw `cavlc_bit_pos` field, with no mode assertion — state inspection, in
+    /// the same family as [`cur_bits`](Self::cur_bits) and
+    /// [`left_bits`](Self::left_bits). Production code wants
+    /// [`cavlc_bit_pos`](Self::cavlc_bit_pos), which asserts.
+    #[inline]
+    pub fn cavlc_bit_pos_state(&self) -> isize {
+        self.cavlc_bit_pos
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// A bitstream write position — the writing half of `SBitStringAux`.
+///
+/// Implements the canonical semantics of `codec/common/inc/bit_stream.h`: no masking
+/// of the value, no `iLen <= 0` guard. Writes are checked against buffer capacity;
+/// writing past the end sets `overflow` rather than panicking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BsWriter {
+    pos: usize,
+    cur_bits: u32,
+    left_bits: i32,
+    overflow: bool,
+}
+
+impl Default for BsWriter {
+    /// The state `InitBits` establishes: empty accumulator, 32 bits free.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stores `value` big-endian at `buf[pos..pos + 4]`.
+///
+/// Returns `Err(())` if fewer than 4 bytes remain at `pos`.
+#[inline(always)]
+fn write_be_32(buf: &mut [u8], pos: usize, value: u32) -> Result<(), ()> {
+    let target = buf.get_mut(pos..pos + 4).ok_or(())?;
+    target.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+impl BsWriter {
+    /// A writer positioned at the start of a buffer.
+    ///
+    /// Mirrors `InitBits` (`codec/encoder/core/inc/vlc_encoder.h`).
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            pos: 0,
+            cur_bits: 0,
+            left_bits: 32,
+            overflow: false,
+        }
+    }
+
+    /// Bytes written so far — the C++ `pCurBuf - pStartBuf`. Whole words only; bits
+    /// still in the accumulator are not counted (use [`bits_pos`](Self::bits_pos)).
+    #[inline(always)]
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Bits free in the accumulator — the C++ `iLeftBits`.
+    #[inline(always)]
+    pub fn left_bits(&self) -> i32 {
+        self.left_bits
+    }
+
+    /// Returns whether any write exceeded buffer capacity.
+    #[inline(always)]
+    pub fn is_overflow(&self) -> bool {
+        self.overflow
+    }
+
+    /// Explicitly sets the overflow state.
+    #[inline(always)]
+    pub fn set_overflow(&mut self, overflow: bool) {
+        self.overflow = overflow;
+    }
+
+    /// A writer positioned at `pos` with an empty accumulator.
+    ///
+    /// One caller: the CABAC slice tail (`WelsWriteSliceEndSyn`), where the arithmetic
+    /// coder has written bytes through its own cursor into the same buffer and hands
+    /// the position back.
+    #[inline(always)]
+    pub fn at(pos: usize) -> Self {
+        Self {
+            pos,
+            cur_bits: 0,
+            left_bits: 32,
+            overflow: false,
+        }
+    }
+
+    /// The write position in bits.
+    ///
+    /// Mirrors `BsGetBitsPos`.
+    #[inline(always)]
+    pub fn bits_pos(&self) -> i32 {
+        ((self.pos as i32) << 3) + 32 - self.left_bits
+    }
+
+    /// Writes the low `n` bits of `value`, MSB first.
+    ///
+    /// Mirrors `BsWriteBits`.
+    ///
+    /// # Contract
+    /// `n` in `1..=32`, and `value` must have no bits set above bit `n-1`: it is ORed
+    /// into the accumulator unmasked and unasserted.
+    #[inline(always)]
+    pub fn write_bits(&mut self, buf: &mut [u8], n: i32, value: u32) {
+        if n < self.left_bits {
+            self.cur_bits = (self.cur_bits << n) | value;
+            self.left_bits -= n;
+        } else {
+            let rem = n - self.left_bits; // 0..=31, since left_bits >= 1
+            // `cur_bits << left_bits` with left_bits == 32 would panic; it is only
+            // reachable with an empty accumulator, where the shift contributes nothing.
+            debug_assert!(
+                self.left_bits < 32 || self.cur_bits == 0,
+                "a full accumulator must be empty: left_bits={} cur_bits={:#x}",
+                self.left_bits,
+                self.cur_bits
+            );
+            let head = if self.left_bits >= 32 {
+                0
+            } else {
+                self.cur_bits << self.left_bits
+            };
+            if write_be_32(buf, self.pos, head | (value >> rem)).is_err() {
+                self.overflow = true;
+            }
+            self.pos += 4;
+            self.cur_bits = value & ((1u32 << rem) - 1);
+            self.left_bits = 32 - rem;
+        }
+    }
+
+    /// Writes one bit. Mirrors `BsWriteOneBit`.
+    #[inline(always)]
+    pub fn write_one_bit(&mut self, buf: &mut [u8], value: u32) {
+        self.write_bits(buf, 1, value);
+    }
+
+    /// Writes an unsigned Exp-Golomb code, `ue(v)`.
+    ///
+    /// The code length is [`size_ue`], `2 * floor(log2(value + 1)) + 1`.
+    ///
+    /// # Panics
+    /// On `u32::MAX`, where `value + 1` overflows.
+    #[inline(always)]
+    pub fn write_ue(&mut self, buf: &mut [u8], value: u32) {
+        let len = size_ue(value) as i32;
+        if len <= 32 {
+            self.write_bits(buf, len, value + 1);
+        } else {
+            let half = len >> 1;
+            self.write_bits(buf, half, 0);
+            self.write_bits(buf, half + 1, value + 1);
+        }
+    }
+
+    /// Writes a signed Exp-Golomb code, `se(v)`.
+    ///
+    /// The magnitude is taken with `unsigned_abs`, so `i32::MIN` encodes the wrapped
+    /// value instead of overflowing.
+    #[inline(always)]
+    pub fn write_se(&mut self, buf: &mut [u8], value: i32) {
+        let code = if value > 0 {
+            ((value as u32) << 1) - 1
+        } else {
+            value.unsigned_abs() << 1
+        };
+        self.write_ue(buf, code);
+    }
+
+    /// Flushes the accumulator, padding the last byte with zeros.
+    ///
+    /// Stores a full 32-bit word if 4 bytes remain, or the exact needed bytes if space allows.
+    /// If buffer space is insufficient, records an overflow without panicking.
+    #[inline]
+    pub fn flush(&mut self, buf: &mut [u8]) {
+        if self.left_bits < 32 {
+            let needed_bytes = 4 - (self.left_bits as usize / 8);
+            let val = self.cur_bits << self.left_bits;
+            if self.pos + 4 <= buf.len() {
+                if write_be_32(buf, self.pos, val).is_err() {
+                    self.overflow = true;
+                }
+            } else if let Some(target) = buf.get_mut(self.pos..self.pos + needed_bytes) {
+                target.copy_from_slice(&val.to_be_bytes()[..needed_bytes]);
+            } else {
+                self.overflow = true;
+            }
+            self.pos += needed_bytes;
+            self.left_bits = 32;
+            self.cur_bits = 0;
+        }
+    }
+
+    /// Writes `rbsp_stop_one_bit` and flushes to byte alignment.
+    ///
+    /// Mirrors `BsRbspTrailingBits`.
+    #[inline]
+    pub fn rbsp_trailing_bits(&mut self, buf: &mut [u8]) {
+        self.write_one_bit(buf, 1);
+        self.flush(buf);
+    }
+
+    /// Writes a truncated Exp-Golomb code, `te(v)`.
+    ///
+    /// Mirrors `BsWriteTE`: at `x == 1` the range is
+    /// binary and the code is the *inverted* single bit; otherwise it is `ue(v)`.
+    #[inline]
+    pub fn write_te(&mut self, buf: &mut [u8], x: i32, value: u32) {
+        if x == 1 {
+            self.write_one_bit(buf, u32::from(value == 0));
+        } else {
+            self.write_ue(buf, value);
+        }
+    }
+
+    /// Pads to the next byte boundary with **one** bits, then flushes.
+    ///
+    /// `cabac_alignment_one_bit`: the one bits are normative, unlike
+    /// [`flush`](Self::flush)'s zero padding, which widening the accumulator to a byte
+    /// boundary first makes unreachable.
+    #[inline]
+    pub fn align(&mut self, buf: &mut [u8]) {
+        let rem = self.left_bits & 7;
+        if rem != 0 {
+            self.cur_bits <<= rem;
+            self.cur_bits |= (1 << rem) - 1;
+            self.left_bits &= !7;
+        }
+        self.flush(buf);
+    }
+}
+
+/// Bit length of the `ue(v)` encoding of `value`.
+///
+/// # Panics
+/// On `u32::MAX`.
+#[inline(always)]
+pub fn size_ue(value: u32) -> u32 {
+    // floor(log2(value + 1)) prefix zeros, one stop bit, that many suffix bits.
+    2 * (31 - (value + 1).leading_zeros()) + 1
+}
+
+/// Bit length of the `se(v)` encoding of `value`.
+#[inline]
+pub fn size_se(value: i32) -> u32 {
+    if value == 0 {
+        1
+    } else if value > 0 {
+        size_ue(((value as u32) << 1) - 1)
+    } else {
+        size_ue(value.unsigned_abs() << 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safe::prng::Prng;
+
+    /// An RBSP plus the slack the reader relies on (see `get_bits`).
+    fn with_slack(payload: &[u8]) -> Vec<u8> {
+        let mut v = payload.to_vec();
+        v.extend_from_slice(&[0u8; 4]);
+        v
+    }
+
+    #[test]
+    fn init_mirrors_dec_init_bits() {
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        let c = BsCursor::init(&buf, 64).unwrap();
+        assert_eq!(c.cur_bits(), 0xAABBCCDD);
+        assert_eq!(c.left_bits(), -16);
+        assert_eq!(c.bits(), 64);
+        assert_eq!(c.pos(), 4);
+        assert_eq!(c.len(), 8);
+    }
+
+    #[test]
+    fn init_rejects_an_empty_rbsp() {
+        assert_eq!(BsCursor::init(&[0u8; 8], 0), Err(ErrInfo::INVALID_ACCESS));
+        assert_eq!(BsCursor::init(&[0u8; 8], -8), Err(ErrInfo::INVALID_ACCESS));
+    }
+
+    #[test]
+    fn init_read_bits_honours_its_end_offset() {
+        // A one-byte RBSP: starting a read that must leave one byte spare fails.
+        let buf = with_slack(&[0x80]);
+        let mut c = BsCursor::init(&buf, 8).unwrap();
+        c.pos = 0;
+        assert_eq!(c.init_read_bits(&buf, 1), Err(ErrInfo::INVALID_ACCESS));
+        assert_eq!(c.init_read_bits(&buf, 0), Ok(()));
+
+        // Short 1-byte buffer without slack initializes safely via GetValue4BytesSafe
+        let c_no_slack = BsCursor::init(&[0x80], 8).unwrap();
+        assert_eq!(c_no_slack.cur_bits(), 0x80000000);
+    }
+
+    #[test]
+    fn dec_init_bits_handles_short_seed_bytes_safely() {
+        // C++ test: DecoderBitStreamBoundsTest.DecInitBitsHandlesShortSeedBytesSafely
+        let buf = [0xff, 0xff, 0xff];
+        let mut c = BsCursor::init(&buf, 24).unwrap();
+
+        assert_eq!(c.get_bits(&buf, 16), Ok(0xffff));
+        assert_eq!(c.get_bits(&buf, 16), Ok(0xff00));
+        assert_eq!(c.get_bits(&buf, 16), Err(ErrInfo::READ_OVERFLOW));
+    }
+
+    #[test]
+    fn bs_get_bits_stops_on_two_byte_overread() {
+        // C++ test: DecoderBitStreamBoundsTest.BsGetBitsStopsOnTwoByteOverread
+        let buf = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let mut c = BsCursor::init(&buf, 48).unwrap();
+
+        assert_eq!(c.get_bits(&buf, 16), Ok(0xffff));
+        assert_eq!(c.get_bits(&buf, 16), Ok(0xffff));
+        assert_eq!(c.get_bits(&buf, 16), Ok(0xffff));
+        assert_eq!(c.get_bits(&buf, 16), Err(ErrInfo::READ_OVERFLOW));
+    }
+
+    #[test]
+    fn reads_the_exp_golomb_examples_from_the_spec() {
+        // '1' -> 0, '010' -> 1, '011' -> 2, '00100' -> 3
+        let buf = with_slack(&[0b1_010_011_0, 0b0100_0000]);
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        assert_eq!(c.get_ue(&buf), Ok(0));
+        assert_eq!(c.get_ue(&buf), Ok(1));
+        assert_eq!(c.get_ue(&buf), Ok(2));
+        assert_eq!(c.get_ue(&buf), Ok(3));
+    }
+
+    #[test]
+    fn se_maps_code_numbers_the_way_the_spec_does() {
+        // ue(1) -> +1, ue(2) -> -1, ue(3) -> +2, ue(4) -> -2
+        let buf = with_slack(&[0b010_011_00, 0b100_00101]);
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        assert_eq!(c.get_se(&buf), Ok(1));
+        assert_eq!(c.get_se(&buf), Ok(-1));
+        assert_eq!(c.get_se(&buf), Ok(2));
+        assert_eq!(c.get_se(&buf), Ok(-2));
+    }
+
+    #[test]
+    fn te0_special_cases_its_small_ranges() {
+        let buf = with_slack(&[0b1010_0000]);
+        let mut c = BsCursor::init(&buf, 8).unwrap();
+        assert_eq!(c.get_te0(&buf, 1), Ok(0), "range 1 consumes nothing");
+        assert_eq!(c.peek_bits(1), 1);
+        assert_eq!(c.get_te0(&buf, 2), Ok(0), "range 2 reads one inverted bit");
+        assert_eq!(c.get_te0(&buf, 3), Ok(1), "range 3+ is plain ue(v)");
+    }
+
+    #[test]
+    fn an_all_zero_accumulator_is_a_leading_zero_error() {
+        let buf = with_slack(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut c = BsCursor::init(&buf, 64).unwrap();
+        assert_eq!(c.get_ue(&buf), Err(ErrInfo::READ_LEADING_ZERO));
+    }
+
+    #[test]
+    fn reading_past_the_rbsp_end_overflows_at_the_slop_boundary() {
+        // Two payload bytes, plenty of slack: the cursor may sit at len + 1 but no
+        // further, so a long read eventually returns READ_OVERFLOW rather than data.
+        let buf = with_slack(&[0xFF, 0xFF]);
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = c.get_bits(&buf, 8) {
+                err = Some(e);
+                break;
+            }
+        }
+        assert_eq!(err, Some(ErrInfo::READ_OVERFLOW));
+        assert!(
+            c.pos() > c.len(),
+            "the C++ predicate allows one byte of slop"
+        );
+    }
+
+    #[test]
+    fn a_buffer_without_slack_errors_instead_of_reading_past_it() {
+        // A 2-byte payload without slack initializes safely via GetValue4BytesSafe,
+        // and reads error with READ_OVERFLOW instead of running past the end.
+        let buf = [0xFFu8, 0xFF];
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = c.get_bits(&buf, 8) {
+                err = Some(e);
+                break;
+            }
+        }
+        assert_eq!(err, Some(ErrInfo::READ_OVERFLOW));
+
+        let buf = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = c.get_bits(&buf, 8) {
+                err = Some(e);
+                break;
+            }
+        }
+        assert_eq!(err, Some(ErrInfo::READ_OVERFLOW));
+    }
+
+    #[test]
+    fn check_more_rbsp_data_counts_from_the_steady_state_refill() {
+        // The formula subtracts a *fixed* 2 bytes — the size of one refill — so it only
+        // tells the truth once the cursor is in its steady state: right after the
+        // 4-byte prime it over-counts by 16 bits, and a one-byte RBSP holding nothing
+        // but the stop bit still reports "more data".
+        let buf = with_slack(&[0b1000_0000]);
+        let c = BsCursor::init(&buf, 8).unwrap();
+        assert!(c.check_more_rbsp_data());
+
+        // In the steady state it answers as intended: consume everything but the stop
+        // bit of a 4-byte RBSP and it goes false.
+        let buf = with_slack(&[0xFF, 0xFF, 0xFF, 0b1000_0000]);
+        let mut c = BsCursor::init(&buf, 32).unwrap();
+        assert!(c.check_more_rbsp_data());
+        for _ in 0..3 {
+            c.get_bits(&buf, 8).unwrap();
+        }
+        assert!(c.check_more_rbsp_data());
+        c.get_bits(&buf, 7).unwrap();
+        assert!(!c.check_more_rbsp_data(), "only the stop bit is left");
+    }
+
+    #[test]
+    fn trailing_bits_counts_zeros_below_the_stop_bit() {
+        assert_eq!(trailing_bits(0b0000_1000), 3);
+        assert_eq!(trailing_bits(0b1000_0000), 7);
+        assert_eq!(trailing_bits(1), 0);
+        assert_eq!(trailing_bits(0), 0, "the C++ returns 0, not an error");
+    }
+
+    #[test]
+    fn cursor_is_copy_so_a_position_can_be_saved() {
+        let buf = with_slack(&[0b1010_1010, 0b1100_1100]);
+        let mut c = BsCursor::init(&buf, 16).unwrap();
+        let saved = c;
+        assert_eq!(c.get_bits(&buf, 4), Ok(0b1010));
+        c = saved;
+        assert_eq!(c.get_bits(&buf, 4), Ok(0b1010), "rewound to the same bits");
+    }
+
+    // -----------------------------------------------------------------------
+    // CAVLC mode
+    // -----------------------------------------------------------------------
+
+    /// Randomised round counts shrink under Miri; the shapes tested — every bit phase,
+    /// every width — do not.
+    fn scale_unit(n: usize) -> usize {
+        if cfg!(miri) { (n / 25).max(2) } else { n }
+    }
+
+    /// A payload long enough that any `end_cavlc` prime in these tests is in bounds.
+    fn cavlc_buf(prng: &mut Prng, n: usize) -> Vec<u8> {
+        with_slack(&prng.bytes(n))
+    }
+
+    #[test]
+    fn start_cavlc_projects_the_cursor_onto_an_absolute_bit_position() {
+        // After `init` the accumulator holds 32 valid bits primed from bytes 0..4, so
+        // the next unread bit is bit 0 and `pos` is 4: 4*8 - (16 - (-16)) = 0.
+        let buf = with_slack(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
+        let mut c = BsCursor::init(&buf, 48).unwrap();
+        assert_eq!((c.pos(), c.left_bits()), (4, -16));
+        c.start_cavlc();
+        assert_eq!(c.cavlc_bit_pos(), 0);
+        c.end_cavlc(&buf);
+
+        // Consume 12 bits and it is 12, whatever the refill did to `pos`/`left_bits`.
+        let mut c = BsCursor::init(&buf, 48).unwrap();
+        c.get_bits(&buf, 12).unwrap();
+        c.start_cavlc();
+        assert_eq!(c.cavlc_bit_pos(), 12);
+    }
+
+    #[test]
+    fn end_cavlc_reseats_the_window_at_every_bit_phase() {
+        // The −16 half-window arithmetic, byte-aligned and at each of the 7 unaligned
+        // phases: `left_bits` is `-16 + (idx & 7)` — negative for phase 0 and rising to
+        // −9 at phase 7 — and `pos` is `(idx >> 3) + 4`.
+        let buf = with_slack(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67]);
+        for phase in 0..8usize {
+            for byte in 0..4usize {
+                let idx = (byte * 8 + phase) as isize;
+                let mut c = BsCursor::init(&buf, 64).unwrap();
+                c.start_cavlc();
+                c.advance_cavlc_bits(idx);
+                c.end_cavlc(&buf);
+
+                assert_eq!(c.pos(), byte + 4, "pos = (idx >> 3) + 4 at phase {phase}");
+                assert_eq!(
+                    c.left_bits(),
+                    -16 + phase as i32,
+                    "left_bits = -16 + (idx & 7) at phase {phase}"
+                );
+                let expect =
+                    u32::from_be_bytes([buf[byte], buf[byte + 1], buf[byte + 2], buf[byte + 3]])
+                        << phase;
+                assert_eq!(
+                    c.cur_bits(),
+                    expect,
+                    "the 4-byte prime is shifted by idx & 7"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cavlc_round_trip_reads_on_identically() {
+        // The round trip restores the *reading position*, not the field values — the
+        // re-prime can leave more valid bits in the accumulator than were there before.
+        // Reads of 1..=16 bits are the ones that must agree, and they are the only
+        // widths the codec uses.
+        let mut prng = Prng::new(0x5CA1_AB1E);
+        let buf = cavlc_buf(&mut prng, 64);
+
+        for _ in 0..scale_unit(400) {
+            let skip = prng.below(96) as i32;
+            let mut untouched = BsCursor::init(&buf, 64 * 8).unwrap();
+            for _ in 0..skip {
+                untouched.get_bits(&buf, 1).unwrap();
+            }
+            let mut cycled = untouched;
+            cycled.start_cavlc();
+            assert_eq!(
+                cycled.cavlc_bit_pos(),
+                skip as isize,
+                "the projection is the bit count"
+            );
+            cycled.end_cavlc(&buf);
+
+            for _ in 0..8 {
+                let n = 1 + prng.below(16) as i32;
+                assert_eq!(
+                    cycled.get_bits(&buf, n),
+                    untouched.get_bits(&buf, n),
+                    "a cycled cursor reads on identically after skipping {skip} bits"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advancing_the_bit_position_is_what_end_cavlc_seeks_to() {
+        // Advancing by N and ending the mode is the same reading state as consuming N
+        // bits without the mode at all.
+        let mut prng = Prng::new(0xF00D_1234);
+        let buf = cavlc_buf(&mut prng, 64);
+
+        for used in [0isize, 1, 7, 8, 9, 15, 16, 17, 31, 33, 64, 127] {
+            let mut plain = BsCursor::init(&buf, 64 * 8).unwrap();
+            for _ in 0..used {
+                plain.get_bits(&buf, 1).unwrap();
+            }
+            let mut moded = BsCursor::init(&buf, 64 * 8).unwrap();
+            moded.start_cavlc();
+            moded.advance_cavlc_bits(used);
+            moded.end_cavlc(&buf);
+
+            for _ in 0..4 {
+                assert_eq!(
+                    moded.get_bits(&buf, 16),
+                    plain.get_bits(&buf, 16),
+                    "advance_cavlc_bits({used}) lands where {used} single-bit reads do"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_mode_flag_is_not_part_of_equality() {
+        // Equality must mean the same thing in debug and release, so the `cfg`-gated
+        // flag is excluded: two cursors differing *only* by mode are equal.
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let plain = BsCursor::init(&buf, 32).unwrap();
+        let mut in_mode = plain;
+        in_mode.start_cavlc();
+        // `start_cavlc` writes `cavlc_bit_pos`, which *is* compared — so re-zero it via a
+        // second cursor that entered the mode at the same position.
+        let mut also_in_mode = plain;
+        also_in_mode.start_cavlc();
+        assert_eq!(in_mode, also_in_mode);
+
+        // And a cursor whose bit position differs is unequal, in both profiles.
+        let mut moved = also_in_mode;
+        moved.advance_cavlc_bits(1);
+        assert_ne!(
+            in_mode, moved,
+            "cavlc_bit_pos is one of the six compared fields"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ran inside a CAVLC region")]
+    fn reading_the_accumulator_inside_the_mode_panics_in_debug() {
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut c = BsCursor::init(&buf, 32).unwrap();
+        c.start_cavlc();
+        let _ = c.get_bits(&buf, 4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ran inside a CAVLC region")]
+    fn peeking_inside_the_mode_panics_in_debug() {
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut c = BsCursor::init(&buf, 32).unwrap();
+        c.start_cavlc();
+        let _ = c.peek_bits(4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ran outside a CAVLC region")]
+    fn reading_the_bit_position_outside_the_mode_panics_in_debug() {
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let c = BsCursor::init(&buf, 32).unwrap();
+        let _ = c.cavlc_bit_pos();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ran outside a CAVLC region")]
+    fn advancing_the_bit_position_after_end_cavlc_panics_in_debug() {
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut c = BsCursor::init(&buf, 32).unwrap();
+        c.start_cavlc();
+        c.end_cavlc(&buf);
+        c.advance_cavlc_bits(4);
+    }
+
+    #[test]
+    fn the_bit_position_survives_end_cavlc_for_the_parity_tests() {
+        // `end_cavlc` clears the mode but leaves `cavlc_bit_pos` set; the state
+        // accessor reads it without asserting.
+        let buf = with_slack(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let mut c = BsCursor::init(&buf, 48).unwrap();
+        c.start_cavlc();
+        c.advance_cavlc_bits(19);
+        c.end_cavlc(&buf);
+        assert_eq!(c.cavlc_bit_pos_state(), 19);
+        // …and the accumulator is usable again.
+        assert!(c.get_bits(&buf, 4).is_ok());
+    }
+
+    #[test]
+    fn writer_round_trips_through_the_reader() {
+        let mut out = vec![0u8; 64];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 3, 0b101);
+        w.write_ue(&mut out, 300);
+        w.write_se(&mut out, -7);
+        w.write_one_bit(&mut out, 1);
+        w.write_bits(&mut out, 17, 0x1_5A5A);
+        let bits = w.bits_pos();
+        w.rbsp_trailing_bits(&mut out);
+
+        let mut c = BsCursor::init(&out, bits + 1).unwrap();
+        assert_eq!(c.get_bits(&out, 3), Ok(0b101));
+        assert_eq!(c.get_ue(&out), Ok(300));
+        assert_eq!(c.get_se(&out), Ok(-7));
+        assert_eq!(c.get_one_bit(&out), Ok(1));
+        assert_eq!(c.get_bits(&out, 17), Ok(0x1_5A5A));
+    }
+
+    #[test]
+    fn writer_flushes_whole_words_and_counts_partial_bytes() {
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 12, 0xABC);
+        assert_eq!(w.bits_pos(), 12);
+        assert_eq!(w.pos(), 0, "nothing leaves the accumulator until 32 bits");
+        w.flush(&mut out);
+        assert_eq!(&out[..2], &[0xAB, 0xC0]);
+        assert_eq!(w.pos(), 2, "12 bits round up to 2 bytes");
+        assert_eq!(w.bits_pos(), 16);
+    }
+
+    #[test]
+    fn writer_handles_the_exact_accumulator_boundary() {
+        // A write whose width exactly equals the bits free in the accumulator.
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 20, 0xA_5A5A);
+        w.write_bits(&mut out, 12, 0xC3C); // exactly fills the word
+        assert_eq!(w.pos(), 4);
+        assert_eq!(w.left_bits(), 32);
+        assert_eq!(&out[..4], &[0xA5, 0xA5, 0xAC, 0x3C]);
+        // A 32-bit write into an empty accumulator: the shift-by-32 case.
+        w.write_bits(&mut out, 32, 0xDEAD_BEEF);
+        assert_eq!(&out[4..8], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(w.pos(), 8);
+    }
+
+    #[test]
+    fn writer_snapshot_and_rollback_restores_the_bytes_too() {
+        // Rollback needs the saved writer and the bytes it had written.
+        let mut out = vec![0u8; 32];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 16, 0x1234);
+        let saved = w;
+        let bytes_before = out.clone();
+
+        w.write_bits(&mut out, 24, 0x9A_BCDE);
+        w.write_ue(&mut out, 42);
+
+        w = saved;
+        out.copy_from_slice(&bytes_before);
+        w.write_bits(&mut out, 16, 0x5678);
+        w.flush(&mut out);
+        assert_eq!(&out[..4], &[0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn writing_past_the_buffer_does_not_panic_and_records_overflow() {
+        let mut out = vec![0u8; 3];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 32, 0x1234_5678);
+        assert!(w.is_overflow());
+        assert_eq!(w.pos(), 4);
+
+        // Flushes with undersized buffer also record overflow without panicking.
+        let mut out2 = vec![0u8; 1];
+        let mut w2 = BsWriter::new();
+        w2.write_bits(&mut out2, 16, 0xABCD);
+        w2.flush(&mut out2);
+        assert!(w2.is_overflow());
+    }
+
+    #[test]
+    fn write_te_is_ue_except_at_x_equals_one() {
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        // x == 1: the bit is inverted — 0 writes a 1, anything else writes a 0.
+        w.write_te(&mut out, 1, 0);
+        w.write_te(&mut out, 1, 1);
+        assert_eq!(w.bits_pos(), 2);
+        w.flush(&mut out);
+        assert_eq!(out[0], 0b1000_0000);
+
+        // x != 1: plain ue(v), whatever x is.
+        for x in [0, 2, 7] {
+            let mut a = vec![0u8; 16];
+            let mut b = vec![0u8; 16];
+            let (mut wa, mut wb) = (BsWriter::new(), BsWriter::new());
+            wa.write_te(&mut a, x, 5);
+            wb.write_ue(&mut b, 5);
+            assert_eq!((wa, a), (wb, b), "te(v) at x={x} must be ue(v)");
+        }
+    }
+
+    #[test]
+    fn align_pads_with_ones_where_flush_pads_with_zeros() {
+        // `cabac_alignment_one_bit`: the padding value is normative, and it is the
+        // one place the writer does not pad with zeros.
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 3, 0b101);
+        w.align(&mut out);
+        assert_eq!(out[0], 0b1011_1111, "five pad bits, all ones");
+        assert_eq!(w.pos(), 1);
+        assert_eq!(w.left_bits(), 32);
+
+        // Already aligned: align is then exactly flush, and adds no byte.
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        w.write_bits(&mut out, 8, 0xC3);
+        w.align(&mut out);
+        assert_eq!(&out[..2], &[0xC3, 0x00]);
+        assert_eq!(w.pos(), 1);
+
+        // Empty accumulator: nothing to pad and nothing to flush.
+        let mut out = vec![0u8; 16];
+        let mut w = BsWriter::new();
+        w.align(&mut out);
+        assert_eq!(w.pos(), 0);
+        assert_eq!(out[0], 0);
+    }
+
+    #[test]
+    fn size_ue_matches_the_definition() {
+        assert_eq!(size_ue(0), 1);
+        assert_eq!(size_ue(1), 3);
+        assert_eq!(size_ue(2), 3);
+        assert_eq!(size_ue(3), 5);
+        assert_eq!(size_ue(6), 5);
+        assert_eq!(size_ue(7), 7);
+        assert_eq!(size_se(0), 1);
+        assert_eq!(size_se(1), 3);
+        assert_eq!(size_se(-1), 3);
+    }
+
+    #[test]
+    fn write_then_read_survives_prng_op_sequences() {
+        let mut rng = Prng::new(0x5EED_1234);
+        for round in 0..200 {
+            let mut ops: Vec<(u8, i64)> = Vec::new();
+            for _ in 0..rng.below(24) + 1 {
+                match rng.below(3) {
+                    0 => {
+                        // 16 is the widest read the refill can serve — see `get_bits`.
+                        let n = rng.range_i32(1, 16);
+                        let v = rng.next_u32() & ((1u32 << n) - 1);
+                        ops.push((0, ((n as i64) << 32) | v as i64));
+                    }
+                    1 => ops.push((1, rng.below(4096) as i64)),
+                    _ => ops.push((2, rng.range_i32(-2048, 2048) as i64)),
+                }
+            }
+
+            let mut out = vec![0u8; 1024];
+            let mut w = BsWriter::new();
+            for &(kind, arg) in &ops {
+                match kind {
+                    0 => w.write_bits(&mut out, (arg >> 32) as i32, arg as u32),
+                    1 => w.write_ue(&mut out, arg as u32),
+                    _ => w.write_se(&mut out, arg as i32),
+                }
+            }
+            let bits = w.bits_pos();
+            w.rbsp_trailing_bits(&mut out);
+
+            let mut c = BsCursor::init(&out, bits + 1).unwrap();
+            for &(kind, arg) in &ops {
+                let got = match kind {
+                    0 => c.get_bits(&out, (arg >> 32) as i32).map(|v| v as i64),
+                    1 => c.get_ue(&out).map(|v| v as i64),
+                    _ => c.get_se(&out).map(|v| v as i64),
+                };
+                let want = if kind == 0 { arg & 0xFFFF_FFFF } else { arg };
+                assert_eq!(
+                    got,
+                    Ok(want),
+                    "round {round}, seed {:#x}, op kind {kind}",
+                    rng.seed()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_ue_values_round_trip_at_every_phase_and_preserve_left_bits_invariant() {
+        let values = [
+            65_534u32,
+            65_535,
+            65_536,
+            131_071,
+            1_000_000,
+            0x7FFF_FFFF,
+            u32::MAX - 1,
+        ];
+        for phase in 0..=32i32 {
+            for &v in &values {
+                let mut out = vec![0u8; 64];
+                let mut w = BsWriter::new();
+                if phase > 0 {
+                    let p1 = phase.min(16);
+                    w.write_bits(&mut out, p1, (1u32 << p1) - 1);
+                    if phase > 16 {
+                        let p2 = phase - 16;
+                        w.write_bits(&mut out, p2, (1u32 << p2) - 1);
+                    }
+                }
+                w.write_ue(&mut out, v);
+                w.write_bits(&mut out, 8, 0xA5);
+                let bits = w.bits_pos();
+                w.rbsp_trailing_bits(&mut out);
+
+                let mut c = BsCursor::init(&out, bits + 1).unwrap();
+                if phase > 0 {
+                    let p1 = phase.min(16);
+                    assert_eq!(c.get_bits(&out, p1), Ok((1u32 << p1) - 1));
+                    if phase > 16 {
+                        let p2 = phase - 16;
+                        assert_eq!(c.get_bits(&out, p2), Ok((1u32 << p2) - 1));
+                    }
+                }
+                assert_eq!(c.get_ue(&out), Ok(v), "phase={phase}, v={v}");
+                assert!(
+                    (-16..=0).contains(&c.left_bits()),
+                    "left_bits={} out of -16..=0 after get_ue({v}) at phase {phase}",
+                    c.left_bits()
+                );
+                assert_eq!(c.get_bits(&out, 8), Ok(0xA5), "phase={phase}, v={v}");
+            }
+        }
+    }
+}

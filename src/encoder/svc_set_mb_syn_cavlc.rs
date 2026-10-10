@@ -1,0 +1,1147 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! CAVLC Macroblock Syntax Elements Serialization and Residual Bitstream Encoding.
+//!
+//! `codec/encoder/core/src/svc_set_mb_syn_cavlc.cpp`,
+//! `codec/encoder/core/inc/svc_set_mb_syn.h`.
+
+#![forbid(unsafe_code)]
+
+pub use crate::encoder::encoder_context::EWelsSliceType;
+pub use crate::encoder::encoder_context::SDCTCoeff;
+pub use crate::encoder::encoder_context::SMVUnitXY;
+pub use crate::encoder::encoder_context::sWelsEncCtx;
+pub use crate::encoder::md::SMB;
+pub use crate::encoder::md::SMbCache;
+pub use crate::encoder::svc_encode_slice::SDqLayer;
+pub use crate::encoder::svc_encode_slice::SSlice;
+pub use crate::encoder::svc_encode_slice::SSliceHeader;
+pub use crate::encoder::svc_encode_slice::SSliceHeaderExt;
+pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
+use crate::safe::bits::BsWriter;
+
+// ============================================================================
+// Macroblock Type & Sub-MB Type Constants
+// ============================================================================
+
+pub const MB_TYPE_INTRA4x4: u32 = 0x00000001;
+pub const MB_TYPE_INTRA16x16: u32 = 0x00000002;
+pub const MB_TYPE_INTRA8x8: u32 = 0x00000004;
+pub const MB_TYPE_16x16: u32 = 0x00000008;
+pub const MB_TYPE_16x8: u32 = 0x00000010;
+pub const MB_TYPE_8x16: u32 = 0x00000020;
+pub const MB_TYPE_8x8: u32 = 0x00000040;
+pub const MB_TYPE_8x8_REF0: u32 = 0x00000080;
+pub const MB_TYPE_SKIP: u32 = 0x00000100;
+/// `wels_common_defs.h:286` — 0x00000800, not 0x200 (0x200 is `MB_TYPE_INTRA_PCM`).
+pub use crate::encoder::deblocking::MB_TYPE_DIRECT;
+
+pub const SUB_MB_TYPE_8x8: u32 = 0x00000001;
+
+pub const LUMA_DC: i32 = 0;
+pub const LUMA_AC: i32 = 1;
+pub const LUMA_4x4: i32 = 2;
+pub const CHROMA_DC: i32 = 3;
+pub const CHROMA_AC: i32 = 4;
+
+pub const CHROMA_DC_NC_OFFSET: i8 = 17;
+
+pub const MAX_MACROBLOCK_SIZE_IN_BYTE: usize = 400;
+pub const MAX_MACROBLOCK_SIZE_IN_BYTE_x2: usize = MAX_MACROBLOCK_SIZE_IN_BYTE << 1; // 800
+
+pub const ENC_RETURN_SUCCESS: i32 = 0;
+pub const ENC_RETURN_VLCOVERFLOWFOUND: i32 = 0x40;
+
+#[inline(always)]
+pub fn IS_SKIP(mb_type: u32) -> bool {
+    (mb_type & MB_TYPE_SKIP) != 0
+}
+
+#[inline(always)]
+pub fn IS_INTRA4x4(mb_type: u32) -> bool {
+    mb_type == MB_TYPE_INTRA4x4
+}
+
+#[inline(always)]
+pub fn IS_INTRA16x16(mb_type: u32) -> bool {
+    mb_type == MB_TYPE_INTRA16x16
+}
+
+#[inline(always)]
+pub fn IS_Inter_8x8(mb_type: u32) -> bool {
+    (mb_type & MB_TYPE_8x8) != 0
+}
+
+#[inline(always)]
+pub fn CLIP3_QP_0_51(x: i32) -> i32 {
+    x.clamp(0, 51)
+}
+
+#[inline(always)]
+pub fn wels_non_zero_count_average(nA: i8, nB: i8) -> i8 {
+    let mut nC = (nA as i32) + (nB as i32) + 1;
+    let shift = if nA != -1 && nB != -1 { 1 } else { 0 };
+    nC >>= shift;
+    let add = if nA == -1 && nB == -1 { 1 } else { 0 };
+    nC += add;
+    nC as i8
+}
+
+// ============================================================================
+// Global Lookup Tables
+// ============================================================================
+
+pub const g_kuiIntra4x4CbpMap: [u32; 48] = [
+    3, 29, 30, 17, 31, 18, 37, 8, 32, 38, 19, 9, 20, 10, 11, 2, // 15
+    16, 33, 34, 21, 35, 22, 39, 4, 36, 40, 23, 5, 24, 6, 7, 1, // 31
+    41, 42, 43, 25, 44, 26, 46, 12, 45, 47, 27, 13, 28, 14, 15, 0, // 47
+];
+
+pub const g_kuiInterCbpMap: [u32; 48] = [
+    0, 2, 3, 7, 4, 8, 17, 13, 5, 18, 9, 14, 10, 15, 16, 11, // 15
+    1, 32, 33, 36, 34, 37, 44, 40, 35, 45, 38, 41, 39, 42, 43, 19, // 31
+    6, 24, 25, 20, 26, 21, 46, 28, 27, 47, 22, 29, 23, 30, 31, 12, // 47
+];
+
+pub use crate::common::common_tables::{
+    g_kiMapModeI16x16, g_kiMapModeIntraChroma, g_kuiCache48CountScan4Idx, g_kuiChromaQpTable,
+    g_kuiMbCountScan4Idx,
+};
+
+// `g_kuiGolombUELength` is a common-layer table (`common_tables.cpp:886`).
+pub use crate::common::wels_common_defs::g_kuiGolombUELength;
+
+// `g_kuiEncNcMapTable` is `encoder_data_tables.cpp`'s.
+pub use crate::encoder::vlc_encoder::g_kuiEncNcMapTable;
+
+// ============================================================================
+// Bitstream Writers
+// ============================================================================
+
+// One writer family, `vlc_encoder.rs`'s — `codec/common/inc/golomb_common.h`.
+use crate::encoder::md::MB_BLOCK4x4_NUM;
+use crate::encoder::svc_encode_slice::{SDynamicSlicingStack, current_layer_expect, layer_pps_ref};
+use crate::encoder::vlc_encoder::{
+    BsGetBitsPos, g_kuiVlcCoeffToken, g_kuiVlcRunBefore, g_kuiVlcTotalZeros,
+    g_kuiVlcTotalZerosChromaDc,
+};
+pub use crate::encoder::vlc_encoder::{
+    BsWriteBits, BsWriteOneBit, BsWriteSE, BsWriteTE, BsWriteUE,
+};
+use crate::safe::mb_grid::MbWindow;
+
+// ============================================================================
+// Core C-compatible Data Structures
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TagMVComponentUnit {
+    pub sMotionVectorCache: [SMVUnitXY; 29],
+    pub iRefIndexCache: [i8; 30],
+}
+
+impl Default for TagMVComponentUnit {
+    fn default() -> Self {
+        Self {
+            sMotionVectorCache: [SMVUnitXY::default(); 29],
+            iRefIndexCache: [0; 30],
+        }
+    }
+}
+
+// ============================================================================
+// CAVLC Parameter Calculation and Residual Writing
+// ============================================================================
+
+/// Calculates non-zero count, level, run, and total zero statistics for CAVLC transform blocks.
+///
+/// `iLastIndex` is clamped to the block on entry rather than asserted: every call site
+/// passes 15 or 3, matching the block passed beside it, and clamping keeps a future
+/// caller from reading past the slice.
+pub fn CavlcParamCal_c(
+    pCoffLevel: &[i16],
+    pRun: &mut [u8; 16],
+    pLevel: &mut [i16; 16],
+    pTotalCoeff: &mut i32,
+    iEndIdx: i32,
+) -> i32 {
+    let mut iTotalZeros = 0i32;
+    let mut iTotalCoeffs = 0i32;
+    let mut iLastIndex = iEndIdx.min(pCoffLevel.len() as i32 - 1);
+
+    while iLastIndex >= 0 && pCoffLevel[iLastIndex as usize] == 0 {
+        iLastIndex -= 1;
+    }
+
+    while iLastIndex >= 0 {
+        let mut iCountZero = 0u8;
+        pLevel[iTotalCoeffs as usize] = pCoffLevel[iLastIndex as usize];
+        iLastIndex -= 1;
+
+        while iLastIndex >= 0 && pCoffLevel[iLastIndex as usize] == 0 {
+            iCountZero += 1;
+            iLastIndex -= 1;
+        }
+        iTotalZeros += iCountZero as i32;
+        pRun[iTotalCoeffs as usize] = iCountZero;
+        iTotalCoeffs += 1;
+    }
+    *pTotalCoeff = iTotalCoeffs;
+    iTotalZeros
+}
+
+/// Serializes transform coefficient block residuals into the CAVLC bitstream.
+pub fn WriteBlockResidualCavlc(
+    pFuncList: &SWelsFuncPtrList,
+    pCoffLevel: &[i16],
+    iEndIdx: i32,
+    iCalRunLevelFlag: i32,
+    iResidualProperty: i32,
+    iNC: i8,
+    buf: &mut [u8],
+    pBs: &mut BsWriter,
+) -> i32 {
+    let nc_idx = g_kuiEncNcMapTable[iNC.clamp(0, 17) as usize] as usize;
+    if iCalRunLevelFlag == 0 {
+        let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][0][0];
+        BsWriteBits(
+            buf,
+            &mut *pBs,
+            upCoeffToken[1] as i32,
+            upCoeffToken[0] as u32,
+        );
+        return ENC_RETURN_SUCCESS;
+    }
+
+    let mut iLevel = [0i16; 16];
+    let mut uiRun = [0u8; 16];
+    let mut iTotalCoeffs = 0i32;
+
+    let _ = pFuncList;
+    let iTotalZeros = crate::simd::kernels::quant::cavlc_param_cal(
+        pCoffLevel,
+        &mut uiRun,
+        &mut iLevel,
+        &mut iTotalCoeffs,
+        iEndIdx,
+    );
+
+    if iTotalCoeffs == 0 {
+        let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][0][0];
+        BsWriteBits(
+            buf,
+            &mut *pBs,
+            upCoeffToken[1] as i32,
+            upCoeffToken[0] as u32,
+        );
+        return ENC_RETURN_SUCCESS;
+    }
+
+    let mut iTrailingOnes = 0i32;
+    let mut uiSign = 0u32;
+    let iCount = if iTotalCoeffs > 3 { 3 } else { iTotalCoeffs };
+    for i in 0..iCount {
+        let lv = iLevel[i as usize];
+        if lv.abs() == 1 {
+            iTrailingOnes += 1;
+            uiSign = (uiSign << 1) | ((lv < 0) as u32);
+        } else {
+            break;
+        }
+    }
+
+    let total_coeffs_idx = (iTotalCoeffs as usize).min(16);
+    let trailing_ones_idx = (iTrailingOnes as usize).min(3);
+
+    // Coeff token
+    let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][total_coeffs_idx][trailing_ones_idx];
+    let mut iValue = upCoeffToken[0] as u32;
+    let mut n = upCoeffToken[1] as i32;
+
+    // Trailing ones sign bits
+    n += iTrailingOnes;
+    iValue = (iValue << iTrailingOnes) + uiSign;
+    BsWriteBits(buf, &mut *pBs, n, iValue);
+
+    // Levels
+    let mut uiSuffixLength = if iTotalCoeffs > 10 && iTrailingOnes < 3 {
+        1i32
+    } else {
+        0i32
+    };
+
+    for i in iTrailingOnes..iTotalCoeffs {
+        let iVal = iLevel[i as usize] as i32;
+        let mut iLevelCode = (iVal - 1) * 2;
+        let sign = (iLevelCode >> 31) as u32;
+        iLevelCode = (iLevelCode ^ (sign as i32)) + ((sign as i32) << 1);
+        if i == iTrailingOnes && iTrailingOnes < 3 {
+            iLevelCode -= 2;
+        }
+
+        let mut iLevelPrefix = iLevelCode >> uiSuffixLength;
+        let mut iLevelSuffixSize = uiSuffixLength;
+        let mut iLevelSuffix = iLevelCode - (iLevelPrefix << uiSuffixLength);
+
+        if iLevelPrefix >= 14 && iLevelPrefix < 30 && uiSuffixLength == 0 {
+            iLevelPrefix = 14;
+            iLevelSuffix = iLevelCode - iLevelPrefix;
+            iLevelSuffixSize = 4;
+        } else if iLevelPrefix >= 15 {
+            iLevelPrefix = 15;
+            iLevelSuffix = iLevelCode - (iLevelPrefix << uiSuffixLength);
+            if (iLevelSuffix >> 11) != 0 {
+                return ENC_RETURN_VLCOVERFLOWFOUND;
+            }
+            if uiSuffixLength == 0 {
+                iLevelSuffix -= 15;
+            }
+            iLevelSuffixSize = 12;
+        }
+
+        n = iLevelPrefix + 1 + iLevelSuffixSize;
+        iValue = (1u32 << iLevelSuffixSize) | (iLevelSuffix as u32);
+        BsWriteBits(buf, &mut *pBs, n, iValue);
+
+        if uiSuffixLength == 0 {
+            uiSuffixLength += 1;
+        }
+        let iThreshold = 3 << (uiSuffixLength - 1);
+        if (iVal > iThreshold || iVal < -iThreshold) && uiSuffixLength < 6 {
+            uiSuffixLength += 1;
+        }
+    }
+
+    // Total zeros
+    if iTotalCoeffs < iEndIdx + 1 {
+        if CHROMA_DC != iResidualProperty {
+            let upTotalZeros =
+                g_kuiVlcTotalZeros[(iTotalCoeffs as usize).min(15)][(iTotalZeros as usize).min(15)];
+            n = upTotalZeros[1] as i32;
+            iValue = upTotalZeros[0] as u32;
+            BsWriteBits(buf, &mut *pBs, n, iValue);
+        } else {
+            let upTotalZeros = g_kuiVlcTotalZerosChromaDc[(iTotalCoeffs as usize).min(3)]
+                [(iTotalZeros as usize).min(3)];
+            n = upTotalZeros[1] as i32;
+            iValue = upTotalZeros[0] as u32;
+            BsWriteBits(buf, &mut *pBs, n, iValue);
+        }
+    }
+
+    // Run before
+    let mut iZerosLeft = iTotalZeros;
+    let mut i = 0i32;
+    while i + 1 < iTotalCoeffs && iZerosLeft > 0 {
+        let uirun = uiRun[i as usize] as usize;
+        // `set_mb_syn_cavlc.cpp:223` — `g_kuiZeroLeftMap[iZerosLeft]`, i.e.
+        // saturate at 7.
+        let iZeroLeft =
+            crate::encoder::vlc_encoder::g_kuiZeroLeftMap[(iZerosLeft as usize).min(15)] as usize;
+        let upRunBefore = g_kuiVlcRunBefore[iZeroLeft][uirun.min(14)];
+        n = upRunBefore[1] as i32;
+        iValue = upRunBefore[0] as u32;
+        BsWriteBits(buf, &mut *pBs, n, iValue);
+        iZerosLeft -= uirun as i32;
+        i += 1;
+    }
+
+    ENC_RETURN_SUCCESS
+}
+
+// ============================================================================
+// Core CAVLC Macroblock Serialization Functions
+// ============================================================================
+
+/// Encodes macroblock prediction headers (macroblock type, intra modes, MVDs) for CAVLC.
+///
+/// Matches `void WelsSpatialWriteMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb)`
+pub fn WelsSpatialWriteMbPred(
+    _pEncCtx: &sWelsEncCtx,
+    pSlice: &mut SSlice,
+    pCurMb: &mut SMB,
+    pSliceBsBuf: &mut [u8],
+    pCtxOutBs: &mut Option<&mut BsWriter>,
+) {
+    let pMbCache = &mut pSlice.sMbCacheInfo;
+    let pBs = crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs);
+    let buf = pSliceBsBuf;
+    let pSliceHeadExt = &mut pSlice.sSliceHeaderExt;
+    let iNumRefIdxl0ActiveMinus1 = (pSliceHeadExt.sSliceHeader.uiNumRefIdxL0Active as i32) - 1;
+
+    let uiMbType = pCurMb.uiMbType;
+    let iCbpChroma = (pCurMb.uiCbp >> 4) as i32;
+    let iCbpLuma = (pCurMb.uiCbp & 15) as i32;
+
+    // svc_set_mb_syn_cavlc.cpp:76
+    let iMbOffset = match pSliceHeadExt.sSliceHeader.eSliceType {
+        EWelsSliceType::I_SLICE => 0,
+        EWelsSliceType::P_SLICE => 5,
+        _ => return,
+    };
+
+    let mut sMvd: [SMVUnitXY; 2] = [SMVUnitXY::default(), SMVUnitXY::default()];
+
+    match uiMbType {
+        MB_TYPE_INTRA4x4 => {
+            BsWriteUE(buf, &mut *pBs, (iMbOffset + 0) as u32);
+
+            for iMode in 0..MB_BLOCK4x4_NUM {
+                let flag = pMbCache.bPrevIntra4x4PredModeFlag[iMode];
+                BsWriteOneBit(buf, &mut *pBs, if flag { 1 } else { 0 });
+                if !flag {
+                    BsWriteBits(
+                        buf,
+                        &mut *pBs,
+                        3,
+                        pMbCache.iRemIntra4x4PredModeFlag[iMode] as u32,
+                    );
+                }
+            }
+
+            BsWriteUE(
+                buf,
+                &mut *pBs,
+                g_kiMapModeIntraChroma[pMbCache.uiChmaI8x8Mode as usize] as u32,
+            );
+        }
+
+        MB_TYPE_INTRA16x16 => {
+            let val = 1
+                + iMbOffset
+                + (g_kiMapModeI16x16[pMbCache.uiLumaI16x16Mode as usize] as i32)
+                + (iCbpChroma << 2)
+                + (if iCbpLuma == 0 { 0 } else { 12 });
+            BsWriteUE(buf, &mut *pBs, val as u32);
+
+            BsWriteUE(
+                buf,
+                &mut *pBs,
+                g_kiMapModeIntraChroma[pMbCache.uiChmaI8x8Mode as usize] as u32,
+            );
+        }
+
+        MB_TYPE_16x16 => {
+            BsWriteUE(buf, &mut *pBs, 0);
+            sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
+
+            if iNumRefIdxl0ActiveMinus1 > 0 {
+                BsWriteTE(
+                    buf,
+                    &mut *pBs,
+                    iNumRefIdxl0ActiveMinus1,
+                    pCurMb.iRefIndex[0] as u32,
+                );
+            }
+
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
+        }
+
+        MB_TYPE_16x8 => {
+            BsWriteUE(buf, &mut *pBs, 1);
+
+            sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
+            sMvd[1].sDeltaMv(pCurMb.sMv[8], pMbCache.sMbMvp[1]);
+
+            if iNumRefIdxl0ActiveMinus1 > 0 {
+                BsWriteTE(
+                    buf,
+                    &mut *pBs,
+                    iNumRefIdxl0ActiveMinus1,
+                    pCurMb.iRefIndex[0] as u32,
+                );
+                BsWriteTE(
+                    buf,
+                    &mut *pBs,
+                    iNumRefIdxl0ActiveMinus1,
+                    pCurMb.iRefIndex[2] as u32,
+                );
+            }
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvX as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvY as i32);
+        }
+
+        MB_TYPE_8x16 => {
+            BsWriteUE(buf, &mut *pBs, 2);
+
+            sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
+            sMvd[1].sDeltaMv(pCurMb.sMv[2], pMbCache.sMbMvp[1]);
+
+            if iNumRefIdxl0ActiveMinus1 > 0 {
+                BsWriteTE(
+                    buf,
+                    &mut *pBs,
+                    iNumRefIdxl0ActiveMinus1,
+                    pCurMb.iRefIndex[0] as u32,
+                );
+                BsWriteTE(
+                    buf,
+                    &mut *pBs,
+                    iNumRefIdxl0ActiveMinus1,
+                    pCurMb.iRefIndex[1] as u32,
+                );
+            }
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvX as i32);
+            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvY as i32);
+        }
+
+        _ => {}
+    }
+}
+
+/// Encodes 8x8 sub-macroblock prediction headers for CAVLC.
+///
+/// Matches `void WelsSpatialWriteSubMbPred (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb)`
+pub fn WelsSpatialWriteSubMbPred(
+    _pEncCtx: &sWelsEncCtx,
+    pSlice: &mut SSlice,
+    pCurMb: &mut SMB,
+    pSliceBsBuf: &mut [u8],
+    pCtxOutBs: &mut Option<&mut BsWriter>,
+) {
+    let pMbCache = &mut pSlice.sMbCacheInfo;
+    let pBs = crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs);
+    let buf = pSliceBsBuf;
+    let pSliceHeadExt = &mut pSlice.sSliceHeaderExt;
+
+    let iNumRefIdxl0ActiveMinus1 = (pSliceHeadExt.sSliceHeader.uiNumRefIdxL0Active as i32) - 1;
+
+    let bSubRef0: bool;
+    let mut kpScan4_idx = 0usize;
+
+    // `LD32 (pCurMb->pRefIndex)` — the four 8x8 reference indices as one word.
+    let ref_idx_u32 = u32::from_ne_bytes(pCurMb.iRefIndex.map(|r| r as u8));
+    if ref_idx_u32 == 0 {
+        BsWriteUE(buf, &mut *pBs, 4);
+        bSubRef0 = false;
+    } else {
+        BsWriteUE(buf, &mut *pBs, 3);
+        bSubRef0 = true;
+    }
+
+    // sub_mb_type
+    for i in 0..4 {
+        match pCurMb.uiSubMbType[i] as u32 {
+            SUB_MB_TYPE_8x8 => {
+                BsWriteUE(buf, &mut *pBs, 0);
+            }
+            // Every writer of `uiSubMbType` in this encoder sets `SUB_MB_TYPE_8x8`,
+            // and upstream's only other writers are inside `#if 0` at
+            // `svc_mode_decision.cpp:634-661`.
+            other => {
+                debug_assert_eq!(
+                    other, SUB_MB_TYPE_8x8,
+                    "sub_mb_type {:#x} — the sub-8x8 search is #if 0 upstream and unwritten here",
+                    other
+                );
+            }
+        }
+    }
+
+    // Get and write uiRefIndex and sMvd
+    if iNumRefIdxl0ActiveMinus1 > 0 && bSubRef0 {
+        BsWriteTE(
+            buf,
+            &mut *pBs,
+            iNumRefIdxl0ActiveMinus1,
+            pCurMb.iRefIndex[0] as u32,
+        );
+        BsWriteTE(
+            buf,
+            &mut *pBs,
+            iNumRefIdxl0ActiveMinus1,
+            pCurMb.iRefIndex[1] as u32,
+        );
+        BsWriteTE(
+            buf,
+            &mut *pBs,
+            iNumRefIdxl0ActiveMinus1,
+            pCurMb.iRefIndex[2] as u32,
+        );
+        BsWriteTE(
+            buf,
+            &mut *pBs,
+            iNumRefIdxl0ActiveMinus1,
+            pCurMb.iRefIndex[3] as u32,
+        );
+    }
+
+    // Write sMvd
+    for i in 0..4 {
+        let uiSubMbType = pCurMb.uiSubMbType[i] as u32;
+        let s0 = g_kuiMbCountScan4Idx[kpScan4_idx] as usize;
+
+        let cur_mv = &pCurMb.sMv;
+
+        if SUB_MB_TYPE_8x8 == uiSubMbType {
+            BsWriteSE(
+                buf,
+                &mut *pBs,
+                (cur_mv[s0].iMvX - pMbCache.sMbMvp[s0].iMvX) as i32,
+            );
+            BsWriteSE(
+                buf,
+                &mut *pBs,
+                (cur_mv[s0].iMvY - pMbCache.sMbMvp[s0].iMvY) as i32,
+            );
+        } else {
+            // See the `sub_mb_type` match above for the reachability argument.
+            debug_assert_eq!(
+                uiSubMbType, SUB_MB_TYPE_8x8,
+                "sub_mb_type {:#x} — the sub-8x8 search is #if 0 upstream and unwritten here",
+                uiSubMbType
+            );
+        }
+        kpScan4_idx += 4;
+    }
+}
+
+/// Checks bitstream buffer safety threshold.
+///
+/// Matches `int32_t CheckBitstreamBuffer (const uint32_t kuiSliceIdx, sWelsEncCtx* pEncCtx, SBitStringAux* pBs)`
+///
+/// The C++ computes `iLeftLength = pEndBuf - pCurBuf - 1` as a signed pointer difference
+/// and compares it twice. Both comparisons stay in comparison form against `pos`/`len`
+/// rather than as a subtraction: `len - pos - 1` on `usize` wraps to a huge number
+/// exactly where the signed original goes negative, which turns an overflow report into
+/// a silent pass.
+///
+///   `iLeftLength > 0`  <=>  `pos + 1 < len`
+///   `iLeftLength < K`  <=>  `len < pos + 1 + K`   (true when `pos >= len`, where the
+///                                                  signed form is negative)
+pub fn CheckBitstreamBuffer(
+    _kuiSliceIdx: u32,
+    _pEncCtx: &sWelsEncCtx,
+    buf: &[u8],
+    pBs: &BsWriter,
+) -> i32 {
+    let (pos, len) = (pBs.pos(), buf.len());
+    if pBs.is_overflow() || len < pos + 1 + MAX_MACROBLOCK_SIZE_IN_BYTE_x2 {
+        return ENC_RETURN_VLCOVERFLOWFOUND;
+    }
+    ENC_RETURN_SUCCESS
+}
+
+/// Top-level macroblock CAVLC bitstream serialization function.
+///
+/// Matches `int32_t WelsSpatialWriteMbSyn (sWelsEncCtx* pEncCtx, SSlice* pSlice, SMB* pCurMb)`
+pub fn WelsSpatialWriteMbSyn(
+    pEncCtx: &sWelsEncCtx,
+    pSlice: &mut SSlice,
+    mbs: &mut MbWindow<'_, SMB>,
+    pSliceBsBuf: &mut [u8],
+    pCtxOutBs: &mut Option<&mut BsWriter>,
+) -> i32 {
+    let Some(pPps) = layer_pps_ref(pEncCtx, current_layer_expect(pEncCtx)) else {
+        return crate::encoder::wels_preprocess::ENC_RETURN_UNEXPECTED;
+    };
+    let kuiChromaQpIndexOffset = pPps.uiChromaQpIndexOffset;
+
+    let pBs = crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs);
+    if pBs.is_overflow() {
+        return ENC_RETURN_VLCOVERFLOWFOUND;
+    }
+
+    if IS_SKIP(mbs.cur().uiMbType) {
+        mbs.cur_mut().uiLumaQp = pSlice.uiLastMbQp;
+        let idx = CLIP3_QP_0_51((mbs.cur().uiLumaQp as i32) + (kuiChromaQpIndexOffset as i32));
+        mbs.cur_mut().uiChromaQp = g_kuiChromaQpTable[idx as usize];
+
+        pSlice.iMbSkipRun += 1;
+        ENC_RETURN_SUCCESS
+    } else {
+        if pEncCtx.eSliceType != EWelsSliceType::I_SLICE {
+            let kiMbSkipRun = pSlice.iMbSkipRun as u32;
+            BsWriteUE(
+                &mut *pSliceBsBuf,
+                crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs),
+                kiMbSkipRun,
+            );
+            pSlice.iMbSkipRun = 0;
+        }
+
+        // Write mb type and pred
+        if IS_Inter_8x8(mbs.cur().uiMbType) {
+            WelsSpatialWriteSubMbPred(
+                pEncCtx,
+                &mut *pSlice,
+                mbs.cur_mut(),
+                &mut *pSliceBsBuf,
+                &mut *pCtxOutBs,
+            );
+        } else {
+            WelsSpatialWriteMbPred(
+                pEncCtx,
+                &mut *pSlice,
+                mbs.cur_mut(),
+                &mut *pSliceBsBuf,
+                &mut *pCtxOutBs,
+            );
+        }
+        let pBs =
+            crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs);
+
+        // Write coded block pattern
+        if IS_INTRA4x4(mbs.cur().uiMbType) {
+            let buf = &mut *pSliceBsBuf;
+            BsWriteUE(
+                buf,
+                &mut *pBs,
+                g_kuiIntra4x4CbpMap[mbs.cur().uiCbp as usize],
+            );
+        } else if !IS_INTRA16x16(mbs.cur().uiMbType) {
+            let buf = &mut *pSliceBsBuf;
+            BsWriteUE(buf, &mut *pBs, g_kuiInterCbpMap[mbs.cur().uiCbp as usize]);
+        }
+
+        // Write QP and residual
+        if mbs.cur().uiCbp > 0 || IS_INTRA16x16(mbs.cur().uiMbType) {
+            let kiDeltaQp = (mbs.cur().uiLumaQp as i32) - (pSlice.uiLastMbQp as i32);
+            pSlice.uiLastMbQp = mbs.cur().uiLumaQp;
+
+            BsWriteSE(&mut *pSliceBsBuf, &mut *pBs, kiDeltaQp);
+            let pMbCache = &mut pSlice.sMbCacheInfo;
+            let buf = &mut *pSliceBsBuf;
+            if WelsWriteMbResidual(
+                pEncCtx.func_list(),
+                &mut *pMbCache,
+                mbs.cur(),
+                buf,
+                &mut *pBs,
+            ) != 0
+            {
+                return ENC_RETURN_VLCOVERFLOWFOUND;
+            }
+        } else {
+            mbs.cur_mut().uiLumaQp = pSlice.uiLastMbQp;
+            // `kuiChromaQpIndexOffset` is bound at this function's head from the same
+            // expression; nothing between the two can change the layer's PPS.
+            let idx = CLIP3_QP_0_51((mbs.cur().uiLumaQp as i32) + (kuiChromaQpIndexOffset as i32));
+            mbs.cur_mut().uiChromaQp = g_kuiChromaQpTable[idx as usize];
+        }
+
+        let pBs =
+            crate::encoder::svc_encode_slice::slice_bs_writer(&mut pSlice.sSliceBs, pCtxOutBs);
+        if pBs.is_overflow() {
+            return ENC_RETURN_VLCOVERFLOWFOUND;
+        }
+
+        // Check the left buffer
+        CheckBitstreamBuffer(pSlice.iSliceIdx as u32, pEncCtx, &*pSliceBsBuf, &*pBs)
+    }
+}
+
+/// Serializes all macroblock quantized transform coefficient residuals using CAVLC.
+///
+/// Matches `int32_t WelsWriteMbResidual (SWelsFuncPtrList* pFuncList, SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pBs)`
+pub fn WelsWriteMbResidual(
+    pFuncList: &SWelsFuncPtrList,
+    sMbCacheInfo: &mut SMbCache,
+    pCurMb: &SMB,
+    buf: &mut [u8],
+    pBs: &mut BsWriter,
+) -> i32 {
+    let uiMbType = pCurMb.uiMbType;
+    let kiCbpChroma = (pCurMb.uiCbp >> 4) as i32;
+    let kiCbpLuma = (pCurMb.uiCbp & 0x0F) as i32;
+    // Every index below comes from `g_kuiCache48CountScan4Idx` (max 47) or that
+    // table's 16.. tail plus 24 (max 47), against `[i8; 48]`; the lowest is `9 - 8`.
+
+    let mut iA: i8;
+    let mut iB: i8;
+    let mut iC: i8;
+
+    if IS_INTRA16x16(uiMbType) {
+        // DC luma
+        iA = sMbCacheInfo.iNonZeroCoeffCount[8];
+        iB = sMbCacheInfo.iNonZeroCoeffCount[1];
+        iC = wels_non_zero_count_average(iA, iB);
+        if WriteBlockResidualCavlc(
+            pFuncList,
+            &sMbCacheInfo.sDct.iLumaI16x16Dc[..],
+            15,
+            1,
+            LUMA_4x4,
+            iC,
+            buf,
+            pBs,
+        ) != 0
+        {
+            return ENC_RETURN_VLCOVERFLOWFOUND;
+        }
+
+        // AC Luma
+        if kiCbpLuma != 0 {
+            for i in 0..16 {
+                let iIdx = g_kuiCache48CountScan4Idx[i] as usize;
+                iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
+                iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
+                iC = wels_non_zero_count_average(iA, iB);
+                if WriteBlockResidualCavlc(
+                    pFuncList,
+                    &sMbCacheInfo.sDct.iLumaBlock[i][..],
+                    14,
+                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
+                        1
+                    } else {
+                        0
+                    },
+                    LUMA_AC,
+                    iC,
+                    buf,
+                    pBs,
+                ) != 0
+                {
+                    return ENC_RETURN_VLCOVERFLOWFOUND;
+                }
+            }
+        }
+    } else {
+        // Luma DC AC
+        if kiCbpLuma != 0 {
+            let mut i = 0usize;
+            while i < 16 {
+                if (kiCbpLuma & (1 << (i >> 2))) != 0 {
+                    let iIdx = g_kuiCache48CountScan4Idx[i] as usize;
+                    let kiA = sMbCacheInfo.iNonZeroCoeffCount[iIdx];
+                    let kiB = sMbCacheInfo.iNonZeroCoeffCount[iIdx + 1];
+                    let kiC_val = sMbCacheInfo.iNonZeroCoeffCount[iIdx + 8];
+                    let kiD = sMbCacheInfo.iNonZeroCoeffCount[iIdx + 9];
+
+                    iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
+                    iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
+                    iC = wels_non_zero_count_average(iA, iB);
+                    if WriteBlockResidualCavlc(
+                        pFuncList,
+                        &sMbCacheInfo.sDct.iLumaBlock[i][..],
+                        15,
+                        if kiA > 0 { 1 } else { 0 },
+                        LUMA_4x4,
+                        iC,
+                        buf,
+                        pBs,
+                    ) != 0
+                    {
+                        return ENC_RETURN_VLCOVERFLOWFOUND;
+                    }
+
+                    iA = kiA;
+                    iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 7];
+                    iC = wels_non_zero_count_average(iA, iB);
+                    if WriteBlockResidualCavlc(
+                        pFuncList,
+                        &sMbCacheInfo.sDct.iLumaBlock[i + 1][..],
+                        15,
+                        if kiB > 0 { 1 } else { 0 },
+                        LUMA_4x4,
+                        iC,
+                        buf,
+                        pBs,
+                    ) != 0
+                    {
+                        return ENC_RETURN_VLCOVERFLOWFOUND;
+                    }
+
+                    iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx + 7];
+                    iB = kiA;
+                    iC = wels_non_zero_count_average(iA, iB);
+                    if WriteBlockResidualCavlc(
+                        pFuncList,
+                        &sMbCacheInfo.sDct.iLumaBlock[i + 2][..],
+                        15,
+                        if kiC_val > 0 { 1 } else { 0 },
+                        LUMA_4x4,
+                        iC,
+                        buf,
+                        pBs,
+                    ) != 0
+                    {
+                        return ENC_RETURN_VLCOVERFLOWFOUND;
+                    }
+
+                    iA = kiC_val;
+                    iB = kiB;
+                    iC = wels_non_zero_count_average(iA, iB);
+                    if WriteBlockResidualCavlc(
+                        pFuncList,
+                        &sMbCacheInfo.sDct.iLumaBlock[i + 3][..],
+                        15,
+                        if kiD > 0 { 1 } else { 0 },
+                        LUMA_4x4,
+                        iC,
+                        buf,
+                        pBs,
+                    ) != 0
+                    {
+                        return ENC_RETURN_VLCOVERFLOWFOUND;
+                    }
+                }
+                i += 4;
+            }
+        }
+    }
+
+    if kiCbpChroma != 0 {
+        // Chroma DC residual present
+        // Each row is four coefficients and `iEndIdx` is 3, so the slice is the
+        // exact extent.
+        if WriteBlockResidualCavlc(
+            pFuncList,
+            &sMbCacheInfo.sDct.iChromaDc[0][..],
+            3,
+            1,
+            CHROMA_DC,
+            CHROMA_DC_NC_OFFSET,
+            buf,
+            pBs,
+        ) != 0
+        {
+            return ENC_RETURN_VLCOVERFLOWFOUND;
+        }
+
+        if WriteBlockResidualCavlc(
+            pFuncList,
+            &sMbCacheInfo.sDct.iChromaDc[1][..],
+            3,
+            1,
+            CHROMA_DC,
+            CHROMA_DC_NC_OFFSET,
+            buf,
+            pBs,
+        ) != 0
+        {
+            return ENC_RETURN_VLCOVERFLOWFOUND;
+        }
+
+        // Chroma AC residual present
+        if (kiCbpChroma & 0x02) != 0 {
+            let kCache48CountScan4Idx16base = &g_kuiCache48CountScan4Idx[16..];
+            // Blocks 0..4 are Cb, 4..8 are Cr.
+            for i in 0..4 {
+                let iIdx = kCache48CountScan4Idx16base[i] as usize;
+                iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
+                iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
+                iC = wels_non_zero_count_average(iA, iB);
+                if WriteBlockResidualCavlc(
+                    pFuncList,
+                    &sMbCacheInfo.sDct.iChromaBlock[i][..],
+                    14,
+                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
+                        1
+                    } else {
+                        0
+                    },
+                    CHROMA_AC,
+                    iC,
+                    buf,
+                    pBs,
+                ) != 0
+                {
+                    return ENC_RETURN_VLCOVERFLOWFOUND;
+                }
+            }
+
+            // The Cr half.
+            for i in 0..4 {
+                let iIdx = 24 + (kCache48CountScan4Idx16base[i] as usize);
+                iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
+                iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
+                iC = wels_non_zero_count_average(iA, iB);
+                if WriteBlockResidualCavlc(
+                    pFuncList,
+                    &sMbCacheInfo.sDct.iChromaBlock[4 + i][..],
+                    14,
+                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
+                        1
+                    } else {
+                        0
+                    },
+                    CHROMA_AC,
+                    iC,
+                    buf,
+                    pBs,
+                ) != 0
+                {
+                    return ENC_RETURN_VLCOVERFLOWFOUND;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// The CAVLC stash needs no buffer: a detached cursor is `Copy`, so the whole
+/// snapshot is `*pBs`.
+pub fn StashMBStatusCavlc(
+    pBs: &mut BsWriter,
+    pDss: &mut SDynamicSlicingStack,
+    kuiLastMbQp: u8,
+    iMbSkipRun: i32,
+) {
+    pDss.sBsStack = *pBs;
+    pDss.uiLastMbQp = kuiLastMbQp;
+    pDss.iMbSkipRunStack = iMbSkipRun;
+}
+
+/// See [`StashMBStatusCavlc`] for why this takes no buffer.
+pub fn StashPopMBStatusCavlc(pBs: &mut BsWriter, pDss: &mut SDynamicSlicingStack) -> i32 {
+    *pBs = pDss.sBsStack;
+    pDss.iMbSkipRunStack
+}
+
+/// `StashMBStatusCabac` — set_mb_syn_cavlc.cpp:250.
+///
+/// Saves the whole arithmetic-coder state and copies out the bytes already emitted,
+/// because CABAC renormalisation can rewrite them via `PropagateCarry`; the CAVLC twin
+/// only has to remember three bitstream cursor fields.
+pub fn StashMBStatusCabac(
+    buf: &mut [u8],
+    pDss: &mut SDynamicSlicingStack<'_>,
+    pCabacCtx: &mut crate::encoder::set_mb_syn_cabac::SCabacCtx,
+    kuiLastMbQp: u8,
+    iMbSkipRun: i32,
+) {
+    let pCtx = pCabacCtx;
+    // `SCabacCtx` is `Copy` and holds no pointers, so the whole snapshot is one
+    // assignment.
+    pDss.sStoredCabac = *pCtx;
+    if let Some(pRestore) = pDss.pRestoreBuffer.as_deref_mut() {
+        let iPosBitOffset = GetBsPosCabac(pCtx) - pDss.iStartPos;
+        let iLen = (iPosBitOffset >> 3) + if (iPosBitOffset & 0x07) != 0 { 1 } else { 0 };
+        let start = pCtx.m_iBufStart;
+        let end = (start + iLen.max(0) as usize).min(buf.len());
+        if start <= end {
+            let copy_len = (end - start).min(pRestore.len());
+            pRestore[..copy_len].copy_from_slice(&buf[start..start + copy_len]);
+        }
+    }
+    pDss.uiLastMbQp = kuiLastMbQp;
+    pDss.iMbSkipRunStack = iMbSkipRun;
+}
+
+/// `StashPopMBStatusCabac` — set_mb_syn_cavlc.cpp:261.
+///
+/// Note the offset is recomputed from the *restored* context, so
+/// `GetBsPosCabac` is called after `sStoredCabac` has been copied back.
+pub fn StashPopMBStatusCabac(
+    buf: &mut [u8],
+    pDss: &mut SDynamicSlicingStack<'_>,
+    pCabacCtx: &mut crate::encoder::set_mb_syn_cabac::SCabacCtx,
+) -> i32 {
+    let pCtx = pCabacCtx;
+    *pCtx = pDss.sStoredCabac;
+    // The one write that is not at the cursor.
+    if let Some(pRestore) = pDss.pRestoreBuffer.as_deref() {
+        let iPosBitOffset = GetBsPosCabac(pCtx) - pDss.iStartPos;
+        let iLen = (iPosBitOffset >> 3) + if (iPosBitOffset & 0x07) != 0 { 1 } else { 0 };
+        let start = pCtx.m_iBufStart;
+        let end = (start + iLen.max(0) as usize).min(buf.len());
+        if start <= end {
+            let copy_len = (end - start).min(pRestore.len());
+            buf[start..start + copy_len].copy_from_slice(&pRestore[..copy_len]);
+        }
+    }
+    pDss.iMbSkipRunStack
+}
+
+/// `GetBsPosCabac` — set_mb_syn_cavlc.cpp:275.
+///
+/// The bit position is derived from the arithmetic coder's own byte cursor, not
+/// from `SBitStringAux`: `((m_iBufCur - m_iBufStart) << 3) + (m_iLowBitCnt - 9)`.
+/// The `- 9` is load-bearing and the result can legitimately be negative before
+/// the first byte is emitted.
+///
+/// Both cursor fields are offsets into the same buffer, so the difference is
+/// plain arithmetic and this function needs no buffer — which is why
+/// [`EntropyCoder::GetBsPosition`] takes none on either arm.
+///
+/// [`EntropyCoder::GetBsPosition`]: crate::encoder::wels_func_ptr_def::EntropyCoder::GetBsPosition
+pub fn GetBsPosCabac(pCabacCtx: &crate::encoder::set_mb_syn_cabac::SCabacCtx) -> i32 {
+    let pCtx = pCabacCtx;
+    let diff = pCtx.m_iBufCur.saturating_sub(pCtx.m_iBufStart) as i32;
+    diff * 8 + (pCtx.m_iLowBitCnt - 9)
+}
+
+/// Takes the slice's writer (`slice_bs_writer`) rather than the slice: the writer is
+/// all this reads.
+pub fn GetBsPosCavlc(pBs: &BsWriter) -> i32 {
+    BsGetBitsPos(pBs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cbp_lookup_tables() {
+        assert_eq!(g_kuiIntra4x4CbpMap[0], 3);
+        assert_eq!(g_kuiIntra4x4CbpMap[47], 0);
+        assert_eq!(g_kuiInterCbpMap[0], 0);
+        assert_eq!(g_kuiInterCbpMap[47], 12);
+    }
+
+    #[test]
+    fn test_non_zero_count_average() {
+        assert_eq!(wels_non_zero_count_average(2, 4), 3);
+        assert_eq!(wels_non_zero_count_average(2, -1), 2);
+        assert_eq!(wels_non_zero_count_average(-1, 4), 4);
+        assert_eq!(wels_non_zero_count_average(-1, -1), 0);
+    }
+
+    #[test]
+    fn test_clip3_qp() {
+        assert_eq!(CLIP3_QP_0_51(-5), 0);
+        assert_eq!(CLIP3_QP_0_51(26), 26);
+        assert_eq!(CLIP3_QP_0_51(60), 51);
+    }
+
+    #[test]
+    fn test_cavlc_param_cal() {
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 5;
+        coeffs[2] = -1;
+        coeffs[3] = 1;
+
+        let mut run = [0u8; 16];
+        let mut level = [0i16; 16];
+        let mut total_coeffs = 0i32;
+
+        let total_zeros = CavlcParamCal_c(&coeffs[..], &mut run, &mut level, &mut total_coeffs, 15);
+        assert_eq!(total_coeffs, 3);
+        assert_eq!(total_zeros, 1);
+    }
+}

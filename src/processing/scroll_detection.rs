@@ -1,0 +1,839 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! Scroll detection — `codec/processing/src/scrolldetection/`, the plugin reached
+//! through `METHOD_SCROLL_DETECTION`.
+//!
+//! `CWelsPreProcessScreen::DetectSceneChange` runs it once per P frame against the
+//! first available reference only (`wels_preprocess.cpp`) and hands the
+//! vector to the screen scene-change detector (`SceneChangeDetection.h`), the
+//! mode decision's `JudgeScrollSkip`, and the scrolled motion search.
+//!
+//! A horizontal band of the current frame is picked, a single textured row inside it
+//! is chosen ([`CheckLine`] — four or more distinct values, or two or three with more
+//! than three changes), and the reference frame is scanned outward from that row's own
+//! position for a row that matches it. On a match a window of up to fifty rows around
+//! the pair is verified. The answer is the vertical displacement, previous position
+//! minus current position, so content that moved up by eight rows reports
+//! `iScrollMvY = +8`.
+//!
+//! `iScrollMvX` is always zero — [`ScrollDetectionCore`] sets it so unconditionally
+//! (`ScrollDetectionFuncs.cpp`).
+
+#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
+
+use super::scene_change_detection::ScdPlanes;
+use super::vaacalc::{RET_INVALIDPARAM, RET_SUCCESS};
+use crate::encoder::wels_preprocess::{SPixMap, SScrollDetectionParam};
+
+/// `ScrollDetectionFuncs.h`.
+pub const MINIMUM_DETECT_WIDTH: i32 = 50; // no less than 16
+pub const CHECK_OFFSET: i32 = 25;
+pub const MAX_SCROLL_MV_Y: i32 = 511;
+pub const REGION_NUMBER: i32 = 9;
+
+/// A row-and-column offset into a plane: `row * iStride + x`.
+#[inline]
+fn at(row: i32, iStride: usize, x: i32) -> usize {
+    (row.max(0) as usize) * iStride + (x.max(0) as usize)
+}
+
+/// `CheckLine` — `ScrollDetectionFuncs.cpp`.
+///
+/// Does this row carry enough texture to be worth matching? One colour, never; two or
+/// three, only with more than three transitions; four or more, always.
+///
+/// `iColorMap` is a 256-bit set over the byte values: `RECORD_COLOR` sets bit `v & 31`
+/// of word `v >> 5`.
+pub fn CheckLine(pData: &[u8], iWidth: i32) -> i32 {
+    let iQualified;
+    let mut iColorMap = [0u32; 8];
+    let mut iChangedTimes = 0i32;
+    let mut iColorCounts = 0i32;
+
+    // RECORD_COLOR (pData[0], iColorMap)
+    let t = pData[0];
+    iColorMap[(t >> 5) as usize] |= 1u32 << (t & 31);
+
+    for i in 1..iWidth as usize {
+        let t = pData[i];
+        iColorMap[(t >> 5) as usize] |= 1u32 << (t & 31);
+        iChangedTimes += (pData[i] != pData[i - 1]) as i32;
+    }
+    for i in 0..8 {
+        for j in 0..32 {
+            iColorCounts += ((iColorMap[i] >> j) & 1) as i32;
+        }
+    }
+
+    match iColorCounts {
+        1 => iQualified = 0,
+        2 | 3 => iQualified = (iChangedTimes > 3) as i32,
+        _ => iQualified = 1,
+    }
+    iQualified
+}
+
+/// `SelectTestLine` — `ScrollDetectionFuncs.cpp`.
+///
+/// The row to match on, searched outward from the band's middle: `mid`, `mid + 1`,
+/// `mid - 1`, `mid + 2`, … The first row [`CheckLine`] qualifies wins; `-1` if none in
+/// the band does.
+///
+/// `pY` is the plane's origin, not a row.
+pub fn SelectTestLine(
+    pY: &[u8],
+    iWidth: i32,
+    iHeight: i32,
+    iPicHeight: i32,
+    iStride: i32,
+    iOffsetX: i32,
+    iOffsetY: i32,
+) -> i32 {
+    let kiHalfHeight = iHeight >> 1;
+    let kiMidPos = iOffsetY + kiHalfHeight;
+    let mut TestPos = kiMidPos;
+    let iStride = iStride as usize;
+
+    // Both probes are bounded on both sides, unlike upstream's one-sided tests, so
+    // every row read lies inside the picture whatever `iOffsetY` is; with that, every
+    // row lies within `ScrollDetectionCore`'s `[iMinHeight, iMaxHeight]`.
+    let mut iOffsetAbs = 0;
+    while iOffsetAbs < kiHalfHeight {
+        TestPos = kiMidPos + iOffsetAbs;
+        if TestPos >= 0 && TestPos < iPicHeight {
+            if CheckLine(&pY[at(TestPos, iStride, iOffsetX)..], iWidth) != 0 {
+                break;
+            }
+        }
+        TestPos = kiMidPos - iOffsetAbs;
+        if TestPos >= 0 && TestPos < iPicHeight {
+            if CheckLine(&pY[at(TestPos, iStride, iOffsetX)..], iWidth) != 0 {
+                break;
+            }
+        }
+        iOffsetAbs += 1;
+    }
+    if iOffsetAbs == kiHalfHeight {
+        TestPos = -1;
+    }
+    TestPos
+}
+
+/// `CompareLine` — `ScrollDetectionFuncs.cpp`. 0 when the two rows are equal,
+/// 1 otherwise.
+///
+/// Both slices must hold at least twelve bytes: the first twelve are compared before
+/// `kiWidth` is consulted at all, however narrow the nominal comparison is.
+///
+/// For `kiWidth <= 12` the answer is 1 even when those twelve bytes are equal, the
+/// tail comparison that would clear it running only above twelve. Unreachable from the
+/// encoder: every width [`ScrollDetectionCore`] sees is at least 24 (see
+/// [`CScrollDetection::ScrollDetectionWithoutMask`]), the mask path refuses anything at
+/// or below [`MINIMUM_DETECT_WIDTH`], and [`ScrollDetectionCore`] itself refuses widths
+/// at or below twelve up front — the same "no scroll" this function would produce.
+pub fn CompareLine(pYSrc: &[u8], pYRef: &[u8], kiWidth: i32) -> i32 {
+    let mut iCmp = 1;
+
+    if pYSrc[..12] != pYRef[..12] {
+        return 1;
+    }
+    if kiWidth > 12 {
+        let n = kiWidth as usize - 12;
+        iCmp = (pYSrc[12..12 + n] != pYRef[12..12 + n]) as i32;
+    }
+    iCmp
+}
+
+/// `ScrollDetectionCore` — `ScrollDetectionFuncs.cpp`.
+///
+/// The reference's stride is used for both frames (`ScrollDetectionFuncs.cpp`).
+/// The encoder's two pictures come from one pool and share a geometry, so the strides
+/// are equal; the debug assertion below is that claim.
+pub fn ScrollDetectionCore(
+    pRefPixMap: &SPixMap,
+    planes: &ScdPlanes<'_>,
+    iWidth: i32,
+    iHeight: i32,
+    iOffsetX: i32,
+    iOffsetY: i32,
+    sScrollDetectionParam: &mut SScrollDetectionParam,
+) {
+    let mut bScrollDetected = false;
+    let iPicWidth = pRefPixMap.sRect.iRectWidth;
+    let iPicHeight = pRefPixMap.sRect.iRectHeight;
+    let iYStride = pRefPixMap.iStride[0];
+
+    // Everything the helpers below read is established here; they index without
+    // further checks. `iWidth <= 12` is refused because `CompareLine` reads twelve
+    // bytes regardless and answers "different" for every such width, so upstream can
+    // never detect a scroll there either.
+    if iWidth <= 12
+        || iHeight <= 0
+        || iPicWidth <= 0
+        || iPicHeight <= 0
+        || iYStride <= 0
+        || iOffsetX < 0
+        || iOffsetX
+            .checked_add(iWidth)
+            .is_none_or(|end| end > iPicWidth || end > iYStride)
+    {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+        return;
+    }
+
+    let iMinHeight = iOffsetY.max(0);
+    let iMaxHeight = (iOffsetY.saturating_add(iHeight) - 1).min(iPicHeight - 1);
+    if iMinHeight > iMaxHeight {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+        return;
+    }
+
+    let pYRef = planes.refp;
+    let pYSrc = planes.cur;
+    debug_assert_eq!(
+        planes.cur_stride, planes.ref_stride,
+        "ScrollDetectionCore reads both frames with the reference's stride"
+    );
+    let kiStride = iYStride as usize;
+    let Some(required_len) = (iMaxHeight as usize)
+        .checked_mul(kiStride)
+        .and_then(|row_off| row_off.checked_add((iOffsetX + iWidth) as usize))
+    else {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+        return;
+    };
+    if pYSrc.len() < required_len || pYRef.len() < required_len {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+        return;
+    }
+
+    let iTestPos = SelectTestLine(
+        pYSrc, iWidth, iHeight, iPicHeight, iYStride, iOffsetX, iOffsetY,
+    );
+
+    if iTestPos == -1 {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+        return;
+    }
+    // The source's test row, kept as an offset because the two windows below step
+    // away from it in both directions.
+    let iLineOff = at(iTestPos, kiStride, iOffsetX);
+    let iMaxAbs = (iTestPos - iMinHeight - 1)
+        .max(iMaxHeight - iTestPos)
+        .min(MAX_SCROLL_MV_Y);
+    let mut iSearchPos = iTestPos;
+    let mut iOffsetAbs = 0;
+    while iOffsetAbs <= iMaxAbs {
+        iSearchPos = iTestPos + iOffsetAbs;
+        if iSearchPos <= iMaxHeight {
+            let iTmpOff = at(iSearchPos, kiStride, iOffsetX);
+            if CompareLine(&pYSrc[iLineOff..], &pYRef[iTmpOff..], iWidth) == 0 {
+                let iLowOffset = (iMaxHeight - iSearchPos).min(CHECK_OFFSET);
+                let iCheckedLines = (iTestPos - iMinHeight + iLowOffset).min(2 * CHECK_OFFSET);
+                let iBack = (iCheckedLines - iLowOffset) as usize * kiStride;
+                let mut i = 0;
+                while i < iCheckedLines {
+                    let step = i as usize * kiStride;
+                    if CompareLine(
+                        &pYSrc[iLineOff - iBack + step..],
+                        &pYRef[iTmpOff - iBack + step..],
+                        iWidth,
+                    ) != 0
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i == iCheckedLines {
+                    bScrollDetected = true;
+                    break;
+                }
+            }
+        }
+
+        iSearchPos = iTestPos - iOffsetAbs - 1;
+        if iSearchPos >= iMinHeight {
+            let iTmpOff = at(iSearchPos, kiStride, iOffsetX);
+            if CompareLine(&pYSrc[iLineOff..], &pYRef[iTmpOff..], iWidth) == 0 {
+                let iUpOffset = (iSearchPos - iMinHeight).min(CHECK_OFFSET);
+                let iCheckedLines = (iMaxHeight - iTestPos + iUpOffset).min(2 * CHECK_OFFSET);
+                let iBack = iUpOffset as usize * kiStride;
+                let mut i = 0;
+                while i < iCheckedLines {
+                    let step = i as usize * kiStride;
+                    if CompareLine(
+                        &pYSrc[iLineOff - iBack + step..],
+                        &pYRef[iTmpOff - iBack + step..],
+                        iWidth,
+                    ) != 0
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i == iCheckedLines {
+                    bScrollDetected = true;
+                    break;
+                }
+            }
+        }
+        iOffsetAbs += 1;
+    }
+
+    if !bScrollDetected {
+        sScrollDetectionParam.bScrollDetectFlag = false;
+    } else {
+        sScrollDetectionParam.bScrollDetectFlag = true;
+        sScrollDetectionParam.iScrollMvY = iSearchPos - iTestPos; // pre_pos - cur_pos, change to mv
+        sScrollDetectionParam.iScrollMvX = 0;
+    }
+}
+
+/// `CScrollDetection` — `ScrollDetection.h`.
+#[derive(Debug, Default)]
+pub struct CScrollDetection {
+    pub m_sScrollDetectionParam: SScrollDetectionParam,
+}
+
+impl CScrollDetection {
+    /// `CScrollDetection::Set` — `ScrollDetection.cpp`.
+    pub fn Set(&mut self, pParam: &SScrollDetectionParam) -> i32 {
+        self.m_sScrollDetectionParam = *pParam;
+        RET_SUCCESS
+    }
+
+    /// `CScrollDetection::Get` — `ScrollDetection.cpp`. Copies the whole
+    /// parameter block back.
+    pub fn Get(&self, pParam: &mut SScrollDetectionParam) -> i32 {
+        *pParam = self.m_sScrollDetectionParam;
+        RET_SUCCESS
+    }
+
+    /// `CScrollDetection::Process` — `ScrollDetection.cpp`.
+    pub fn Process(
+        &mut self,
+        pSrcPixMap: &SPixMap,
+        pRefPixMap: &SPixMap,
+        planes: &ScdPlanes<'_>,
+    ) -> i32 {
+        if planes.refp.is_empty()
+            || planes.cur.is_empty()
+            || pSrcPixMap.sRect.iRectWidth <= 0
+            || pSrcPixMap.sRect.iRectHeight <= 0
+            || pRefPixMap.sRect.iRectWidth != pSrcPixMap.sRect.iRectWidth
+            || pRefPixMap.sRect.iRectHeight != pSrcPixMap.sRect.iRectHeight
+            || pRefPixMap.iStride[0] < pRefPixMap.sRect.iRectWidth
+        {
+            return RET_INVALIDPARAM;
+        }
+
+        if !self.m_sScrollDetectionParam.bMaskInfoAvailable {
+            self.ScrollDetectionWithoutMask(pSrcPixMap, pRefPixMap, planes);
+        } else {
+            self.ScrollDetectionWithMask(pSrcPixMap, pRefPixMap, planes);
+        }
+
+        RET_SUCCESS
+    }
+
+    /// `CScrollDetection::ScrollDetectionWithMask` — `ScrollDetection.cpp`.
+    ///
+    /// Nothing writes `bMaskInfoAvailable`: the encoder's one caller zeroes the
+    /// parameter block before every `Set` (`wels_preprocess.cpp`), so this branch
+    /// is dead in practice.
+    fn ScrollDetectionWithMask(
+        &mut self,
+        _pSrcPixMap: &SPixMap,
+        pRefPixMap: &SPixMap,
+        planes: &ScdPlanes<'_>,
+    ) {
+        let iStartX;
+        let iStartY;
+        let mut iWidth;
+        let iHeight;
+
+        iStartX = self.m_sScrollDetectionParam.sMaskRect.iRectLeft;
+        iStartY = self.m_sScrollDetectionParam.sMaskRect.iRectTop;
+        iWidth = self.m_sScrollDetectionParam.sMaskRect.iRectWidth;
+        iHeight = self.m_sScrollDetectionParam.sMaskRect.iRectHeight;
+
+        iWidth /= 2;
+        let iStartX = iStartX.saturating_add(iWidth / 2);
+
+        self.m_sScrollDetectionParam.iScrollMvX = 0;
+        self.m_sScrollDetectionParam.iScrollMvY = 0;
+        self.m_sScrollDetectionParam.bScrollDetectFlag = false;
+
+        if iStartX >= 0 && iWidth > MINIMUM_DETECT_WIDTH && iHeight > 2 * CHECK_OFFSET {
+            ScrollDetectionCore(
+                pRefPixMap,
+                planes,
+                iWidth,
+                iHeight,
+                iStartX,
+                iStartY,
+                &mut self.m_sScrollDetectionParam,
+            );
+        }
+    }
+
+    /// `CScrollDetection::ScrollDetectionWithoutMask` — `ScrollDetection.cpp`.
+    ///
+    /// Nine probe regions in a 3x3 grid over the frame, tried in order until one both
+    /// detects and reports a non-zero vector. The first region row starts above the
+    /// picture (`iStartY` is negative for `i < 3`): the band is seven eighths of the
+    /// picture tall and the grid centres it, so [`ScrollDetectionCore`]'s
+    /// `iMinHeight`/`iMaxHeight` clamps do the trimming.
+    ///
+    /// `-h * 7 / 48` truncates toward zero, so `h = 100` gives `-14`, not `-15`.
+    ///
+    /// `iWidth` is at least 24 for any picture the encoder passes, which keeps
+    /// [`CompareLine`]'s twelve-byte floor out of reach: `iWidth = kiRegionWidth / 2 =
+    /// (w - 2 * (h >> 4)) / 6`, and the smallest `scc` geometry, 160x96, gives 24.
+    fn ScrollDetectionWithoutMask(
+        &mut self,
+        pSrcPixMap: &SPixMap,
+        pRefPixMap: &SPixMap,
+        planes: &ScdPlanes<'_>,
+    ) {
+        let kiPicBorderWidth = pSrcPixMap.sRect.iRectHeight >> 4;
+        let kiRegionWidth = (pSrcPixMap.sRect.iRectWidth - (kiPicBorderWidth << 1)) / 3;
+        let kiRegionHeight = (pSrcPixMap.sRect.iRectHeight * 7) >> 3;
+        let kiHieghtStride = pSrcPixMap.sRect.iRectHeight * 5 / 24;
+
+        for i in 0..REGION_NUMBER {
+            let mut iStartX = kiPicBorderWidth + (i % 3) * kiRegionWidth;
+            let iStartY = -pSrcPixMap.sRect.iRectHeight * 7 / 48 + (i / 3) * kiHieghtStride;
+            let mut iWidth = kiRegionWidth;
+            let iHeight = kiRegionHeight;
+
+            iWidth /= 2;
+            iStartX += iWidth / 2;
+
+            ScrollDetectionCore(
+                pRefPixMap,
+                planes,
+                iWidth,
+                iHeight,
+                iStartX,
+                iStartY,
+                &mut self.m_sScrollDetectionParam,
+            );
+
+            if self.m_sScrollDetectionParam.bScrollDetectFlag
+                && self.m_sScrollDetectionParam.iScrollMvY != 0
+            {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::wels_preprocess::SRect;
+
+    /// A synthetic text page: paper 235, text lines every 12 rows from row 4, cells 8
+    /// columns apart, four inks rotating word by word so a line carries the four-or-more
+    /// distinct values [`CheckLine`] wants, and every fifth line a two-value rule
+    /// instead. Deterministic, by a 31-bit LCG.
+    fn page(w: usize, h: usize, seed: u32) -> Vec<u8> {
+        const PAPER: u8 = 235;
+        const INKS: [u8; 4] = [16, 48, 96, 144];
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fff_ffff;
+            state >> 8
+        };
+        // Sixteen 7x10 glyphs; glyph 0 blank, the rest with at least 12 set bits.
+        let mut glyphs = vec![[0u16; 10]; 16];
+        for g in 1..16 {
+            loop {
+                let mut rows = [0u16; 10];
+                let mut bits = 0;
+                for r in 0..10 {
+                    rows[r] = (next() & 0x7f) as u16;
+                    bits += rows[r].count_ones();
+                }
+                if bits >= 12 {
+                    glyphs[g] = rows;
+                    break;
+                }
+            }
+        }
+
+        let mut buf = vec![PAPER; w * h];
+        let cells = (w.saturating_sub(16)) / 8;
+        let mut line_idx = 0;
+        let mut y0 = 4;
+        while y0 + 10 < h {
+            if line_idx % 5 == 4 {
+                // A rule: one row of 200 across the width, at the line's middle.
+                let yr = y0 + 5;
+                for x in 0..w {
+                    buf[yr * w + x] = 200;
+                }
+            } else {
+                let mut ink = (next() % 4) as usize;
+                let mut c = 0;
+                while c < cells {
+                    let word = 3 + (next() % 5) as usize;
+                    for _ in 0..word {
+                        if c >= cells {
+                            break;
+                        }
+                        let g = (next() % 16) as usize;
+                        let x0 = 8 + 8 * c;
+                        for r in 0..10 {
+                            for b in 0..7 {
+                                if glyphs[g][r] & (1 << b) != 0 && x0 + b < w {
+                                    buf[(y0 + r) * w + x0 + b] = INKS[ink];
+                                }
+                            }
+                        }
+                        c += 1;
+                    }
+                    ink = (ink + 1) % 4;
+                }
+            }
+            line_idx += 1;
+            y0 += 12;
+        }
+        buf
+    }
+
+    fn pixmap(w: i32, h: i32, stride: i32) -> SPixMap {
+        let mut m = SPixMap::default();
+        m.iStride[0] = stride;
+        m.sRect.iRectWidth = w;
+        m.sRect.iRectHeight = h;
+        m
+    }
+
+    /// Runs the detector over a `cur`/`ref` pair of one geometry.
+    fn detect(cur: &[u8], refp: &[u8], w: i32, h: i32) -> SScrollDetectionParam {
+        let mut d = CScrollDetection::default();
+        d.Set(&SScrollDetectionParam::default());
+        let map = pixmap(w, h, w);
+        let planes = ScdPlanes {
+            cur,
+            cur_stride: w as usize,
+            refp,
+            ref_stride: w as usize,
+        };
+        assert_eq!(d.Process(&map, &map, &planes), RET_SUCCESS);
+        let mut out = SScrollDetectionParam::default();
+        d.Get(&mut out);
+        out
+    }
+
+    /// The sign convention, both ways: `iScrollMvY = iSearchPos - iTestPos` is previous
+    /// position minus current position, so content that moved up by eight rows reports
+    /// `+8`.
+    #[test]
+    fn a_scrolled_page_reports_its_displacement_with_upstreams_sign() {
+        const W: usize = 320;
+        const H: usize = 192;
+        const K: usize = 8;
+        let tall = page(W, H + 2 * K, 7);
+
+        // Content moved UP by K: cur[y] = page[K + y], ref[y] = page[y].
+        let refp: Vec<u8> = tall[..W * H].to_vec();
+        let cur: Vec<u8> = tall[K * W..][..W * H].to_vec();
+        let r = detect(&cur, &refp, W as i32, H as i32);
+        assert!(r.bScrollDetectFlag, "a scrolled page must be detected");
+        assert_eq!(r.iScrollMvY, K as i32, "content up by {K} rows is +{K}");
+        assert_eq!(r.iScrollMvX, 0, "this detector never produces an X vector");
+
+        // Content moved DOWN by K: the two frames swap roles.
+        let r = detect(&refp, &cur, W as i32, H as i32);
+        assert!(r.bScrollDetectFlag);
+        assert_eq!(
+            r.iScrollMvY,
+            -(K as i32),
+            "content down by {K} rows is -{K}"
+        );
+        assert_eq!(r.iScrollMvX, 0);
+    }
+
+    /// A flat frame has one colour per row, so [`CheckLine`] disqualifies every row of
+    /// every region and [`SelectTestLine`] answers `-1` nine times. No pixel of the
+    /// reference is ever compared.
+    #[test]
+    fn flat_frames_detect_nothing() {
+        const W: i32 = 320;
+        const H: i32 = 192;
+        let flat = vec![128u8; (W * H) as usize];
+        let r = detect(&flat, &flat, W, H);
+        assert!(!r.bScrollDetectFlag);
+        assert_eq!(r.iScrollMvY, 0);
+    }
+
+    /// Two unrelated pages: rows qualify, but no reference row matches a source row
+    /// well enough to survive the fifty-row window check.
+    #[test]
+    fn unrelated_frames_detect_nothing() {
+        const W: usize = 320;
+        const H: usize = 192;
+        let a = page(W, H, 11);
+        let b = page(W, H, 4242);
+        let r = detect(&a, &b, W as i32, H as i32);
+        assert!(
+            !r.bScrollDetectFlag,
+            "two unrelated pages are not a scroll: got mv {}",
+            r.iScrollMvY
+        );
+    }
+
+    /// An identical pair is detected, at zero: the first probe region matches its own
+    /// row at `iOffsetAbs == 0`, and since the break wants a non-zero vector all nine
+    /// regions run and report the same. A still frame therefore reports
+    /// `bScrollDetectFlag = 1, iScrollMvY = 0` rather than "no scroll".
+    #[test]
+    fn an_identical_pair_detects_a_zero_vector() {
+        const W: usize = 320;
+        const H: usize = 192;
+        let p = page(W, H, 3);
+        let r = detect(&p, &p, W as i32, H as i32);
+        assert!(r.bScrollDetectFlag);
+        assert_eq!(r.iScrollMvY, 0);
+        assert_eq!(r.iScrollMvX, 0);
+    }
+
+    /// The mask path on a sub-rectangle of the same scrolled page finds the same
+    /// vector the grid does.
+    #[test]
+    fn the_mask_path_finds_the_same_vector() {
+        const W: usize = 320;
+        const H: usize = 192;
+        const K: usize = 8;
+        let tall = page(W, H + 2 * K, 21);
+        let refp: Vec<u8> = tall[..W * H].to_vec();
+        let cur: Vec<u8> = tall[K * W..][..W * H].to_vec();
+
+        let mut d = CScrollDetection::default();
+        let mut p = SScrollDetectionParam::default();
+        p.bMaskInfoAvailable = true;
+        // Wide enough that `iWidth /= 2` still clears MINIMUM_DETECT_WIDTH, tall
+        // enough to clear 2 * CHECK_OFFSET.
+        p.sMaskRect = SRect {
+            iRectTop: 20,
+            iRectLeft: 8,
+            iRectWidth: 260,
+            iRectHeight: 140,
+        };
+        d.Set(&p);
+        let map = pixmap(W as i32, H as i32, W as i32);
+        let planes = ScdPlanes {
+            cur: &cur,
+            cur_stride: W,
+            refp: &refp,
+            ref_stride: W,
+        };
+        assert_eq!(d.Process(&map, &map, &planes), RET_SUCCESS);
+        let mut out = SScrollDetectionParam::default();
+        d.Get(&mut out);
+        assert!(out.bScrollDetectFlag);
+        assert_eq!(out.iScrollMvY, K as i32);
+    }
+
+    /// A mask narrower than [`MINIMUM_DETECT_WIDTH`] is refused before a pixel is read.
+    /// `iWidth` is halved before the test, so 100 becomes 50 and `50 > 50` is false:
+    /// the boundary is exclusive.
+    #[test]
+    fn a_narrow_mask_refuses_without_reading() {
+        const W: usize = 320;
+        const H: usize = 192;
+        let p0 = page(W, H, 5);
+        let mut d = CScrollDetection::default();
+        let mut p = SScrollDetectionParam::default();
+        p.bMaskInfoAvailable = true;
+        p.iScrollMvY = 99; // must be cleared by the mask path before its width test
+        p.sMaskRect = SRect {
+            iRectTop: 10,
+            iRectLeft: 0,
+            iRectWidth: 100,
+            iRectHeight: 140,
+        };
+        d.Set(&p);
+        let map = pixmap(W as i32, H as i32, W as i32);
+        let planes = ScdPlanes {
+            cur: &p0,
+            cur_stride: W,
+            refp: &p0,
+            ref_stride: W,
+        };
+        assert_eq!(d.Process(&map, &map, &planes), RET_SUCCESS);
+        let mut out = SScrollDetectionParam::default();
+        d.Get(&mut out);
+        assert!(!out.bScrollDetectFlag);
+        assert_eq!(out.iScrollMvY, 0, "the mask path zeroes the vector first");
+
+        // A short mask is refused the same way: 2 * CHECK_OFFSET is also exclusive.
+        p.sMaskRect = SRect {
+            iRectTop: 10,
+            iRectLeft: 0,
+            iRectWidth: 260,
+            iRectHeight: 50,
+        };
+        d.Set(&p);
+        assert_eq!(d.Process(&map, &map, &planes), RET_SUCCESS);
+        d.Get(&mut out);
+        assert!(!out.bScrollDetectFlag);
+    }
+
+    /// `Process` validity checks: an empty plane and dimension mismatches both return
+    /// `RET_INVALIDPARAM`.
+    #[test]
+    fn process_refuses_an_empty_plane_or_a_size_mismatch() {
+        let mut d = CScrollDetection::default();
+        let map = pixmap(320, 192, 320);
+        let buf = vec![0u8; 320 * 192];
+
+        let empty = ScdPlanes {
+            cur: &[],
+            cur_stride: 320,
+            refp: &buf,
+            ref_stride: 320,
+        };
+        assert_eq!(d.Process(&map, &map, &empty), RET_INVALIDPARAM);
+        let empty = ScdPlanes {
+            cur: &buf,
+            cur_stride: 320,
+            refp: &[],
+            ref_stride: 320,
+        };
+        assert_eq!(d.Process(&map, &map, &empty), RET_INVALIDPARAM);
+
+        let planes = ScdPlanes {
+            cur: &buf,
+            cur_stride: 320,
+            refp: &buf,
+            ref_stride: 320,
+        };
+        let other = pixmap(320, 96, 320);
+        assert_eq!(d.Process(&map, &other, &planes), RET_INVALIDPARAM);
+        let other = pixmap(160, 192, 320);
+        assert_eq!(d.Process(&map, &other, &planes), RET_INVALIDPARAM);
+    }
+
+    /// [`CheckLine`]'s three arms, at the boundaries upstream writes them.
+    #[test]
+    fn check_line_counts_colours_then_transitions() {
+        assert_eq!(CheckLine(&[7u8; 32], 32), 0, "one colour never qualifies");
+
+        // Two colours, exactly three transitions: not enough.
+        let mut row = [1u8; 32];
+        row[8..16].fill(2);
+        row[24..].fill(2);
+        assert_eq!(CheckLine(&row, 32), 0, "two colours and 3 changes is short");
+        // One more transition tips it.
+        row[20] = 2;
+        assert_eq!(CheckLine(&row, 32), 1);
+
+        // Four colours qualify however still they are.
+        let mut row = [1u8; 32];
+        row[8..16].fill(2);
+        row[16..24].fill(3);
+        row[24..].fill(4);
+        assert_eq!(CheckLine(&row, 32), 1, "four colours always qualify");
+
+        // The colour map is a 256-bit set: 32 and 64 land in different words, and
+        // 31/32 in adjacent words at the `>> 5` boundary.
+        let mut row = [31u8; 32];
+        row[16..].fill(32);
+        assert_eq!(CheckLine(&row, 32), 0, "two colours, one change");
+    }
+
+    /// [`CompareLine`]'s two edge behaviours: twelve bytes are read whatever the width,
+    /// and a width at or below twelve answers "different" even when those twelve bytes
+    /// are equal.
+    #[test]
+    fn compare_line_keeps_its_twelve_byte_floor() {
+        let a = [9u8; 16];
+        let b = [9u8; 16];
+        assert_eq!(CompareLine(&a, &b, 16), 0, "equal rows compare equal");
+        assert_eq!(
+            CompareLine(&a, &b, 8),
+            1,
+            "a width at or below 12 answers `different` even on equal bytes"
+        );
+        assert_eq!(
+            CompareLine(&a, &b, 12),
+            1,
+            "12 is `at or below`, not `above`"
+        );
+
+        // A difference inside the first twelve bytes short-circuits at any width.
+        let mut c = b;
+        c[11] = 8;
+        assert_eq!(CompareLine(&a, &c, 16), 1);
+        // A difference past twelve is only seen when the width reaches it.
+        let mut d = b;
+        d[13] = 8;
+        assert_eq!(CompareLine(&a, &d, 16), 1);
+        assert_eq!(
+            CompareLine(&a, &d, 13),
+            0,
+            "byte 13 is outside a width of 13"
+        );
+    }
+
+    #[test]
+    fn narrow_and_short_buffer_frames_do_not_panic() {
+        // 32x32 frame has iWidth = kiRegionWidth / 2 = 4 (<= 12): refused up front by
+        // ScrollDetectionCore, matching upstream, whose CompareLine can never match
+        // at that width. Must not panic on the 12-byte read.
+        let p32: Vec<u8> = (0..(32 * 32))
+            .map(|idx| ((idx % 4) as u8) * 40 + ((idx / 32) as u8))
+            .collect();
+        let r = detect(&p32, &p32, 32, 32);
+        assert!(!r.bScrollDetectFlag);
+        assert_eq!(r.iScrollMvY, 0);
+
+        // Narrow tall frame (16x256) where kiRegionWidth is negative must not panic.
+        let p_narrow = vec![42u8; 16 * 256];
+        let _ = detect(&p_narrow, &p_narrow, 16, 256);
+
+        // Short plane buffer smaller than stride * height must be safely ignored.
+        let mut d = CScrollDetection::default();
+        let map = pixmap(64, 64, 64);
+        let short_planes = ScdPlanes {
+            cur: &[0u8; 64],
+            cur_stride: 64,
+            refp: &[0u8; 64],
+            ref_stride: 64,
+        };
+        assert_eq!(d.Process(&map, &map, &short_planes), RET_SUCCESS);
+    }
+}

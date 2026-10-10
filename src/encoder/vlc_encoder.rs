@@ -1,0 +1,739 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! Context-Adaptive Variable-Length Coding (CAVLC) Entropy Encoding Subsystem.
+//!
+//! `codec/encoder/core/inc/vlc_encoder.h`,
+//! `codec/encoder/core/src/encoder_data_tables.cpp`, `codec/encoder/core/src/set_mb_syn_cavlc.cpp`.
+
+#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
+
+/// Residual transform block category.
+/// Matches `ECtxBlockCat` in `codec/encoder/core/inc/set_mb_syn_cavlc.h`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ECtxBlockCat {
+    LUMA_DC = 0,
+    LUMA_AC = 1,
+    LUMA_4x4 = 2,
+    CHROMA_DC = 3,
+    CHROMA_AC = 4,
+}
+
+/// The encoder's write position: a detached cursor (`{pos, cur_bits, left_bits}`)
+/// holding no buffer reference — the buffer arrives as `&mut [u8]` on every call.
+pub use crate::safe::bits::BsWriter;
+
+/// CAVLC codeword table item.
+/// Matches `TagCavlcTableItem` in `codec/encoder/core/inc/set_mb_syn_cavlc.h`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct TagCavlcTableItem {
+    pub uiBits: u16,
+    pub uiLen: u8,
+    pub uiSuffixLength: u8,
+}
+
+pub type SCavlcTableItem = TagCavlcTableItem;
+
+// ============================================================================
+// CAVLC Lookup Tables
+// ============================================================================
+
+/// Mapping table from neighbor non-zero coefficient count (nC) to VLC table index.
+/// Matches `g_kuiEncNcMapTable[18]` in `codec/encoder/core/src/encoder_data_tables.cpp`.
+pub const g_kuiEncNcMapTable: [u8; 18] = [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+
+/// Mapping table for zerosLeft context clamping (0..7).
+/// Matches `g_kuiZeroLeftMap[16]` in `codec/encoder/core/src/set_mb_syn_cavlc.cpp`.
+pub const g_kuiZeroLeftMap: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+
+// `g_kuiGolombUELength` is a common-layer table (`common_tables.cpp:886`).
+pub use crate::common::wels_common_defs::g_kuiGolombUELength;
+
+/// Coeff token lookup table: `[nc_idx][total_coeff][trailing_ones][0--value, 1--bit count]`
+/// Dimensions: `[5][17][4][2]`
+pub const g_kuiVlcCoeffToken: [[[[u8; 2]; 4]; 17]; 5] = [
+    // 0 <= nc < 2
+    [
+        [[1, 1], [0, 0], [0, 0], [0, 0]],         // 0
+        [[5, 6], [1, 2], [0, 0], [0, 0]],         // 1
+        [[7, 8], [4, 6], [1, 3], [0, 0]],         // 2
+        [[7, 9], [6, 8], [5, 7], [3, 5]],         // 3
+        [[7, 10], [6, 9], [5, 8], [3, 6]],        // 4
+        [[7, 11], [6, 10], [5, 9], [4, 7]],       // 5
+        [[15, 13], [6, 11], [5, 10], [4, 8]],     // 6
+        [[11, 13], [14, 13], [5, 11], [4, 9]],    // 7
+        [[8, 13], [10, 13], [13, 13], [4, 10]],   // 8
+        [[15, 14], [14, 14], [9, 13], [4, 11]],   // 9
+        [[11, 14], [10, 14], [13, 14], [12, 13]], // 10
+        [[15, 15], [14, 15], [9, 14], [12, 14]],  // 11
+        [[11, 15], [10, 15], [13, 15], [8, 14]],  // 12
+        [[15, 16], [1, 15], [9, 15], [12, 15]],   // 13
+        [[11, 16], [14, 16], [13, 16], [8, 15]],  // 14
+        [[7, 16], [10, 16], [9, 16], [12, 16]],   // 15
+        [[4, 16], [6, 16], [5, 16], [8, 16]],     // 16
+    ],
+    // 2 <= nc < 4
+    [
+        [[3, 2], [0, 0], [0, 0], [0, 0]],         // 0
+        [[11, 6], [2, 2], [0, 0], [0, 0]],        // 1
+        [[7, 6], [7, 5], [3, 3], [0, 0]],         // 2
+        [[7, 7], [10, 6], [9, 6], [5, 4]],        // 3
+        [[7, 8], [6, 6], [5, 6], [4, 4]],         // 4
+        [[4, 8], [6, 7], [5, 7], [6, 5]],         // 5
+        [[7, 9], [6, 8], [5, 8], [8, 6]],         // 6
+        [[15, 11], [6, 9], [5, 9], [4, 6]],       // 7
+        [[11, 11], [14, 11], [13, 11], [4, 7]],   // 8
+        [[15, 12], [10, 11], [9, 11], [4, 9]],    // 9
+        [[11, 12], [14, 12], [13, 12], [12, 11]], // 10
+        [[8, 12], [10, 12], [9, 12], [8, 11]],    // 11
+        [[15, 13], [14, 13], [13, 13], [12, 12]], // 12
+        [[11, 13], [10, 13], [9, 13], [12, 13]],  // 13
+        [[7, 13], [11, 14], [6, 13], [8, 13]],    // 14
+        [[9, 14], [8, 14], [10, 14], [1, 13]],    // 15
+        [[7, 14], [6, 14], [5, 14], [4, 14]],     // 16
+    ],
+    // 4 <= nc < 8
+    [
+        [[15, 4], [0, 0], [0, 0], [0, 0]],       // 0
+        [[15, 6], [14, 4], [0, 0], [0, 0]],      // 1
+        [[11, 6], [15, 5], [13, 4], [0, 0]],     // 2
+        [[8, 6], [12, 5], [14, 5], [12, 4]],     // 3
+        [[15, 7], [10, 5], [11, 5], [11, 4]],    // 4
+        [[11, 7], [8, 5], [9, 5], [10, 4]],      // 5
+        [[9, 7], [14, 6], [13, 6], [9, 4]],      // 6
+        [[8, 7], [10, 6], [9, 6], [8, 4]],       // 7
+        [[15, 8], [14, 7], [13, 7], [13, 5]],    // 8
+        [[11, 8], [14, 8], [10, 7], [12, 6]],    // 9
+        [[15, 9], [10, 8], [13, 8], [12, 7]],    // 10
+        [[11, 9], [14, 9], [9, 8], [12, 8]],     // 11
+        [[8, 9], [10, 9], [13, 9], [8, 8]],      // 12
+        [[13, 10], [7, 9], [9, 9], [12, 9]],     // 13
+        [[9, 10], [12, 10], [11, 10], [10, 10]], // 14
+        [[5, 10], [8, 10], [7, 10], [6, 10]],    // 15
+        [[1, 10], [4, 10], [3, 10], [2, 10]],    // 16
+    ],
+    // 8 <= nc
+    [
+        [[3, 6], [0, 0], [0, 0], [0, 0]],     // 0
+        [[0, 6], [1, 6], [0, 0], [0, 0]],     // 1
+        [[4, 6], [5, 6], [6, 6], [0, 0]],     // 2
+        [[8, 6], [9, 6], [10, 6], [11, 6]],   // 3
+        [[12, 6], [13, 6], [14, 6], [15, 6]], // 4
+        [[16, 6], [17, 6], [18, 6], [19, 6]], // 5
+        [[20, 6], [21, 6], [22, 6], [23, 6]], // 6
+        [[24, 6], [25, 6], [26, 6], [27, 6]], // 7
+        [[28, 6], [29, 6], [30, 6], [31, 6]], // 8
+        [[32, 6], [33, 6], [34, 6], [35, 6]], // 9
+        [[36, 6], [37, 6], [38, 6], [39, 6]], // 10
+        [[40, 6], [41, 6], [42, 6], [43, 6]], // 11
+        [[44, 6], [45, 6], [46, 6], [47, 6]], // 12
+        [[48, 6], [49, 6], [50, 6], [51, 6]], // 13
+        [[52, 6], [53, 6], [54, 6], [55, 6]], // 14
+        [[56, 6], [57, 6], [58, 6], [59, 6]], // 15
+        [[60, 6], [61, 6], [62, 6], [63, 6]], // 16
+    ],
+    // nc == -1 (Chroma DC)
+    [
+        [[1, 2], [0, 0], [0, 0], [0, 0]], // 0
+        [[7, 6], [1, 1], [0, 0], [0, 0]], // 1
+        [[4, 6], [6, 6], [1, 3], [0, 0]], // 2
+        [[3, 6], [3, 7], [2, 7], [5, 6]], // 3
+        [[2, 6], [3, 8], [2, 8], [0, 7]], // 4
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 5
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 6
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 7
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 8
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 9
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 10
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 11
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 12
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 13
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 14
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 15
+        [[0, 0], [0, 0], [0, 0], [0, 0]], // 16
+    ],
+];
+
+/// Total zeros table for 4x4 blocks: `[total_coeff][total_zeros][0--value, 1--bit count]`
+/// Dimensions: `[16][16][2]`
+pub const g_kuiVlcTotalZeros: [[[u8; 2]; 16]; 16] = [
+    [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 1],
+        [3, 3],
+        [2, 3],
+        [3, 4],
+        [2, 4],
+        [3, 5],
+        [2, 5],
+        [3, 6],
+        [2, 6],
+        [3, 7],
+        [2, 7],
+        [3, 8],
+        [2, 8],
+        [3, 9],
+        [2, 9],
+        [1, 9],
+    ],
+    [
+        [7, 3],
+        [6, 3],
+        [5, 3],
+        [4, 3],
+        [3, 3],
+        [5, 4],
+        [4, 4],
+        [3, 4],
+        [2, 4],
+        [3, 5],
+        [2, 5],
+        [3, 6],
+        [2, 6],
+        [1, 6],
+        [0, 6],
+        [0, 0],
+    ],
+    [
+        [5, 4],
+        [7, 3],
+        [6, 3],
+        [5, 3],
+        [4, 4],
+        [3, 4],
+        [4, 3],
+        [3, 3],
+        [2, 4],
+        [3, 5],
+        [2, 5],
+        [1, 6],
+        [1, 5],
+        [0, 6],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [3, 5],
+        [7, 3],
+        [5, 4],
+        [4, 4],
+        [6, 3],
+        [5, 3],
+        [4, 3],
+        [3, 4],
+        [3, 3],
+        [2, 4],
+        [2, 5],
+        [1, 5],
+        [0, 5],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [5, 4],
+        [4, 4],
+        [3, 4],
+        [7, 3],
+        [6, 3],
+        [5, 3],
+        [4, 3],
+        [3, 3],
+        [2, 4],
+        [1, 5],
+        [1, 4],
+        [0, 5],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 6],
+        [1, 5],
+        [7, 3],
+        [6, 3],
+        [5, 3],
+        [4, 3],
+        [3, 3],
+        [2, 3],
+        [1, 4],
+        [1, 3],
+        [0, 6],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 6],
+        [1, 5],
+        [5, 3],
+        [4, 3],
+        [3, 3],
+        [3, 2],
+        [2, 3],
+        [1, 4],
+        [1, 3],
+        [0, 6],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 6],
+        [1, 4],
+        [1, 5],
+        [3, 3],
+        [3, 2],
+        [2, 2],
+        [2, 3],
+        [1, 3],
+        [0, 6],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 6],
+        [0, 6],
+        [1, 4],
+        [3, 2],
+        [2, 2],
+        [1, 3],
+        [1, 2],
+        [1, 5],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [1, 5],
+        [0, 5],
+        [1, 3],
+        [3, 2],
+        [2, 2],
+        [1, 2],
+        [1, 4],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [0, 4],
+        [1, 4],
+        [1, 3],
+        [2, 3],
+        [1, 1],
+        [3, 3],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [0, 4],
+        [1, 4],
+        [1, 2],
+        [1, 1],
+        [1, 3],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [0, 3],
+        [1, 3],
+        [1, 1],
+        [1, 2],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [0, 2],
+        [1, 2],
+        [1, 1],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    [
+        [0, 1],
+        [1, 1],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+];
+
+/// Total zeros table for 2x2 Chroma DC blocks: `[total_coeff][total_zeros][0--value, 1--bit count]`
+/// Dimensions: `[4][4][2]`
+pub const g_kuiVlcTotalZerosChromaDc: [[[u8; 2]; 4]; 4] = [
+    [[0, 0], [0, 0], [0, 0], [0, 0]],
+    [[1, 1], [1, 2], [1, 3], [0, 3]],
+    [[1, 1], [1, 2], [0, 2], [0, 0]],
+    [[1, 1], [0, 1], [0, 0], [0, 0]],
+];
+
+/// Run before lookup table: `[zeros_left_idx][run_before][0--value, 1--bit count]`
+/// Dimensions: `[8][15][2]`
+pub const g_kuiVlcRunBefore: [[[u8; 2]; 15]; 8] = [
+    // 0 not available
+    [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 1
+    [
+        [1, 1],
+        [0, 1],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 2
+    [
+        [1, 1],
+        [1, 2],
+        [0, 2],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 3
+    [
+        [3, 2],
+        [2, 2],
+        [1, 2],
+        [0, 2],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 4
+    [
+        [3, 2],
+        [2, 2],
+        [1, 2],
+        [1, 3],
+        [0, 3],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 5
+    [
+        [3, 2],
+        [2, 2],
+        [3, 3],
+        [2, 3],
+        [1, 3],
+        [0, 3],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // 6
+    [
+        [3, 2],
+        [0, 3],
+        [1, 3],
+        [3, 3],
+        [2, 3],
+        [5, 3],
+        [4, 3],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ],
+    // >6
+    [
+        [7, 3],
+        [6, 3],
+        [5, 3],
+        [4, 3],
+        [3, 3],
+        [2, 3],
+        [1, 3],
+        [1, 4],
+        [1, 5],
+        [1, 6],
+        [1, 7],
+        [1, 8],
+        [1, 9],
+        [1, 10],
+        [1, 11],
+    ],
+];
+
+// ============================================================================
+// Bitstream Helper Functions
+// ============================================================================
+
+// The caller's buffer contract includes four bytes of headroom at the write
+// position — both the accumulator flush and `BsFlush` store a full word even when
+// they advance by one byte.
+
+/// Write `iLen` bits of `kuiValue` into the bitstream.
+#[inline(always)]
+pub fn BsWriteBits(buf: &mut [u8], pBs: &mut BsWriter, iLen: i32, kuiValue: u32) -> i32 {
+    pBs.write_bits(buf, iLen, kuiValue);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Write a single bit into the bitstream.
+#[inline(always)]
+pub fn BsWriteOneBit(buf: &mut [u8], pBs: &mut BsWriter, kuiValue: u32) -> i32 {
+    pBs.write_one_bit(buf, kuiValue);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Flush remaining bits in the 32-bit bit accumulator to the output buffer.
+#[inline(always)]
+pub fn BsFlush(buf: &mut [u8], pBs: &mut BsWriter) -> i32 {
+    pBs.flush(buf);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Bit length of an unsigned Exp-Golomb code: `2 * floor(log2(value + 1)) + 1`.
+#[inline(always)]
+pub fn BsSizeUE(kiValue: u32) -> u32 {
+    if kiValue < 256 {
+        g_kuiGolombUELength[kiValue as usize]
+    } else {
+        let mut n: u32 = 0;
+        let mut iTmpValue = kiValue + 1;
+        if (iTmpValue & 0xffff0000) != 0 {
+            iTmpValue >>= 16;
+            n += 16;
+        }
+        if (iTmpValue & 0xff00) != 0 {
+            iTmpValue >>= 8;
+            n += 8;
+        }
+        n += g_kuiGolombUELength[(iTmpValue - 1) as usize] >> 1;
+        (n << 1) + 1
+    }
+}
+
+/// Calculate the bit length of a signed Exp-Golomb code.
+#[inline(always)]
+pub fn BsSizeSE(kiValue: i32) -> u32 {
+    if kiValue == 0 {
+        1
+    } else if kiValue > 0 {
+        let iTmpValue = ((kiValue as u32) << 1) - 1;
+        BsSizeUE(iTmpValue)
+    } else {
+        let iTmpValue = ((-kiValue) as u32) << 1;
+        BsSizeUE(iTmpValue)
+    }
+}
+
+/// Write an unsigned Exp-Golomb code (`ue(v)`).
+#[inline(always)]
+pub fn BsWriteUE(buf: &mut [u8], pBs: &mut BsWriter, kuiValue: u32) -> i32 {
+    pBs.write_ue(buf, kuiValue);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Write a signed Exp-Golomb code (`se(v)`).
+#[inline(always)]
+pub fn BsWriteSE(buf: &mut [u8], pBs: &mut BsWriter, kiValue: i32) -> i32 {
+    pBs.write_se(buf, kiValue);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Write a truncated Exp-Golomb code (`te(v)`).
+#[inline(always)]
+pub fn BsWriteTE(buf: &mut [u8], pBs: &mut BsWriter, kiX: i32, kuiValue: u32) {
+    pBs.write_te(buf, kiX, kuiValue);
+}
+
+/// Get the current bitstream write cursor position in bits.
+#[inline(always)]
+pub fn BsGetBitsPos(pBs: &BsWriter) -> i32 {
+    pBs.bits_pos()
+}
+
+/// Write RBSP trailing stop bit and flush to byte alignment.
+#[inline(always)]
+pub fn BsRbspTrailingBits(buf: &mut [u8], pBs: &mut BsWriter) -> i32 {
+    pBs.rbsp_trailing_bits(buf);
+    if pBs.is_overflow() { -1 } else { 0 }
+}
+
+/// Align bitstream to byte boundary, padding with one bits.
+#[inline(always)]
+pub fn BsAlign(buf: &mut [u8], pBs: &mut BsWriter) {
+    pBs.align(buf);
+}

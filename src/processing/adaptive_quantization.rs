@@ -1,0 +1,425 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! Adaptive quantization —
+//! `codec/processing/src/adaptivequantization/AdaptiveQuantization.cpp`, the plugin
+//! reached through `METHOD_ADAPTIVE_QUANT`.
+//!
+//! `CWelsPreProcess::AnalyzeSpatialPic` calls it for every P slice when
+//! `bEnableAdaptiveQuant` is set, which `FillDefault` leaves on. It writes a
+//! per-macroblock QP delta into `pMotionTextureIndexToDeltaQp`, which
+//! `RcCalculateMbQp` adds to the slice QP, and a frame average into
+//! `iAverMotionTextureIndexToDeltaQp`, which `RcCalculatePictureQp` and
+//! `WelsRcPictureInitDisable` subtract from the global QP.
+//!
+//! Integer widths are load-bearing: the variance kernel's two sums are `u16` and its
+//! two squares `u32`. Neither sum can reach the wrap — a 16x16 block is 256 samples of
+//! at most 255, so both top out at 65280 — but the sum-of-squares products are computed
+//! wide and truncated at the store into a `u16` field.
+
+#![forbid(unsafe_code)]
+
+use crate::encoder::wels_preprocess::{
+    SAdaptiveQuantizationParam, SMotionTextureUnit, SPixMap, SVAACalcResult,
+};
+
+use super::vaacalc::{RET_INVALIDPARAM, RET_SUCCESS};
+use crate::processing::vaacalc::VaaCalcPlanes;
+
+/// Fixed-point scales for the model arithmetic below — `util.h`.
+const AQ_INT_MULTIPLY: i64 = 10000000;
+const AQ_TIME_INT_MULTIPLY: i64 = 10000;
+const AQ_QSTEP_INT_MULTIPLY: i64 = 100;
+const AQ_PESN: i64 = 10;
+
+/// Model constants, pre-scaled by the fixed-point multipliers above.
+const AVERAGE_TIME_MOTION: i64 = 3000;
+const AVERAGE_TIME_TEXTURE_QUALITYMODE: i64 = 10000;
+const AVERAGE_TIME_TEXTURE_BITRATEMODE: i64 = 8750;
+const MODEL_ALPHA: i64 = 9910;
+const MODEL_TIME: i64 = 58185;
+
+/// `MB_WIDTH_LUMA` — `wels_const_common.h`.
+const MB_WIDTH_LUMA: i32 = 16;
+
+/// `EAQModes` — `IWelsVP.h`.
+pub const AQ_QUALITY_MODE: i32 = 0;
+pub const AQ_BITRATE_MODE: i32 = 1;
+
+use crate::common::macros::WELS_DIV_ROUND64;
+
+//=================== Safe kernels =====================//
+
+/// The bytes [`sample_variance_16x16`] reads from one plane, counted from the
+/// macroblock's top-left sample.
+///
+/// Sixteen rows of sixteen samples reaching forward only, so the last sample sits
+/// `15 * stride + 15` past the origin and the block needs no padding in any
+/// direction.
+pub fn mb_span(stride: usize) -> usize {
+    15 * stride + 16
+}
+
+/// The variance proxies for one macroblock: `uiMotionIndex` from the difference against
+/// the reference, `uiTextureIndex` from the current picture alone. `SampleVariance16x16`
+/// in `AdaptiveQuantization.cpp`.
+///
+/// The two sums are `u16` and the two squares `u32`, so both sums wrap at 65536;
+/// `cur_sum` reaches 65280 for a block of maximum-brightness samples and stops just
+/// short. The final products are computed wide and truncate at the store into the `u16`
+/// result fields.
+pub fn sample_variance_16x16(
+    refy: &[u8],
+    ref_stride: usize,
+    srcy: &[u8],
+    src_stride: usize,
+) -> SMotionTextureUnit {
+    let mut cur_square: u32 = 0;
+    let mut square: u32 = 0;
+    let mut cur_sum: u16 = 0;
+    let mut sum: u16 = 0;
+
+    for y in 0..MB_WIDTH_LUMA as usize {
+        let ref_base = y * ref_stride;
+        let src_base = y * src_stride;
+        // Fixed-size windows: the sixteen-sample inner loop carries no bounds check,
+        // and the two range checks land once per row.
+        let (Some(r), Some(s)) = (
+            refy.get(ref_base..).and_then(|s| s.first_chunk::<16>()),
+            srcy.get(src_base..).and_then(|s| s.first_chunk::<16>()),
+        ) else {
+            break;
+        };
+        for (&rv, &sv) in r.iter().zip(s.iter()) {
+            let diff = (rv as i32 - sv as i32).unsigned_abs();
+            sum = sum.wrapping_add(diff as u16);
+            square = square.wrapping_add(diff.wrapping_mul(diff));
+
+            cur_sum = cur_sum.wrapping_add(sv as u16);
+            cur_square = cur_square.wrapping_add((sv as u32) * (sv as u32));
+        }
+    }
+
+    sum >>= 8;
+    cur_sum >>= 8;
+    SMotionTextureUnit {
+        uiMotionIndex: ((square >> 8) as i32 - (sum as i32) * (sum as i32)) as u16,
+        uiTextureIndex: ((cur_square >> 8) as i32 - (cur_sum as i32) * (cur_sum as i32)) as u16,
+    }
+}
+
+/// `CAdaptiveQuantization` — `AdaptiveQuantization.h`.
+pub struct CAdaptiveQuantization {
+    pub m_sAdaptiveQuantParam: SAdaptiveQuantizationParam,
+}
+
+impl Default for CAdaptiveQuantization {
+    fn default() -> Self {
+        Self {
+            m_sAdaptiveQuantParam: SAdaptiveQuantizationParam::default(),
+        }
+    }
+}
+
+impl CAdaptiveQuantization {
+    /// `CAdaptiveQuantization::Set`.
+    pub fn Set(&mut self, param: &SAdaptiveQuantizationParam) -> i32 {
+        self.m_sAdaptiveQuantParam = *param;
+        RET_SUCCESS
+    }
+
+    /// `CAdaptiveQuantization::Get` — writes back only the frame average.
+    pub fn Get(&self, param: &mut SAdaptiveQuantizationParam) -> i32 {
+        param.iAverMotionTextureIndexToDeltaQp =
+            self.m_sAdaptiveQuantParam.iAverMotionTextureIndexToDeltaQp;
+        RET_SUCCESS
+    }
+
+    /// `CAdaptiveQuantization::Process`. `calc` carries the VAA statistics of this
+    /// picture pair.
+    pub fn Process(
+        &mut self,
+        pSrcPixMap: &SPixMap,
+        _pRefPixMap: &SPixMap,
+        // The two luma planes; the pixel maps carry geometry only.
+        planes: VaaCalcPlanes<'_>,
+        calc: &SVAACalcResult,
+        pMotionTexture: &mut [SMotionTextureUnit],
+        pMotionTextureIndexToDeltaQp: &mut [i8],
+    ) -> i32 {
+        let iWidth = pSrcPixMap.sRect.iRectWidth;
+        let iHeight = pSrcPixMap.sRect.iRectHeight;
+        let iMbWidth = iWidth >> 4;
+        let iMbHeight = iHeight >> 4;
+        if iMbWidth <= 0 || iMbHeight <= 0 {
+            return RET_INVALIDPARAM;
+        }
+        let iMbTotalNum = iMbWidth * iMbHeight;
+        let mb_total = iMbTotalNum as usize;
+        if pMotionTexture.len() < mb_total || pMotionTextureIndexToDeltaQp.len() < mb_total {
+            return RET_INVALIDPARAM;
+        }
+
+        let mut iAverageMotionIndex: i64 = 0;
+        let mut iAverageTextureIndex: i64 = 0;
+
+        let iRefStride = _pRefPixMap.iStride[0];
+        let iCurStride = pSrcPixMap.iStride[0];
+
+        // Reuse the VAA statistics when they were computed over exactly this pair of
+        // pictures (compared by address); otherwise recompute per macroblock.
+        if calc.pRefY == planes.refp.as_ptr() as usize && calc.pCurY == planes.cur.as_ptr() as usize
+        {
+            let mut iMbIndex = 0isize;
+            for _j in 0..iMbHeight {
+                for _i in 0..iMbWidth {
+                    let sad8x8 = &calc.pSad8x8[(iMbIndex) as usize];
+                    let mut iSumDiff = sad8x8[0];
+                    iSumDiff += sad8x8[1];
+                    iSumDiff += sad8x8[2];
+                    iSumDiff += sad8x8[3];
+
+                    let iSQDiff = calc.pSsd16x16[(iMbIndex) as usize];
+                    let mut uiSum = calc.pSum16x16[(iMbIndex) as usize];
+                    let iSQSum = calc.pSumOfSquare16x16[(iMbIndex) as usize];
+
+                    // The arithmetic is 32-bit and truncates at the store into the
+                    // `u16` fields.
+                    iSumDiff >>= 8;
+                    let mt = &mut pMotionTexture[iMbIndex as usize];
+                    mt.uiMotionIndex = ((iSQDiff >> 8) - iSumDiff * iSumDiff) as u16;
+
+                    uiSum >>= 8;
+                    mt.uiTextureIndex = ((iSQSum >> 8) - uiSum * uiSum) as u16;
+
+                    iAverageMotionIndex += mt.uiMotionIndex as i64;
+                    iAverageTextureIndex += mt.uiTextureIndex as i64;
+                    iMbIndex += 1;
+                }
+            }
+        } else {
+            // Each macroblock's origin is bounds-checked by the reslice.
+            let mut iMbIndex = 0usize;
+            let (mut iRefRow, mut iCurRow) = (0usize, 0usize);
+            for _j in 0..iMbHeight {
+                let (mut iRefOff, mut iCurOff) = (iRefRow, iCurRow);
+                for _i in 0..iMbWidth {
+                    let mt = &mut pMotionTexture[iMbIndex];
+                    *mt = sample_variance_16x16(
+                        &planes.refp[iRefOff..],
+                        iRefStride as usize,
+                        &planes.cur[iCurOff..],
+                        iCurStride as usize,
+                    );
+                    iAverageMotionIndex += mt.uiMotionIndex as i64;
+                    iAverageTextureIndex += mt.uiTextureIndex as i64;
+                    iMbIndex += 1;
+                    iRefOff += MB_WIDTH_LUMA as usize;
+                    iCurOff += MB_WIDTH_LUMA as usize;
+                }
+                iRefRow += (iRefStride << 4) as usize;
+                iCurRow += (iCurStride << 4) as usize;
+            }
+        }
+
+        iAverageMotionIndex =
+            WELS_DIV_ROUND64(iAverageMotionIndex * AQ_INT_MULTIPLY, iMbTotalNum as i64);
+        iAverageTextureIndex =
+            WELS_DIV_ROUND64(iAverageTextureIndex * AQ_INT_MULTIPLY, iMbTotalNum as i64);
+        if iAverageMotionIndex <= AQ_PESN && iAverageMotionIndex >= -AQ_PESN {
+            iAverageMotionIndex = AQ_INT_MULTIPLY;
+        }
+        if iAverageTextureIndex <= AQ_PESN && iAverageTextureIndex >= -AQ_PESN {
+            iAverageTextureIndex = AQ_INT_MULTIPLY;
+        }
+
+        let mut iAverMotionTextureIndexToDeltaQp: i32 = 0;
+        iAverageMotionIndex = WELS_DIV_ROUND64(
+            AVERAGE_TIME_MOTION * iAverageMotionIndex,
+            AQ_TIME_INT_MULTIPLY,
+        );
+
+        iAverageTextureIndex = if self.m_sAdaptiveQuantParam.iAdaptiveQuantMode == AQ_QUALITY_MODE {
+            WELS_DIV_ROUND64(
+                AVERAGE_TIME_TEXTURE_QUALITYMODE * iAverageTextureIndex,
+                AQ_TIME_INT_MULTIPLY,
+            )
+        } else {
+            WELS_DIV_ROUND64(
+                AVERAGE_TIME_TEXTURE_BITRATEMODE * iAverageTextureIndex,
+                AQ_TIME_INT_MULTIPLY,
+            )
+        };
+
+        let iAQ_EPSN: i64 =
+            -(AQ_PESN * AQ_TIME_INT_MULTIPLY * AQ_QSTEP_INT_MULTIPLY / AQ_INT_MULTIPLY);
+        for j in 0..iMbHeight {
+            for i in 0..iMbWidth {
+                let mt = pMotionTexture[(j * iMbWidth + i) as usize];
+                let mut a = WELS_DIV_ROUND64(
+                    mt.uiTextureIndex as i64 * AQ_INT_MULTIPLY * AQ_TIME_INT_MULTIPLY,
+                    iAverageTextureIndex,
+                );
+                let mut iQStep = WELS_DIV_ROUND64(
+                    (a - AQ_TIME_INT_MULTIPLY) * AQ_QSTEP_INT_MULTIPLY,
+                    a + MODEL_ALPHA,
+                );
+                let iLumaTextureDeltaQp = MODEL_TIME * iQStep; // range +- 6
+
+                let mut iMotionTextureIndexToDeltaQp =
+                    (iLumaTextureDeltaQp / AQ_TIME_INT_MULTIPLY) as i32;
+
+                a = WELS_DIV_ROUND64(
+                    mt.uiMotionIndex as i64 * AQ_INT_MULTIPLY * AQ_TIME_INT_MULTIPLY,
+                    iAverageMotionIndex,
+                );
+                iQStep = WELS_DIV_ROUND64(
+                    (a - AQ_TIME_INT_MULTIPLY) * AQ_QSTEP_INT_MULTIPLY,
+                    a + MODEL_ALPHA,
+                );
+                let iLumaMotionDeltaQp = MODEL_TIME * iQStep; // range +- 6
+
+                if (self.m_sAdaptiveQuantParam.iAdaptiveQuantMode == AQ_QUALITY_MODE
+                    && iLumaMotionDeltaQp < iAQ_EPSN)
+                    || self.m_sAdaptiveQuantParam.iAdaptiveQuantMode == AQ_BITRATE_MODE
+                {
+                    iMotionTextureIndexToDeltaQp +=
+                        (iLumaMotionDeltaQp / AQ_TIME_INT_MULTIPLY) as i32;
+                }
+
+                pMotionTextureIndexToDeltaQp[(j * iMbWidth + i) as usize] =
+                    (iMotionTextureIndexToDeltaQp as i64 / AQ_QSTEP_INT_MULTIPLY) as i8;
+                iAverMotionTextureIndexToDeltaQp += iMotionTextureIndexToDeltaQp;
+            }
+        }
+
+        self.m_sAdaptiveQuantParam.iAverMotionTextureIndexToDeltaQp =
+            iAverMotionTextureIndexToDeltaQp / iMbTotalNum;
+
+        RET_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block whose samples are all equal has zero texture index, and a block whose
+    /// difference from the reference is uniform has zero motion index, at any stride
+    /// pair: `square >> 8` is `(256 * d^2) >> 8 = d^2` and `(sum >> 8)^2` is
+    /// `((256 * d) >> 8)^2 = d^2`, so the two cancel exactly.
+    #[test]
+    fn variance_of_a_uniform_block_is_zero() {
+        for &(ref_stride, src_stride) in &[(16usize, 16usize), (16, 33), (48, 17)] {
+            for d in [0u8, 1, 17, 255] {
+                let refy = vec![d; mb_span(ref_stride)];
+                let srcy = vec![0u8; mb_span(src_stride)];
+                let got = sample_variance_16x16(&refy, ref_stride, &srcy, src_stride);
+                assert_eq!(
+                    got.uiMotionIndex, 0,
+                    "difference {d}, strides {ref_stride}/{src_stride}"
+                );
+                assert_eq!(got.uiTextureIndex, 0, "strides {ref_stride}/{src_stride}");
+            }
+        }
+    }
+
+    /// The two strides are read independently. The source plane's 16x16 block is uniform
+    /// at its own stride but ragged at the reference's, so walking the source at
+    /// `ref_stride` would report a non-zero texture index where zero is right.
+    #[test]
+    fn the_two_strides_are_independent() {
+        let (ref_stride, src_stride) = (64usize, 20usize);
+        let refy = vec![0u8; mb_span(ref_stride)];
+        // A whole 16 rows rather than `mb_span`, so the gap after the last row exists to
+        // be read; the kernel is still only entitled to `mb_span`.
+        let mut srcy = vec![0u8; 16 * src_stride];
+        for row in 0..16 {
+            for col in 0..src_stride {
+                // 100 inside the block, 200 in the inter-row gap the walk must skip.
+                srcy[row * src_stride + col] = if col < 16 { 100 } else { 200 };
+            }
+        }
+        let got = sample_variance_16x16(&refy, ref_stride, &srcy, src_stride);
+        assert_eq!(
+            got.uiTextureIndex, 0,
+            "the source walk picked up the row gap"
+        );
+        assert_eq!(got.uiMotionIndex, 0);
+    }
+
+    /// The kernel reads exactly `mb_span`, neither more nor less: the last byte of the
+    /// allocation is the last sample of the block, so it must be read.
+    #[test]
+    fn the_span_is_exactly_the_block() {
+        let stride = 24usize;
+        assert_eq!(mb_span(stride), 15 * stride + 16);
+
+        let refy = vec![0u8; mb_span(stride)];
+        let mut srcy = vec![0u8; mb_span(stride)];
+        // Only the very last sample of the block differs.
+        *srcy.last_mut().unwrap() = 255;
+        let got = sample_variance_16x16(&refy, stride, &srcy, stride);
+        assert_ne!(
+            got.uiTextureIndex, 0,
+            "the last sample of the declared span was never read"
+        );
+    }
+
+    #[test]
+    fn process_refuses_zero_macroblock_dimensions() {
+        let mut aq = CAdaptiveQuantization::default();
+        let mut src = SPixMap::default();
+        let refp = SPixMap::default();
+        let calc = SVAACalcResult::default();
+        let mut mt = [SMotionTextureUnit::default(); 4];
+        let mut dqp = [0i8; 4];
+        let buf = [0u8; 64];
+
+        for &(w, h) in &[(0, 0), (8, 32), (32, 8), (-16, 16)] {
+            src.sRect.iRectWidth = w;
+            src.sRect.iRectHeight = h;
+            assert_eq!(
+                aq.Process(
+                    &src,
+                    &refp,
+                    VaaCalcPlanes {
+                        cur: &buf,
+                        refp: &buf
+                    },
+                    &calc,
+                    &mut mt,
+                    &mut dqp
+                ),
+                RET_INVALIDPARAM
+            );
+        }
+    }
+}

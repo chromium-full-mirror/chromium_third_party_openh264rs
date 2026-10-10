@@ -1,0 +1,613 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+
+//! Background detection — the plugin reached through `METHOD_BACKGROUND_DETECTION`.
+//!
+//! `codec/processing/src/backgrounddetection/BackgroundDetection.cpp`.
+//!
+//! `CWelsPreProcess::AnalyzeSpatialPic` calls it for every P slice when
+//! `bEnableBackgroundDetection` is set, which `FillDefault` leaves on. It fills
+//! `pVaa->pVaaBackgroundMbFlag`, one byte per macroblock, which
+//! `WelsMdInterJudgeBGDPskip` uses to force P_SKIP on static background and which
+//! `CComplexityAnalysis`'s background-excluding SAD kernels read.
+//!
+//! The work happens on 16x16 "OU"s (`BGD_OU_SIZE`), which at
+//! `LOG2_BGD_OU_SIZE == 4` is exactly one macroblock — `OU_SIZE_IN_MB` is 1 — so
+//! the OU grid and the macroblock grid coincide.
+
+#![forbid(unsafe_code)]
+
+use crate::encoder::wels_preprocess::{SBGDInterface, SPixMap, SVAACalcResult};
+
+use super::vaacalc::{RET_INVALIDPARAM, RET_SUCCESS};
+
+/// `BackgroundDetection.cpp`.
+const LOG2_BGD_OU_SIZE: i32 = 4;
+const LOG2_BGD_OU_SIZE_UV: i32 = LOG2_BGD_OU_SIZE - 1;
+const BGD_OU_SIZE: i32 = 1 << LOG2_BGD_OU_SIZE;
+const BGD_OU_SIZE_UV: i32 = BGD_OU_SIZE >> 1;
+const BGD_THD_SAD: i32 = 2 * BGD_OU_SIZE * BGD_OU_SIZE;
+const BGD_THD_ASD_UV: i32 = 4 * BGD_OU_SIZE_UV;
+const LOG2_MB_SIZE: i32 = 4;
+const OU_SIZE_IN_MB: i32 = BGD_OU_SIZE >> 4;
+const Q_FACTOR: i32 = 8;
+
+const OU_LEFT: i8 = 0x01;
+const OU_RIGHT: i8 = 0x02;
+const OU_TOP: i8 = 0x04;
+const OU_BOTTOM: i8 = 0x08;
+
+/// `SBackgroundOU` — `BackgroundDetection.h`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct SBackgroundOU {
+    pub iBackgroundFlag: i32,
+    pub iSAD: i32,
+    pub iSD: i32,
+    pub iMAD: i32,
+    pub iMinSubMad: i32,
+    pub iMaxDiffSubSd: i32,
+}
+
+/// `CBackgroundDetection::vBGDParam` — `BackgroundDetection.h`.
+#[derive(Default)]
+struct vBGDParam {
+    iBgdWidth: i32,
+    iBgdHeight: i32,
+    iStride: [i32; 3],
+    pOU_array: Vec<SBackgroundOU>,
+}
+
+/// `CBackgroundDetection` — `BackgroundDetection.h`.
+pub struct CBackgroundDetection {
+    m_BgdParam: vBGDParam,
+    m_iLargestFrameSize: i32,
+}
+
+impl Default for CBackgroundDetection {
+    fn default() -> Self {
+        Self {
+            m_BgdParam: vBGDParam {
+                iBgdWidth: 0,
+                iBgdHeight: 0,
+                iStride: [0; 3],
+                pOU_array: Vec::new(),
+            },
+            m_iLargestFrameSize: 0,
+        }
+    }
+}
+
+#[inline]
+fn WELS_MAX(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+
+#[inline]
+fn WELS_MIN(a: i32, b: i32) -> i32 {
+    if a < b { a } else { b }
+}
+
+/// The three planes of each picture [`CBackgroundDetection::Process`] reads, from the
+/// logical origin. The chroma edge check reads U and V.
+pub struct BgdPlanes<'a> {
+    pub cur: [&'a [u8]; 3],
+    pub refp: [&'a [u8]; 3],
+}
+
+impl CBackgroundDetection {
+    /// `CBackgroundDetection::Set`. It has no state to take.
+    pub fn Set(&mut self, _param: &SBGDInterface) -> i32 {
+        RET_SUCCESS
+    }
+
+    /// `CBackgroundDetection::Process` — `BackgroundDetection.cpp`. `calc` is the
+    /// VAA statistics of this picture pair.
+    pub fn Process(
+        &mut self,
+        pSrcPixMap: &SPixMap,
+        _pRefPixMap: &SPixMap,
+        // the six planes; the pixel maps carry geometry only.
+        planes: &BgdPlanes<'_>,
+        calc: &SVAACalcResult,
+        // the caller's per-macroblock flag array.
+        pVaaBackgroundMbFlag: &mut [i8],
+    ) -> i32 {
+        let iBgdWidth = pSrcPixMap.sRect.iRectWidth;
+        let iBgdHeight = pSrcPixMap.sRect.iRectHeight;
+        if iBgdWidth <= 0
+            || iBgdHeight <= 0
+            || pSrcPixMap.iStride[0] <= 0
+            || pSrcPixMap.iStride[1] <= 0
+            || pSrcPixMap.iStride[2] <= 0
+        {
+            return RET_INVALIDPARAM;
+        }
+
+        let iPicWidthInOU = iBgdWidth >> LOG2_BGD_OU_SIZE;
+        let iPicHeightInOU = iBgdHeight >> LOG2_BGD_OU_SIZE;
+        if iPicWidthInOU <= 0 || iPicHeightInOU <= 0 {
+            return RET_INVALIDPARAM;
+        }
+
+        let iPicStrideUV = pSrcPixMap.iStride[1];
+        if iPicStrideUV < iPicWidthInOU * BGD_OU_SIZE_UV {
+            return RET_INVALIDPARAM;
+        }
+
+        let iPicWidthInMb = (15 + iBgdWidth) >> 4;
+        let Some(required_mbs) = ((iPicHeightInOU - 1) as usize)
+            .checked_mul(iPicWidthInMb as usize)
+            .and_then(|r| r.checked_add(iPicWidthInOU as usize))
+            .map(|r| r << (LOG2_BGD_OU_SIZE - LOG2_MB_SIZE))
+        else {
+            return RET_INVALIDPARAM;
+        };
+        if calc.pSad8x8.len() < required_mbs
+            || calc.pSumOfDiff8x8.len() < required_mbs
+            || calc.pMad8x8.len() < required_mbs
+            || pVaaBackgroundMbFlag.len() < required_mbs
+        {
+            return RET_INVALIDPARAM;
+        }
+
+        let Some(required_chroma) = ((iPicHeightInOU * BGD_OU_SIZE_UV - 1) as usize)
+            .checked_mul(iPicStrideUV as usize)
+            .and_then(|r| r.checked_add((iPicWidthInOU * BGD_OU_SIZE_UV) as usize))
+            .filter(|&r| r <= i32::MAX as usize)
+        else {
+            return RET_INVALIDPARAM;
+        };
+        if planes.cur[1].len() < required_chroma
+            || planes.cur[2].len() < required_chroma
+            || planes.refp[1].len() < required_chroma
+            || planes.refp[2].len() < required_chroma
+        {
+            return RET_INVALIDPARAM;
+        }
+        // From here on the helpers index without further checks: every macroblock
+        // index is below `required_mbs`, and every chroma sample offset (computed in
+        // `i32`) is below `required_chroma`.
+
+        for i in 0..3 {
+            self.m_BgdParam.iStride[i] = pSrcPixMap.iStride[i];
+        }
+        self.m_BgdParam.iBgdWidth = iBgdWidth;
+        self.m_BgdParam.iBgdHeight = iBgdHeight;
+
+        let Some(iCurFrameSize) = iBgdWidth.checked_mul(iBgdHeight) else {
+            return RET_INVALIDPARAM;
+        };
+        if self.m_BgdParam.pOU_array.is_empty() || iCurFrameSize > self.m_iLargestFrameSize {
+            let iMaxOUWidth = (BGD_OU_SIZE - 1 + self.m_BgdParam.iBgdWidth) >> LOG2_BGD_OU_SIZE;
+            let iMaxOUHeight = (BGD_OU_SIZE - 1 + self.m_BgdParam.iBgdHeight) >> LOG2_BGD_OU_SIZE;
+            let Some(ou_count) = (iMaxOUWidth as usize).checked_mul(iMaxOUHeight as usize) else {
+                return RET_INVALIDPARAM;
+            };
+            self.m_BgdParam.pOU_array = vec![SBackgroundOU::default(); ou_count];
+            self.m_iLargestFrameSize = iCurFrameSize;
+        }
+        if self.m_BgdParam.pOU_array.is_empty() {
+            return RET_INVALIDPARAM;
+        }
+
+        self.ForegroundBackgroundDivision(calc);
+        self.ForegroundDilationAndBackgroundErosion(planes, pVaaBackgroundMbFlag);
+        RET_SUCCESS
+    }
+
+    /// `CBackgroundDetection::GetOUParameters` — `BackgroundDetection.cpp`.
+    fn GetOUParameters(sVaaCalcInfo: &SVAACalcResult, iMbIndex: i32, pBgdOU: &mut SBackgroundOU) {
+        let idx = iMbIndex as usize;
+        let iSubSAD = sVaaCalcInfo.pSad8x8[idx];
+        let iSubSD = sVaaCalcInfo.pSumOfDiff8x8[idx];
+        let iSubMAD = sVaaCalcInfo.pMad8x8[idx];
+
+        pBgdOU.iSD = iSubSD[0] + iSubSD[1] + iSubSD[2] + iSubSD[3];
+        pBgdOU.iSAD = iSubSAD[0] + iSubSAD[1] + iSubSAD[2] + iSubSAD[3];
+        pBgdOU.iSD = pBgdOU.iSD.abs();
+
+        // Every use of the MAD quadruple widens to `i32`.
+        let m: [i32; 4] = [
+            iSubMAD[0] as i32,
+            iSubMAD[1] as i32,
+            iSubMAD[2] as i32,
+            iSubMAD[3] as i32,
+        ];
+        pBgdOU.iMAD = WELS_MAX(WELS_MAX(m[0], m[1]), WELS_MAX(m[2], m[3]));
+        pBgdOU.iMinSubMad = WELS_MIN(WELS_MIN(m[0], m[1]), WELS_MIN(m[2], m[3]));
+
+        pBgdOU.iMaxDiffSubSd = WELS_MAX(
+            WELS_MAX(iSubSD[0], iSubSD[1]),
+            WELS_MAX(iSubSD[2], iSubSD[3]),
+        ) - WELS_MIN(
+            WELS_MIN(iSubSD[0], iSubSD[1]),
+            WELS_MIN(iSubSD[2], iSubSD[3]),
+        );
+    }
+
+    /// `CBackgroundDetection::ForegroundBackgroundDivision` — `BackgroundDetection.cpp`.
+    fn ForegroundBackgroundDivision(&mut self, calc: &SVAACalcResult) {
+        let iPicWidthInOU = self.m_BgdParam.iBgdWidth >> LOG2_BGD_OU_SIZE;
+        let iPicHeightInOU = self.m_BgdParam.iBgdHeight >> LOG2_BGD_OU_SIZE;
+        let iPicWidthInMb = (15 + self.m_BgdParam.iBgdWidth) >> 4;
+
+        let mut ou = 0usize;
+        for j in 0..iPicHeightInOU {
+            for i in 0..iPicWidthInOU {
+                let pBackgroundOU = &mut self.m_BgdParam.pOU_array[ou];
+                Self::GetOUParameters(
+                    calc,
+                    (j * iPicWidthInMb + i) << (LOG2_BGD_OU_SIZE - LOG2_MB_SIZE),
+                    pBackgroundOU,
+                );
+
+                pBackgroundOU.iBackgroundFlag = 0;
+                if pBackgroundOU.iMAD > 63 {
+                    ou += 1;
+                    continue;
+                }
+                if (pBackgroundOU.iMaxDiffSubSd <= pBackgroundOU.iSAD >> 3
+                    || pBackgroundOU.iMaxDiffSubSd <= BGD_OU_SIZE * Q_FACTOR)
+                    && pBackgroundOU.iSAD < (BGD_THD_SAD << 1)
+                {
+                    if pBackgroundOU.iSAD <= BGD_OU_SIZE * Q_FACTOR {
+                        pBackgroundOU.iBackgroundFlag = 1;
+                    } else {
+                        pBackgroundOU.iBackgroundFlag = if pBackgroundOU.iSAD < BGD_THD_SAD {
+                            (pBackgroundOU.iSD < (pBackgroundOU.iSAD * 3) >> 2) as i32
+                        } else {
+                            (pBackgroundOU.iSD << 1 < pBackgroundOU.iSAD) as i32
+                        };
+                    }
+                }
+                ou += 1;
+            }
+        }
+    }
+
+    /// `CBackgroundDetection::CalculateAsdChromaEdge` — `BackgroundDetection.cpp`.
+    fn CalculateAsdChromaEdge(pOriRef: &[u8], pOriCur: &[u8], iStride: i32) -> i32 {
+        let mut ASD: i32 = 0;
+        let mut off = 0usize;
+        for _idx in 0..BGD_OU_SIZE_UV {
+            ASD += pOriCur[off] as i32 - pOriRef[off] as i32;
+            off += iStride as usize;
+        }
+        ASD.abs()
+    }
+
+    /// `CBackgroundDetection::ForegroundDilation23Luma` — `BackgroundDetection.cpp`.
+    fn ForegroundDilation23Luma(pBackgroundOU: &SBackgroundOU, nb: &[SBackgroundOU; 4]) -> bool {
+        let (pOU_L, pOU_R, pOU_U, pOU_D) = (&nb[0], &nb[1], &nb[2], &nb[3]);
+
+        if pBackgroundOU.iMAD > pBackgroundOU.iMinSubMad << 1 {
+            // `(flag - 1) & mad` is a branchless select: -1 (all ones) when the
+            // flag is 0, 0 when it is 1.
+            let aForegroundMad = [
+                (pOU_L.iBackgroundFlag - 1) & pOU_L.iMAD,
+                (pOU_R.iBackgroundFlag - 1) & pOU_R.iMAD,
+                (pOU_U.iBackgroundFlag - 1) & pOU_U.iMAD,
+                (pOU_D.iBackgroundFlag - 1) & pOU_D.iMAD,
+            ];
+            let iMaxNbrForegroundMad = WELS_MAX(
+                WELS_MAX(aForegroundMad[0], aForegroundMad[1]),
+                WELS_MAX(aForegroundMad[2], aForegroundMad[3]),
+            );
+
+            let not = |f: i32| (f == 0) as i32;
+            let aBackgroundMad = [
+                (not(pOU_L.iBackgroundFlag) - 1) & pOU_L.iMAD,
+                (not(pOU_R.iBackgroundFlag) - 1) & pOU_R.iMAD,
+                (not(pOU_U.iBackgroundFlag) - 1) & pOU_U.iMAD,
+                (not(pOU_D.iBackgroundFlag) - 1) & pOU_D.iMAD,
+            ];
+            let iMaxNbrBackgroundMad = WELS_MAX(
+                WELS_MAX(aBackgroundMad[0], aBackgroundMad[1]),
+                WELS_MAX(aBackgroundMad[2], aBackgroundMad[3]),
+            );
+
+            return (iMaxNbrForegroundMad > pBackgroundOU.iMinSubMad << 2)
+                || (pBackgroundOU.iMAD > iMaxNbrBackgroundMad << 1
+                    && pBackgroundOU.iMAD <= (iMaxNbrForegroundMad * 3) >> 1);
+        }
+        false
+    }
+
+    /// `CBackgroundDetection::ForegroundDilation23Chroma` — `BackgroundDetection.cpp`.
+    fn ForegroundDilation23Chroma(
+        &self,
+        planes: &BgdPlanes<'_>,
+        iNeighbourForegroundFlags: i8,
+        iStartSamplePos: i32,
+        iPicStrideUV: i32,
+    ) -> bool {
+        const kaOUPos: [i8; 4] = [OU_LEFT, OU_RIGHT, OU_TOP, OU_BOTTOM];
+        let aEdgeOffset: [i32; 4] = [
+            0,
+            BGD_OU_SIZE_UV - 1,
+            0,
+            iPicStrideUV * (BGD_OU_SIZE_UV - 1),
+        ];
+        let iStride: [i32; 4] = [iPicStrideUV, iPicStrideUV, 1, 1];
+
+        // V first (red; human skin weighs more on it), then U.
+        for plane in [2usize, 1usize] {
+            for i in 0..4 {
+                if iNeighbourForegroundFlags & kaOUPos[i] != 0 {
+                    let off = (iStartSamplePos + aEdgeOffset[i]) as usize;
+                    if Self::CalculateAsdChromaEdge(
+                        &planes.refp[plane][off..],
+                        &planes.cur[plane][off..],
+                        iStride[i],
+                    ) > BGD_THD_ASD_UV
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `CBackgroundDetection::ForegroundDilation` — `BackgroundDetection.cpp`.
+    fn ForegroundDilation(
+        &self,
+        planes: &BgdPlanes<'_>,
+        pBackgroundOU: &mut SBackgroundOU,
+        nb: &[SBackgroundOU; 4],
+        iChromaSampleStartPos: i32,
+    ) {
+        let iPicStrideUV = self.m_BgdParam.iStride[1];
+        let iSumNeighBackgroundFlags = nb[0].iBackgroundFlag
+            + nb[1].iBackgroundFlag
+            + nb[2].iBackgroundFlag
+            + nb[3].iBackgroundFlag;
+
+        if pBackgroundOU.iSAD > BGD_OU_SIZE * Q_FACTOR {
+            match iSumNeighBackgroundFlags {
+                0 | 1 => {
+                    pBackgroundOU.iBackgroundFlag = 0;
+                }
+                2 | 3 => {
+                    pBackgroundOU.iBackgroundFlag =
+                        !Self::ForegroundDilation23Luma(pBackgroundOU, nb) as i32;
+
+                    // chroma component check
+                    if pBackgroundOU.iBackgroundFlag == 1 {
+                        let n = |f: i32| (f == 0) as i8;
+                        let iNeighbourForegroundFlags = n(nb[0].iBackgroundFlag)
+                            | (n(nb[1].iBackgroundFlag) << 1)
+                            | (n(nb[2].iBackgroundFlag) << 2)
+                            | (n(nb[3].iBackgroundFlag) << 3);
+                        pBackgroundOU.iBackgroundFlag = !self.ForegroundDilation23Chroma(
+                            planes,
+                            iNeighbourForegroundFlags,
+                            iChromaSampleStartPos,
+                            iPicStrideUV,
+                        ) as i32;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `CBackgroundDetection::BackgroundErosion` — `BackgroundDetection.cpp`.
+    fn BackgroundErosion(pBackgroundOU: &mut SBackgroundOU, nb: &[SBackgroundOU; 4]) {
+        if pBackgroundOU.iMaxDiffSubSd <= BGD_OU_SIZE * Q_FACTOR {
+            let iSumNeighBackgroundFlags = nb[0].iBackgroundFlag
+                + nb[1].iBackgroundFlag
+                + nb[2].iBackgroundFlag
+                + nb[3].iBackgroundFlag;
+            let sumNbrBGsad = (nb[0].iSAD & (-nb[0].iBackgroundFlag))
+                + (nb[2].iSAD & (-nb[2].iBackgroundFlag))
+                + (nb[1].iSAD & (-nb[1].iBackgroundFlag))
+                + (nb[3].iSAD & (-nb[3].iBackgroundFlag));
+            if pBackgroundOU.iSAD * iSumNeighBackgroundFlags <= (3 * sumNbrBGsad) >> 1 {
+                if iSumNeighBackgroundFlags == 4 {
+                    pBackgroundOU.iBackgroundFlag = 1;
+                } else if (nb[0].iBackgroundFlag & nb[1].iBackgroundFlag) != 0
+                    || (nb[2].iBackgroundFlag & nb[3].iBackgroundFlag) != 0
+                {
+                    pBackgroundOU.iBackgroundFlag =
+                        !Self::ForegroundDilation23Luma(pBackgroundOU, nb) as i32;
+                }
+            }
+        }
+    }
+
+    /// `CBackgroundDetection::ForegroundDilationAndBackgroundErosion` —
+    /// `BackgroundDetection.cpp`.
+    ///
+    /// The four neighbours live in the array being mutated, so each iteration copies
+    /// them by value before touching the current OU.
+    fn ForegroundDilationAndBackgroundErosion(
+        &mut self,
+        planes: &BgdPlanes<'_>,
+        pVaaBackgroundMbFlag: &mut [i8],
+    ) {
+        let iPicStrideUV = self.m_BgdParam.iStride[1];
+        let iPicWidthInOU = self.m_BgdParam.iBgdWidth >> LOG2_BGD_OU_SIZE;
+        let iPicHeightInOU = self.m_BgdParam.iBgdHeight >> LOG2_BGD_OU_SIZE;
+        let iOUStrideUV = iPicStrideUV << (LOG2_BGD_OU_SIZE - 1);
+        let iPicWidthInMb = (15 + self.m_BgdParam.iBgdWidth) >> 4;
+
+        let kiRowStep = (OU_SIZE_IN_MB * iPicWidthInMb) as isize;
+        let mut iRowBase: isize = 0;
+
+        // Indices into pOU_array.
+        let mut cur = 0usize; // pBackgroundOU
+        let mut nb_top = 0isize; // pOUNeighbours[2]
+
+        for j in 0..iPicHeightInOU {
+            let mut iSkipFlag = iRowBase;
+            let mut nb_left = cur as isize;
+            // `iPicWidthInOU & ((j == iPicHeightInOU-1) - 1)`: the mask is 0 on the
+            // last row and -1 (all ones) otherwise.
+            let last_row = j == iPicHeightInOU - 1;
+            let mut nb_bottom = cur as isize + (iPicWidthInOU & ((last_row as i32) - 1)) as isize;
+
+            for i in 0..iPicWidthInOU {
+                let nb_right = cur as isize + (i < iPicWidthInOU - 1) as isize;
+
+                let nb = [
+                    self.m_BgdParam.pOU_array[nb_left as usize],
+                    self.m_BgdParam.pOU_array[nb_right as usize],
+                    self.m_BgdParam.pOU_array[nb_top as usize],
+                    self.m_BgdParam.pOU_array[nb_bottom as usize],
+                ];
+
+                let mut ou = self.m_BgdParam.pOU_array[cur];
+                if ou.iBackgroundFlag != 0 {
+                    self.ForegroundDilation(
+                        planes,
+                        &mut ou,
+                        &nb,
+                        j * iOUStrideUV + (i << LOG2_BGD_OU_SIZE_UV),
+                    );
+                } else {
+                    Self::BackgroundErosion(&mut ou, &nb);
+                }
+                self.m_BgdParam.pOU_array[cur] = ou;
+
+                // check the up OU
+                if j > 1
+                    && i > 0
+                    && i < iPicWidthInOU - 1
+                    && self.m_BgdParam.pOU_array[nb_top as usize].iBackgroundFlag == 1
+                {
+                    let up = self.m_BgdParam.pOU_array[nb_top as usize];
+                    if up.iSAD > BGD_OU_SIZE * Q_FACTOR {
+                        let l = self.m_BgdParam.pOU_array[(nb_top - 1) as usize].iBackgroundFlag;
+                        let r = self.m_BgdParam.pOU_array[(nb_top + 1) as usize].iBackgroundFlag;
+                        let u = self.m_BgdParam.pOU_array
+                            [(nb_top - iPicWidthInOU as isize) as usize]
+                            .iBackgroundFlag;
+                        let d = self.m_BgdParam.pOU_array
+                            [(nb_top + iPicWidthInOU as isize) as usize]
+                            .iBackgroundFlag;
+                        if l + r + u + d <= 1 {
+                            pVaaBackgroundMbFlag[(iSkipFlag - kiRowStep) as usize] = 0;
+                            self.m_BgdParam.pOU_array[nb_top as usize].iBackgroundFlag = 0;
+                        }
+                    }
+                }
+
+                pVaaBackgroundMbFlag[iSkipFlag as usize] =
+                    self.m_BgdParam.pOU_array[cur].iBackgroundFlag as i8;
+
+                // preparation for the next OU
+                iSkipFlag += OU_SIZE_IN_MB as isize;
+                nb_left = cur as isize;
+                nb_top += 1;
+                nb_bottom += 1;
+                cur += 1;
+            }
+            nb_top = cur as isize - iPicWidthInOU as isize;
+            iRowBase += kiRowStep;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::wels_preprocess::SRect;
+
+    fn pixmap(w: i32, h: i32, stride_y: i32, stride_uv: i32) -> SPixMap {
+        SPixMap {
+            iStride: [stride_y, stride_uv, stride_uv],
+            sRect: SRect {
+                iRectTop: 0,
+                iRectLeft: 0,
+                iRectWidth: w,
+                iRectHeight: h,
+            },
+            ..SPixMap::default()
+        }
+    }
+
+    #[test]
+    fn process_validates_dimensions_strides_and_slice_lengths() {
+        let mut bgd = CBackgroundDetection::default();
+        let y = vec![16u8; 32 * 32];
+        let uv = vec![128u8; 16 * 16];
+        let planes = BgdPlanes {
+            cur: [&y, &uv, &uv],
+            refp: [&y, &uv, &uv],
+        };
+        let mut calc = SVAACalcResult::default();
+        calc.pSad8x8 = vec![[0; 4]; 4];
+        calc.pSumOfDiff8x8 = vec![[0; 4]; 4];
+        calc.pMad8x8 = vec![[0; 4]; 4];
+        let mut flags = vec![0i8; 4];
+
+        let map = pixmap(32, 32, 32, 16);
+        assert_eq!(
+            bgd.Process(&map, &map, &planes, &calc, &mut flags),
+            RET_SUCCESS
+        );
+        assert_eq!(flags, vec![1, 1, 1, 1]);
+
+        // Non-16-aligned width (40x32) where calc is only sized for truncated width (4 MBs)
+        // must return RET_INVALIDPARAM rather than panicking in GetOUParameters.
+        let map_40 = pixmap(40, 32, 48, 24);
+        assert_eq!(
+            bgd.Process(&map_40, &map_40, &planes, &calc, &mut flags),
+            RET_INVALIDPARAM
+        );
+
+        // Short pVaaBackgroundMbFlag slice must return RET_INVALIDPARAM.
+        let mut short_flags = vec![0i8; 2];
+        assert_eq!(
+            bgd.Process(&map, &map, &planes, &calc, &mut short_flags),
+            RET_INVALIDPARAM
+        );
+
+        // Short chroma plane must return RET_INVALIDPARAM.
+        let short_uv = vec![128u8; 8];
+        let short_planes = BgdPlanes {
+            cur: [&y, &short_uv, &uv],
+            refp: [&y, &uv, &uv],
+        };
+        assert_eq!(
+            bgd.Process(&map, &map, &short_planes, &calc, &mut flags),
+            RET_INVALIDPARAM
+        );
+
+        // Invalid UV stride must return RET_INVALIDPARAM.
+        let bad_stride = pixmap(32, 32, 32, 0);
+        assert_eq!(
+            bgd.Process(&bad_stride, &bad_stride, &planes, &calc, &mut flags),
+            RET_INVALIDPARAM
+        );
+    }
+}

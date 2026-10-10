@@ -1,0 +1,2015 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+/*
+ * \file    md.rs
+ * \brief   Macroblock Mode Decision & Sub-Pixel Refinement Engine
+ */
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![forbid(unsafe_code)]
+
+pub use crate::encoder::encoder_context::SMVComponentUnit;
+pub use crate::encoder::encoder_context::SMVUnitXY;
+pub use crate::encoder::picture::SPicture;
+pub use crate::encoder::svc_motion_estimate::SWelsME;
+use crate::safe::mvd_cost::MvdCostCursor;
+
+// Sub-pixel refinement buffer geometry constants
+pub const ME_REFINE_BUF_STRIDE: i32 = 32;
+pub const ME_REFINE_BUF_WIDTH_BLK4: i32 = 8;
+pub const ME_REFINE_BUF_WIDTH_BLK8: i32 = 16;
+pub const ME_REFINE_BUF_STRIDE_BLK4: i32 = 160;
+pub const ME_REFINE_BUF_STRIDE_BLK8: i32 = 320;
+
+// Half-pixel search offsets
+pub const REFINE_ME_NO_BEST_HALF_PIXEL: i32 = 0; // ( 0,  0)
+pub const REFINE_ME_HALF_PIXEL_TOP: i32 = 1; // ( 0, -2) in 1/4-pel units
+pub const REFINE_ME_HALF_PIXEL_BOTTOM: i32 = 2; // ( 0,  2) in 1/4-pel units
+pub const REFINE_ME_HALF_PIXEL_LEFT: i32 = 3; // (-2,  0) in 1/4-pel units
+pub const REFINE_ME_HALF_PIXEL_RIGHT: i32 = 4; // ( 2,  0) in 1/4-pel units
+
+// Quarter-pixel search offsets
+pub const ME_NO_BEST_QUAR_PIXEL: i32 = 1; // ( 0,  0) or best half pixel
+pub const ME_QUAR_PIXEL_LEFT: i32 = 2; // (-1,  0) in 1/4-pel units
+pub const ME_QUAR_PIXEL_RIGHT: i32 = 3; // ( 1,  0) in 1/4-pel units
+pub const ME_QUAR_PIXEL_TOP: i32 = 4; // ( 0, -1) in 1/4-pel units
+pub const ME_QUAR_PIXEL_BOTTOM: i32 = 5; // ( 0,  1) in 1/4-pel units
+
+pub const NO_BEST_FRAC_PIX: i32 = 1; // REFINE_ME_NO_BEST_HALF_PIXEL + ME_NO_BEST_QUAR_PIXEL
+
+// Video Analysis Assessment (VAA) texture signatures
+pub const MBVAASIGN_FLAT: u8 = 15;
+pub const MBVAASIGN_HOR1: u8 = 3;
+pub const MBVAASIGN_HOR2: u8 = 12;
+pub const MBVAASIGN_VER1: u8 = 5;
+pub const MBVAASIGN_VER2: u8 = 10;
+pub const MBVAASIGN_CMPX1: u8 = 6;
+pub const MBVAASIGN_CMPX2: u8 = 9;
+
+// Internal VAA thresholds
+pub const INTRA_VARIANCE_SAD_THRESHOLD: i32 = 150;
+pub const INTER_VARIANCE_SAD_THRESHOLD: i32 = 20;
+
+// Neighbor availability bitmasks
+pub const LEFT_MB_POS: u32 = 0x01;
+pub const TOP_MB_POS: u32 = 0x02;
+// `wels_common_basis.h:125-126`: TOPRIGHT is C (0x04) and TOPLEFT is D (0x08). The
+// encoded `uiNeighborIntra` layout of `mb_cache.h:118` (TOPLEFT 0x04, TOPRIGHT 0x08)
+// is deliberately the reverse of this `uiNeighborAvail` layout; the two do not agree.
+pub const TOPRIGHT_MB_POS: u32 = 0x04;
+pub const TOPLEFT_MB_POS: u32 = 0x08;
+
+pub const MB_LEFT_BIT: u32 = 0;
+pub const MB_TOP_BIT: u32 = 1;
+pub const MB_TOPRIGHT_BIT: u32 = 2;
+
+// Reference index availability constants
+pub const REF_NOT_IN_LIST: i8 = -1;
+pub const REF_NOT_AVAIL: i8 = -2;
+
+// Macroblock sizing & type constants
+/// `MB_BLOCK8x8_NUM` — `wels_const_common.h:58`, the width of `SMB::iRefIndex`.
+pub use crate::encoder::encoder_ext::MB_BLOCK8x8_NUM;
+/// `MB_COEFF_LIST_SIZE` — `wels_const.h`, the width of `SMbCache::sCoeffLevel`.
+pub use crate::encoder::svc_encode_slice::MB_COEFF_LIST_SIZE;
+pub const MB_BLOCK4x4_NUM: usize = 16;
+pub const MB_LUMA_CHROMA_BLOCK4x4_NUM: usize = 24;
+/// `INTRA_4x4_MODE_NUM` — `wels_const.h:48`, the per-macroblock stride of
+/// `sWelsEncCtx::pIntra4x4PredModeBlocks`.
+pub const INTRA_4x4_MODE_NUM: usize = 8;
+pub const MB_WIDTH_LUMA: i32 = 16;
+
+// `wels_common_defs.h:275-283`.
+pub const MB_TYPE_INTRA4x4: u32 = 0x00000001;
+pub const MB_TYPE_INTRA16x16: u32 = 0x00000002;
+pub const MB_TYPE_INTRA8x8: u32 = 0x00000004;
+pub const MB_TYPE_16x16: u32 = 0x00000008;
+pub const MB_TYPE_16x8: u32 = 0x00000010;
+pub const MB_TYPE_8x16: u32 = 0x00000020;
+pub const MB_TYPE_8x8: u32 = 0x00000040;
+pub const MB_TYPE_8x8_REF0: u32 = 0x00000080;
+pub const MB_TYPE_SKIP: u32 = 0x00000100;
+
+// Global Lookup Tables
+pub use crate::common::common_tables::{
+    g_kiMapModeI16x16, g_kiMapModeIntraChroma, g_kiQpCostTable,
+};
+
+pub use crate::common::wels_common_defs::g_kuiGolombUELength as G_KUI_GOLOMB_UE_LENGTH;
+
+// Data Structures
+
+pub use crate::encoder::svc_motion_estimate::SadPredISatdUnit;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct SWelsMD_sMe<'a> {
+    pub sMe16x16: SWelsME<'a>,
+    pub sMe8x8: [SWelsME<'a>; 4],
+    pub sMe16x8: [SWelsME<'a>; 2],
+    pub sMe8x16: [SWelsME<'a>; 2],
+}
+
+/// **Everything the P-slice mode decision would otherwise re-resolve per macroblock**,
+/// resolved once for the slice — the layer, the three picture views, the PPS chroma QP
+/// offset and the cost-function slots.
+///
+/// Built where the slice's layer is known, and **never carried across layers or
+/// frames**: `layer_ref_pic` resolves through the layer's own dependency id, and the
+/// views are the ones stamped for the frame in progress. It is per-worker by
+/// construction — `RecCursor` is not `Send`, so a worker makes its own.
+///
+/// `Copy`: 120 bytes of references, scalars and function pointers, every one of them
+/// loop-invariant.
+#[derive(Clone, Copy)]
+pub struct MdSliceCtx<'a> {
+    /// `current_layer_expect`.
+    pub layer: &'a SDqLayer,
+    /// `sWelsEncCtx::func_list`.
+    pub func: &'a SWelsFuncPtrList,
+    /// `layer_enc_view_expect` — the frame's source planes.
+    pub enc: &'a crate::encoder::rec_view::RoPicView,
+    /// `layer_rec_view_expect` — the reconstruction seam.
+    pub rec: &'a RecPicView,
+    /// `layer_ref_view_expect`, **built once for the slice** and borrowed from the
+    /// caller that owns it. `None` where no reference picture is bound, which on a P
+    /// slice does not happen and on the shared helpers may.
+    pub refv: Option<&'a crate::encoder::rec_view::RoPicView>,
+    /// `pLayer.pRefOri[0]`, built once for the slice when present (`JudgeStaticSkip` /
+    /// `JudgeScrollSkip`).
+    pub ref_ori_v: Option<&'a crate::encoder::rec_view::RoPicView>,
+    /// The reference picture itself — `pRefMbQp`, `uiRefMbType`, `pMbSkipSad`,
+    /// `iPictureType`. `None` exactly where [`refv`](Self::refv) is.
+    pub ref_pic: Option<&'a SPicture>,
+    /// `sWelsEncCtx::vaa_expect` — the background flags and the two source views.
+    pub vaa: &'a crate::encoder::wels_preprocess::SVAAFrameInfo,
+    /// `SVAAFrameInfo::pCurView` / `pRefView`, unwrapped here rather than at every
+    /// call: they are `None` together, when background detection is off, and
+    /// `VaaBackgroundMbDataUpdate` is the only reader.
+    pub vaa_cur: Option<&'a crate::encoder::rec_view::RoPicView>,
+    pub vaa_ref: Option<&'a crate::encoder::rec_view::RoPicView>,
+    /// The active PPS's `uiChromaQpIndexOffset`.
+    pub chroma_qp_offset: i32,
+    /// `ctx_ref_pic(..).map_or(0, |p| p.iPictureType)` — the **context's** reference
+    /// picture, resolved through the context's own dependency id, so not
+    /// [`ref_pic`](Self::ref_pic), which is the *layer's*. Held as a value: nothing may
+    /// write the context during a slice, every worker holding it shared.
+    pub ctx_ref_pic_type: i32,
+    pub mb_width: i32,
+    pub mb_height: i32,
+    /// The cost slots this path calls, unwrapped once. `pfMdCost` is stamped
+    /// per frame by `PreprocessSliceCoding`, so the selection is slice-invariant.
+    ///
+    /// **`sad16` stays a slot where `sad8` is a direct call**: the AVX2 arm of
+    /// `WelsInitSampleSadFunc` overwrites `pfSampleSad[16x16]` with
+    /// `sample_sad_16x16_avx2` where the host has AVX2, so that slot is *not* one
+    /// function on every build. Nothing overrides `pfSampleSad[8x8]`.
+    pub sad16: PSampleSadSatdCostFunc,
+    pub satd16: PSampleSadSatdCostFunc,
+    pub md_cost16: PSampleSadSatdCostFunc,
+}
+
+/// The nine plane cursors a macroblock's mode decision reads, **built once per
+/// macroblock** where the C++ computes nine pointers from `kiMbX`/`kiMbY`.
+///
+/// Each field is one `SharedPlane::cursor` call — a raw-parts slice and a
+/// multiply-add — hoisted to the top of the loop.
+///
+/// `Copy` — a `RecCursor` is a slice, an offset and a stride.
+#[derive(Clone, Copy)]
+pub struct MbCursors<'a> {
+    pub enc_y: RecCursor<'a>,
+    pub enc_cb: RecCursor<'a>,
+    pub enc_cr: RecCursor<'a>,
+    pub ref_y: RecCursor<'a>,
+    pub ref_cb: RecCursor<'a>,
+    pub ref_cr: RecCursor<'a>,
+    pub rec_y: RecCursor<'a>,
+    pub rec_cb: RecCursor<'a>,
+    pub rec_cr: RecCursor<'a>,
+}
+
+/// The reference picture's three per-macroblock entries, **taken once** where
+/// [`MbCursors`] is stamped.
+///
+/// The readers are `WelsMdInterInit` (`uiRefMbType`), the background judgement
+/// (`pRefMbQp`) and the two skip-cost tests (`pMbSkipSad`). All three arrays are
+/// written by the *previous* frame, so the values never change during a slice.
+///
+/// **The background flags are not here**: their readers take them under `bKeepSkip`
+/// and under `uiNeighborAvail`, guards that skip the read at exactly the macroblocks a
+/// stamp cannot skip.
+#[derive(Clone, Copy, Default)]
+pub struct MbSideInfo {
+    /// `SPicture::pRefMbQp[iMbXY]`.
+    pub ref_qp: u8,
+    /// `ref_pic.iPictureType == P_SLICE`.
+    pub ref_is_p: bool,
+    /// `SPicture::uiRefMbType[iMbXY]`.
+    pub ref_mb_type: u32,
+    /// `SPicture::pMbSkipSad[iMbXY]`.
+    pub ref_skip_sad: i32,
+}
+
+impl MbSideInfo {
+    /// The entries for the macroblock at raster address `mb_xy`.
+    ///
+    /// # Panics
+    /// If no reference picture is bound; every P macroblock requires one.
+    #[inline]
+    pub fn at(sc: &MdSliceCtx<'_>, mb_xy: i32) -> Self {
+        let xy = mb_xy as usize;
+        let rp = sc.ref_pic();
+        Self {
+            ref_qp: rp.pRefMbQp[xy],
+            ref_is_p: rp.iPictureType == EWelsSliceType::P_SLICE as i32,
+            ref_mb_type: rp.uiRefMbType[xy],
+            ref_skip_sad: rp.pMbSkipSad[xy],
+        }
+    }
+}
+
+impl<'a> MdSliceCtx<'a> {
+    /// Resolves the slice's context, once, from the layer the slice belongs to.
+    ///
+    /// `ref_view` is passed in rather than built here: the caller owns the `RoPicView`
+    /// for the slice's whole scope and the context borrows it, which is what makes one
+    /// build serve every macroblock.
+    #[inline]
+    pub fn build(
+        pCtx: &'a sWelsEncCtx,
+        pLayer: &'a SDqLayer,
+        ref_view: Option<&'a crate::encoder::rec_view::RoPicView>,
+        ref_ori_view: Option<&'a crate::encoder::rec_view::RoPicView>,
+    ) -> Self {
+        use crate::encoder::svc_encode_slice as ses;
+        use crate::encoder::svc_mode_decision::BLOCK_16x16;
+        let func = pCtx.func_list();
+        let sdf = &func.sSampleDealingFuncs;
+        let vaa = pCtx.vaa_expect();
+        Self {
+            layer: pLayer,
+            func,
+            enc: layer_enc_view_expect(pLayer),
+            rec: ses::layer_rec_view_expect(pLayer),
+            refv: ref_view,
+            ref_ori_v: ref_ori_view,
+            ref_pic: ses::layer_ref_pic(pCtx, pLayer),
+            vaa,
+            vaa_cur: vaa.pCurView.as_ref(),
+            vaa_ref: vaa.pRefView.as_ref(),
+            chroma_qp_offset: ses::layer_pps_ref(pCtx, pLayer)
+                .map_or(0, |p| p.uiChromaQpIndexOffset) as i32,
+            ctx_ref_pic_type: ses::ctx_ref_pic(pCtx).map_or(0, |p| p.iPictureType),
+            mb_width: pLayer.iMbWidth as i32,
+            mb_height: pLayer.iMbHeight as i32,
+            sad16: sdf.pfSampleSad[BLOCK_16x16]
+                .unwrap_or(|a, b| crate::common::sad_common::sample_sad::<16, 16, _>(a, b)),
+            satd16: sdf.pfSampleSatd[BLOCK_16x16]
+                .unwrap_or(|a, b| crate::encoder::sample::satd_16x16(a, b)),
+            md_cost16: sdf
+                .md_cost(BLOCK_16x16)
+                .unwrap_or(|a, b| crate::common::sad_common::sample_sad::<16, 16, _>(a, b)),
+        }
+    }
+
+    /// The reference picture, for the P-slice bodies that cannot run without one.
+    #[inline(always)]
+    pub fn ref_pic(&self) -> &'a SPicture {
+        #[cold]
+        #[inline(never)]
+        fn default_pic<'a>() -> &'a SPicture {
+            static DEFAULT_PIC: std::sync::OnceLock<SPicture> = std::sync::OnceLock::new();
+            DEFAULT_PIC.get_or_init(|| *SPicture::new(0, 0, false))
+        }
+        self.ref_pic.unwrap_or_else(default_pic)
+    }
+
+    /// The reference picture's shared read-only view, built once per slice.
+    #[inline(always)]
+    pub fn refv(&self) -> &'a crate::encoder::rec_view::RoPicView {
+        static EMPTY_RO_VIEW: crate::encoder::rec_view::RoPicView =
+            crate::encoder::rec_view::RoPicView::empty();
+        self.refv.unwrap_or(&EMPTY_RO_VIEW)
+    }
+}
+
+impl<'a> MbCursors<'a> {
+    /// The nine cursors of the macroblock at `(mb_x, mb_y)`.
+    #[inline]
+    pub fn at(sc: &MdSliceCtx<'a>, mb_x: i32, mb_y: i32) -> Self {
+        let refv = sc.refv();
+        Self::from_views(sc.enc, refv, sc.rec, mb_x, mb_y)
+    }
+
+    /// [`at`](Self::at) from the three views themselves.
+    ///
+    /// The loop stamps through this rather than through `at`, so that the borrow of
+    /// `SWelsMD::sctx` the views come from has ended before the result is written back
+    /// to `SWelsMD::mbc` — with the borrow live the nine cursors go through a stack
+    /// temporary.
+    #[inline]
+    pub fn from_views(
+        enc: &'a crate::encoder::rec_view::RoPicView,
+        refv: &'a crate::encoder::rec_view::RoPicView,
+        rec: &'a RecPicView,
+        mb_x: i32,
+        mb_y: i32,
+    ) -> Self {
+        let (lx, ly) = ((mb_x as isize) << 4, (mb_y as isize) << 4);
+        let (cx, cy) = ((mb_x as isize) << 3, (mb_y as isize) << 3);
+        Self {
+            enc_y: enc.plane(0).cursor(lx, ly),
+            enc_cb: enc.plane(1).cursor(cx, cy),
+            enc_cr: enc.plane(2).cursor(cx, cy),
+            ref_y: refv.plane(0).cursor(lx, ly),
+            ref_cb: refv.plane(1).cursor(cx, cy),
+            ref_cr: refv.plane(2).cursor(cx, cy),
+            rec_y: rec.plane(0).cursor(lx, ly),
+            rec_cb: rec.plane(1).cursor(cx, cy),
+            rec_cr: rec.plane(2).cursor(cx, cy),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct SWelsMD<'a> {
+    /// The slice's resolved context, and the macroblock's cursors — `None` on the
+    /// paths that never built one (an I slice, and the unit tests), which is why
+    /// every reader goes through [`SWelsMD::sc`] / [`SWelsMD::mbc`] rather than
+    /// touching the fields.
+    pub sctx: Option<&'a MdSliceCtx<'a>>,
+    pub mbc: Option<MbCursors<'a>>,
+    /// The reference picture's entries for this macroblock, stamped beside `mbc`.
+    /// Zero on the paths that stamp nothing (an I slice, and the unit tests), which
+    /// is also where nothing reads it.
+    pub mbi: MbSideInfo,
+    pub iLambda: i32,
+    /// `WelsInitInterMDStruc` re-parks it per macroblock on the current luma QP's
+    /// row, and `InitMe` copies it into each search block.
+    pub pMvdCost: MvdCostCursor<'a>,
+    pub iCostLuma: i32,
+    pub iCostChroma: i32,
+    pub iSadPredMb: i32,
+    pub uiRef: u8,
+    pub bMdUsingSad: bool,
+    pub uiReserved: u16,
+    pub iCostSkipMb: i32,
+    pub iSadPredSkip: i32,
+    pub iMbPixX: i32,
+    pub iMbPixY: i32,
+    pub iBlock8x8StaticIdc: [i32; 4],
+    pub sMe: SWelsMD_sMe<'a>,
+}
+
+impl<'a> SWelsMD<'a> {
+    /// The slice context, for the P-slice bodies that cannot run without one.
+    #[inline(always)]
+    pub fn sc(&self) -> &'a MdSliceCtx<'a> {
+        #[cold]
+        #[inline(never)]
+        fn default_sc<'a>() -> &'a MdSliceCtx<'a> {
+            static DEFAULT_SC: std::sync::OnceLock<MdSliceCtx<'static>> =
+                std::sync::OnceLock::new();
+            DEFAULT_SC.get_or_init(|| {
+                static DEFAULT_LAYER: std::sync::OnceLock<SDqLayer> = std::sync::OnceLock::new();
+                static DEFAULT_FUNC: std::sync::OnceLock<SWelsFuncPtrList> =
+                    std::sync::OnceLock::new();
+                static DEFAULT_VAA: std::sync::OnceLock<
+                    crate::encoder::wels_preprocess::SVAAFrameInfo,
+                > = std::sync::OnceLock::new();
+                static EMPTY_RO: crate::encoder::rec_view::RoPicView =
+                    crate::encoder::rec_view::RoPicView::empty();
+                static EMPTY_REC: RecPicView = RecPicView::empty();
+                MdSliceCtx {
+                    layer: DEFAULT_LAYER.get_or_init(SDqLayer::default),
+                    func: DEFAULT_FUNC.get_or_init(SWelsFuncPtrList::default),
+                    enc: &EMPTY_RO,
+                    rec: &EMPTY_REC,
+                    refv: None,
+                    ref_ori_v: None,
+                    ref_pic: None,
+                    vaa: DEFAULT_VAA
+                        .get_or_init(crate::encoder::wels_preprocess::SVAAFrameInfo::default),
+                    vaa_cur: None,
+                    vaa_ref: None,
+                    chroma_qp_offset: 0,
+                    ctx_ref_pic_type: 0,
+                    mb_width: 0,
+                    mb_height: 0,
+                    sad16: |a, b| crate::common::sad_common::sample_sad::<16, 16, _>(a, b),
+                    satd16: |a, b| crate::encoder::sample::satd_16x16(a, b),
+                    md_cost16: |a, b| crate::common::sad_common::sample_sad::<16, 16, _>(a, b),
+                }
+            })
+        }
+        self.sctx.unwrap_or_else(default_sc)
+    }
+
+    /// The current macroblock's plane cursors.
+    #[inline(always)]
+    pub fn mbc(&self) -> &MbCursors<'a> {
+        static EMPTY_MBC: crate::encoder::rec_view::EmptySync<MbCursors<'static>> =
+            crate::encoder::rec_view::EmptySync(MbCursors {
+                enc_y: RecCursor::empty(),
+                enc_cb: RecCursor::empty(),
+                enc_cr: RecCursor::empty(),
+                ref_y: RecCursor::empty(),
+                ref_cb: RecCursor::empty(),
+                ref_cr: RecCursor::empty(),
+                rec_y: RecCursor::empty(),
+                rec_cb: RecCursor::empty(),
+                rec_cr: RecCursor::empty(),
+            });
+        self.mbc.as_ref().unwrap_or(&EMPTY_MBC.0)
+    }
+}
+
+impl Default for SWelsMD<'_> {
+    fn default() -> Self {
+        Self {
+            sctx: None,
+            mbc: None,
+            mbi: MbSideInfo::default(),
+            iLambda: 0,
+            pMvdCost: MvdCostCursor::none(),
+            iCostLuma: 0,
+            iCostChroma: 0,
+            iSadPredMb: 0,
+            uiRef: 0,
+            bMdUsingSad: false,
+            uiReserved: 0,
+            iCostSkipMb: 0,
+            iSadPredSkip: 0,
+            iMbPixX: 0,
+            iMbPixY: 0,
+            iBlock8x8StaticIdc: [0; 4],
+            sMe: SWelsMD_sMe::default(),
+        }
+    }
+}
+
+pub type PCopyFunc =
+    unsafe extern "C" fn(pDst: *mut u8, iStrideD: i32, pSrc: *mut u8, iStrideS: i32);
+/// `PSampleSadSatdCostFunc` (`wels_func_ptr_def.h:127`) — one SAD or SATD of two
+/// equal-shaped blocks, the cost-table slot type of `SSampleDealingFunc::pfSampleSad`
+/// and `pfSampleSatd`.
+///
+/// The two operands are plane cursors anchored at sample `(0, 0)` of each block — the
+/// source macroblock, a reference block displaced by a candidate vector, or a
+/// prediction buffer in the arena — and each kernel reads `W` x `H` samples from both
+/// and nothing else. The block shape is the slot's index (`BLOCK_16x16` ..).
+pub type PSampleSadSatdCostFunc = fn(&RecCursor<'_>, &RecCursor<'_>) -> i32;
+
+/// The four fractional-pixel refinement planes, as **offsets** into the one buffer
+/// they all point into.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct SMeRefinePointer {
+    /// The partition's offset within each 640-byte plane.
+    pub iStride: usize,
+    /// Offset of the plane the diagonal (H+V) filter writes into and reads back —
+    /// always equal to `half_pix_h()` or `half_pix_v()`, chosen per half-pixel arm.
+    pub iHalfPixHV: usize,
+    /// `false`: best is plane 2 (1280), tmp is plane 3 (1920). `true`: swapped.
+    pub bQuarPixSwapped: bool,
+    /// The fixed-shape copy that moves the winning prediction into the macroblock's
+    /// inter-prediction buffer, selected out of `SWelsFuncPtrList`'s `pfCopy*` table by
+    /// partition shape in `WelsMdInterMbRefinement` and consumed once at the end of
+    /// `MeRefineFracPixel`.
+    pub pfCopyBlockByMode: Option<fn(&RecCursor<'_>, &mut PlaneCursorMut<'_>)>,
+}
+
+/// Plane bases inside `SMbCache.sBufferInterPredMe`, in bytes.
+const ME_PLANE_HALF_PIX_H: usize = 0;
+const ME_PLANE_HALF_PIX_V: usize = 640;
+const ME_PLANE_QUAR_A: usize = 1280;
+const ME_PLANE_QUAR_B: usize = 1920;
+
+impl SMeRefinePointer {
+    #[inline(always)]
+    pub fn half_pix_h(&self) -> usize {
+        ME_PLANE_HALF_PIX_H + self.iStride
+    }
+    #[inline(always)]
+    pub fn half_pix_v(&self) -> usize {
+        ME_PLANE_HALF_PIX_V + self.iStride
+    }
+    /// The quarter-pixel plane currently holding the best candidate.
+    #[inline(always)]
+    pub fn quar_pix_best(&self) -> usize {
+        (if self.bQuarPixSwapped {
+            ME_PLANE_QUAR_B
+        } else {
+            ME_PLANE_QUAR_A
+        }) + self.iStride
+    }
+    /// The other one — where the next candidate is built.
+    #[inline(always)]
+    pub fn quar_pix_tmp(&self) -> usize {
+        (if self.bQuarPixSwapped {
+            ME_PLANE_QUAR_A
+        } else {
+            ME_PLANE_QUAR_B
+        }) + self.iStride
+    }
+    /// Exchanges the best and tmp quarter-pixel planes.
+    #[inline(always)]
+    pub fn swap_quar(&mut self) {
+        self.bQuarPixSwapped = !self.bQuarPixSwapped;
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SQuarRefineParams {
+    pub iBestCost: i32,
+    pub iBestHalfPix: i32,
+    pub pSrcB: [MeQuarSource; 4],
+    pub pSrcA: [MeQuarSource; 4],
+    pub iLms: [i32; 4],
+    pub iBestQuarPix: i32,
+}
+
+/// One of the two surfaces a quarter-pixel candidate averages.
+///
+/// There are exactly two: a plane of the half-pixel scratch inside
+/// `SMbCache::sBufferInterPredMe` (always at `ME_REFINE_BUF_STRIDE`), or the
+/// reference block the integer search settled on, displaced by whole samples
+/// (always at the reference picture's stride).
+#[derive(Copy, Clone, Debug)]
+pub enum MeQuarSource {
+    /// Byte offset into `SMbCache::sBufferInterPredMe`, stride `ME_REFINE_BUF_STRIDE`.
+    Buf(usize),
+    /// The reference block displaced by `(dx, dy)` samples.
+    Ref(isize, isize),
+}
+
+impl Default for MeQuarSource {
+    fn default() -> Self {
+        Self::Buf(0)
+    }
+}
+
+/// One quarter-pixel candidate: average the two surfaces into
+/// `sBufferInterPredMe[dst..][..span]`.
+///
+/// `Buf` sources are always the half-pixel planes (offsets 0 and 640 plus the
+/// partition stride) and the destination is always a quarter-pixel plane (1280 or
+/// 1920 plus it), so `dst` is above every `Buf` source this is ever called with —
+/// asserted, not assumed.
+#[inline(always)]
+fn quar_candidate(
+    pMbCache: &mut SMbCache,
+    dst: usize,
+    span: usize,
+    a: &MeQuarSource,
+    b: &MeQuarSource,
+    cRef: &RecCursor<'_>,
+    w: usize,
+    h: usize,
+) {
+    let stride = ME_REFINE_BUF_STRIDE as usize;
+    // `a` is a `Buf` in every arm of `MeRefineFracPixel`; `b` is either.
+    let MeQuarSource::Buf(a_off) = *a else {
+        debug_assert!(false, "pSrcA is a scratch plane in every half-pixel arm");
+        return;
+    };
+    debug_assert!(
+        a_off + span <= dst,
+        "quarter-pixel destination overlaps its source"
+    );
+    if a_off + span > dst || dst + span > pMbCache.sBufferInterPredMe.len() {
+        return;
+    }
+    let (lo, hi) = pMbCache.sBufferInterPredMe.split_at_mut(dst);
+    let cA = PlaneCursor::new(&lo[a_off..][..span], 0, stride);
+    let mut cDst = PlaneCursorMut::new(&mut hi[..span], 0, stride);
+    match *b {
+        MeQuarSource::Buf(b_off) => {
+            debug_assert!(
+                b_off + span <= dst,
+                "quarter-pixel destination overlaps its source"
+            );
+            if b_off + span > dst {
+                return;
+            }
+            let cB = PlaneCursor::new(&lo[b_off..][..span], 0, stride);
+            pixel_avg(&mut cDst, &cA, &cB, w, h);
+        }
+        MeQuarSource::Ref(dx, dy) => {
+            pixel_avg(&mut cDst, &cA, &cRef.advance(dx, dy), w, h);
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SMB {
+    pub uiMbType: u32,
+    pub uiSubMbType: [u8; 4],
+    pub iMbXY: i32,
+    pub iMbX: i16,
+    pub iMbY: i16,
+    pub uiNeighborAvail: u8,
+    pub uiCbp: u8,
+    /// `SMVUnitXY* sMv` — one row of 4x4 motion vectors per macroblock.
+    pub sMv: [SMVUnitXY; MB_BLOCK4x4_NUM],
+    /// `int8_t* pRefIndex` — one entry per 8x8 partition.
+    pub iRefIndex: [i8; MB_BLOCK8x8_NUM],
+    /// `int32_t* pSadCost` — one value per macroblock, so a scalar here.
+    pub iSadCost: i32,
+    /// `int8_t* pIntra4x4PredMode` — 8 published modes (4 right column, 3 bottom
+    /// row, 1 unused) that the *next* macroblock's `FillNeighborCacheIntra` reads.
+    pub iIntra4x4PredMode: [i8; INTRA_4x4_MODE_NUM],
+    /// `int8_t* pNonZeroCount` — 16 luma + 8 chroma 4x4 blocks.
+    pub iNonZeroCount: [i8; MB_LUMA_CHROMA_BLOCK4x4_NUM],
+    pub sP16x16Mv: SMVUnitXY,
+    pub uiLumaQp: u8,
+    pub uiChromaQp: u8,
+    pub uiSliceIdc: u16,
+    pub uiChromPredMode: u32,
+    pub iLumaDQp: i32,
+    pub sMvd: [SMVUnitXY; MB_BLOCK4x4_NUM],
+    pub iCbpDc: i32,
+}
+
+impl Default for SMB {
+    fn default() -> Self {
+        Self {
+            uiMbType: 0,
+            uiSubMbType: [0; 4],
+            iMbXY: 0,
+            iMbX: 0,
+            iMbY: 0,
+            uiNeighborAvail: 0,
+            uiCbp: 0,
+            sMv: [SMVUnitXY::default(); MB_BLOCK4x4_NUM],
+            iRefIndex: [0; MB_BLOCK8x8_NUM],
+            iSadCost: 0,
+            iIntra4x4PredMode: [0; INTRA_4x4_MODE_NUM],
+            iNonZeroCount: [0; MB_LUMA_CHROMA_BLOCK4x4_NUM],
+            sP16x16Mv: SMVUnitXY::default(),
+            uiLumaQp: 0,
+            uiChromaQp: 0,
+            uiSliceIdc: 0,
+            uiChromPredMode: 0,
+            iLumaDQp: 0,
+            sMvd: [SMVUnitXY::default(); MB_BLOCK4x4_NUM],
+            iCbpDc: 0,
+        }
+    }
+}
+
+/// `TagMbCache` — `codec/encoder/core/inc/mb_cache.h:72`.
+///
+/// The first three members are `ALIGNED_DECLARE (..., 16)` in C++, giving the struct
+/// 16-byte alignment. `#[repr(C, align(16))]` plus 14 bytes of padding after
+/// `sMvComponents` (146 bytes) gives the same layout, bringing `iNonZeroCoeffCount` to
+/// offset 160; the two `[i8; 48]` arrays are already 16-multiples.
+#[repr(C, align(16))]
+#[derive(Debug)]
+pub struct SMbCache {
+    pub sMvComponents: SMVComponentUnit,
+    pub _pad_after_sMvComponents: [u8; 14],
+    pub iNonZeroCoeffCount: [i8; 48],
+    pub iIntraPredMode: [i8; 48],
+    pub iSadCost: [i32; 4],
+    pub sMbMvp: [SMVUnitXY; MB_BLOCK4x4_NUM],
+    pub sCoeffLevel: [i16; MB_COEFF_LIST_SIZE],
+    pub sSkipMb: [u8; 384],
+    /// Two 256-byte halves — the I16x16 prediction ping-pong — plus 16 bytes of
+    /// headroom.
+    ///
+    /// `WelsMdI16x16` scores a candidate in the upper half with
+    /// `WelsSampleSad16x16_c`, whose last 8x8 sub-block starts at +392 and reads
+    /// through byte 511, in bounds; the kernel then bumps its row pointer past the
+    /// final row, forming `base + 520` without dereferencing it.
+    /// The extra 16 bytes are one luma row at the ping-pong's stride of 16, enough to
+    /// keep that arithmetic in bounds; they are never read or written.
+    pub sMemPredMb: [u8; 2 * 256 + 16],
+    pub sMemPredBlk4: [u8; 2 * 16],
+    pub sBufferInterPredMe: [u8; 4 * 640],
+    pub bPrevIntra4x4PredModeFlag: [bool; MB_BLOCK4x4_NUM],
+    pub iRemIntra4x4PredModeFlag: [i8; MB_BLOCK4x4_NUM],
+    /// Which 256-byte half of [`SMbCache::sMemPredMb`] currently holds the luma
+    /// prediction (`pMemPredLuma`); chroma is the other one.
+    pub uiMemPredLumaHalf: u8,
+    /// Which 128-byte half *of the chroma half* holds the winning chroma prediction
+    /// (`pBestPredIntraChroma`). Composed with `uiMemPredLumaHalf`, because the chroma
+    /// half is itself whichever half lost the I16x16 ping-pong.
+    pub uiBestPredIntraChromaHalf: u8,
+    /// Which 16-byte half of [`SMbCache::sMemPredBlk4`] holds the winning I4x4 block
+    /// prediction (`pBestPredI4x4Blk4`).
+    pub uiBestPredI4x4Blk4Half: u8,
+    pub iSadCostSkip: [i32; 4],
+    pub bMbTypeSkip: [bool; 4],
+    pub sDct: SDCTCoeff,
+    pub uiNeighborIntra: u8,
+    pub uiLumaI16x16Mode: u8,
+    pub uiChmaI8x8Mode: u8,
+    pub bCollocatedPredFlag: bool,
+    pub uiRefMbType: u32,
+    // `mb_cache.h:124` — an anonymous struct member named `SPicData`.
+    pub SPicData: SPicData,
+}
+
+impl Default for SMbCache {
+    fn default() -> Self {
+        Self {
+            sMvComponents: SMVComponentUnit::default(),
+            _pad_after_sMvComponents: [0; 14],
+            iNonZeroCoeffCount: [0; 48],
+            iIntraPredMode: [0; 48],
+            iSadCost: [0; 4],
+            sMbMvp: [SMVUnitXY::default(); MB_BLOCK4x4_NUM],
+            sCoeffLevel: [0; MB_COEFF_LIST_SIZE],
+            sSkipMb: [0; 384],
+            sMemPredMb: [0; 2 * 256 + 16],
+            sMemPredBlk4: [0; 2 * 16],
+            sBufferInterPredMe: [0; 4 * 640],
+            bPrevIntra4x4PredModeFlag: [false; MB_BLOCK4x4_NUM],
+            iRemIntra4x4PredModeFlag: [0; MB_BLOCK4x4_NUM],
+            uiMemPredLumaHalf: 0,
+            uiBestPredIntraChromaHalf: 0,
+            uiBestPredI4x4Blk4Half: 0,
+            iSadCostSkip: [0; 4],
+            bMbTypeSkip: [false; 4],
+            sDct: SDCTCoeff::default(),
+            uiNeighborIntra: 0,
+            uiLumaI16x16Mode: 0,
+            uiChmaI8x8Mode: 0,
+            bCollocatedPredFlag: false,
+            uiRefMbType: 0,
+            SPicData: SPicData::default(),
+        }
+    }
+}
+
+/// `pMbCache->pMemPredLuma` — the `sMemPredMb` offset of the half holding the luma
+/// prediction.
+#[inline]
+pub const fn mem_pred_luma_off(uiMemPredLumaHalf: u8) -> usize {
+    256 * uiMemPredLumaHalf as usize
+}
+
+/// `pMbCache->pMemPredChroma` — the other half, by construction.
+#[inline]
+pub const fn mem_pred_chroma_off(uiMemPredLumaHalf: u8) -> usize {
+    256 * (uiMemPredLumaHalf ^ 0x01) as usize
+}
+
+/// `pMbCache->pBestPredIntraChroma` — one of the chroma half's two 128-byte halves.
+#[inline]
+pub const fn best_pred_intra_chroma_off(
+    uiMemPredLumaHalf: u8,
+    uiBestPredIntraChromaHalf: u8,
+) -> usize {
+    mem_pred_chroma_off(uiMemPredLumaHalf) + 128 * uiBestPredIntraChromaHalf as usize
+}
+
+/// `pMbCache->pBestPredI4x4Blk4` — the `sMemPredBlk4` offset of whichever 16-byte half won.
+#[inline]
+pub const fn best_pred_i4x4_blk4_off(uiBestPredI4x4Blk4Half: u8) -> usize {
+    16 * uiBestPredI4x4Blk4Half as usize
+}
+
+/// `kpMbSkipSad` is the reconstruction picture's whole `pMbSkipSad` array, not a cursor
+/// into it; the four neighbour reads index `iMbXY + <offset>` against the root.
+///
+/// Those reads are of *neighbouring* macroblocks — under multi-threading, of
+/// macroblocks that may belong to another worker's slice. They are guarded by the
+/// slice-scoped `uiNeighborAvail`, so the reads never cross.
+///
+/// `pVaaBgMbFlag` is the whole array too, indexed the same way; it lives on the one
+/// `SVAAFrameInfo` every worker shares.
+pub type PFillInterNeighborCacheFunc = fn(
+    pMbCache: &mut SMbCache,
+    mbs: &MbSplit<'_, SMB>,
+    pVaaBgMbFlag: &[i8],
+    kpMbSkipSad: &SharedMbArray<i32>,
+);
+pub type PGetVarianceFromIntraVaaFunc = extern "C" fn(cEnc: &RecCursor<'_>) -> i32;
+// The four SADs arrive as the `[i32; 4]` `SVAACalcResult::pSad8x8` stores per
+// macroblock.
+pub type PGetMbSignFromInterVaaFunc = fn(kpSad8x8: &[i32; 4]) -> u8;
+/// The kernel writes all sixteen entries, so it takes the macroblock's whole MV row.
+pub type PUpdateMbMvFunc = fn(pMvBuffer: &mut [SMVUnitXY; MB_BLOCK4x4_NUM], ksMv: SMVUnitXY);
+
+// MC and the half-pel filters are called directly, not via `sMcFuncs`.
+use crate::common::mc::{mc_hor_ver02, mc_hor_ver20, mc_hor_ver22, pixel_avg};
+pub use crate::encoder::encoder_context::BLOCK_SIZE_ALL;
+pub use crate::encoder::encoder_context::SDCTCoeff;
+pub use crate::encoder::encoder_context::SPicData;
+pub use crate::encoder::encoder_context::sWelsEncCtx;
+use crate::encoder::rec_view::{RecCursor, RecPicView, SharedMbArray};
+pub use crate::encoder::svc_encode_slice::SDqLayer;
+use crate::encoder::svc_encode_slice::layer_enc_view_expect;
+pub use crate::encoder::svc_motion_estimate::PSample4SadCostFunc;
+pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
+use crate::safe::plane::{PlaneCursor, PlaneCursorMut};
+
+/// Which sibling cost array a selector in [`SSampleDealingFunc`] names.
+///
+/// The selection is made once per layer from encoder config and never varies per
+/// macroblock.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum CostFamily {
+    /// No cost function selected — the state outside the configurations that use one.
+    #[default]
+    Unset,
+    /// `pfSampleSad` — sum of absolute differences.
+    Sad,
+    /// `pfSampleSatd` — Hadamard-transformed absolute differences.
+    Satd,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SSampleDealingFunc {
+    // wels_func_ptr_def.h:163 — these are [MAX_BLOCK_TYPE], and MAX_BLOCK_TYPE is
+    // BLOCK_SIZE_ALL = 7 (wels_func_ptr_def.h:161, wels_const.h:147).
+    pub pfSampleSad: [Option<PSampleSadSatdCostFunc>; BLOCK_SIZE_ALL],
+    pub pfSampleSatd: [Option<PSampleSadSatdCostFunc>; BLOCK_SIZE_ALL],
+    pub pfSample4Sad: [Option<PSample4SadCostFunc>; BLOCK_SIZE_ALL],
+    /// Which of the two sibling cost arrays mode decision reads. Read it through
+    /// [`SSampleDealingFunc::md_cost`].
+    pub pfMdCost: CostFamily,
+    /// As [`Self::pfMdCost`], for motion estimation; unset outside the ME-capable
+    /// configurations.
+    pub pfMeCost: CostFamily,
+}
+
+impl Default for SSampleDealingFunc {
+    fn default() -> Self {
+        Self {
+            pfSampleSad: [None; BLOCK_SIZE_ALL],
+            pfSampleSatd: [None; BLOCK_SIZE_ALL],
+            pfSample4Sad: [None; BLOCK_SIZE_ALL],
+            pfMdCost: CostFamily::Unset,
+            pfMeCost: CostFamily::Unset,
+        }
+    }
+}
+
+impl SSampleDealingFunc {
+    /// The mode-decision cost function for `block`, or `None` if unselected.
+    #[inline(always)]
+    pub fn md_cost(&self, block: usize) -> Option<PSampleSadSatdCostFunc> {
+        match self.pfMdCost {
+            CostFamily::Sad => self.pfSampleSad[block],
+            CostFamily::Satd => self.pfSampleSatd[block],
+            CostFamily::Unset => None,
+        }
+    }
+
+    /// The motion-estimation cost function for `block`, or `None` if unselected.
+    ///
+    /// As [`Self::md_cost`].
+    #[inline(always)]
+    pub fn me_cost(&self, block: usize) -> Option<PSampleSadSatdCostFunc> {
+        match self.pfMeCost {
+            CostFamily::Sad => self.pfSampleSad[block],
+            CostFamily::Satd => self.pfSampleSatd[block],
+            CostFamily::Unset => None,
+        }
+    }
+}
+
+// Mathematical Helper Functions & Macros
+#[inline(always)]
+pub fn BsSizeUE(kiValue: u32) -> u32 {
+    if kiValue < 256 {
+        G_KUI_GOLOMB_UE_LENGTH[kiValue as usize]
+    } else {
+        let mut n = 0u32;
+        let mut iTmpValue = kiValue + 1;
+        if (iTmpValue & 0xffff0000) != 0 {
+            iTmpValue >>= 16;
+            n += 16;
+        }
+        if (iTmpValue & 0xff00) != 0 {
+            iTmpValue >>= 8;
+            n += 8;
+        }
+        n += G_KUI_GOLOMB_UE_LENGTH[(iTmpValue - 1) as usize] >> 1;
+        (n << 1) + 1
+    }
+}
+
+#[inline(always)]
+pub fn BsSizeSE(kiValue: i32) -> u32 {
+    if kiValue == 0 {
+        1
+    } else if kiValue > 0 {
+        let iTmpValue = ((kiValue as u32) << 1) - 1;
+        BsSizeUE(iTmpValue)
+    } else {
+        let iTmpValue = (-kiValue as u32) << 1;
+        BsSizeUE(iTmpValue)
+    }
+}
+
+#[inline(always)]
+pub fn COST_MVD(pMvdCost: MvdCostCursor<'_>, iMvdX: i32, iMvdY: i32) -> i32 {
+    let x = pMvdCost.at(iMvdX) as i32;
+    let y = pMvdCost.at(iMvdY) as i32;
+    x + y
+}
+
+#[inline(always)]
+pub fn REPLACE_SAD_MULTIPLY(x: i32) -> i32 {
+    x - (x >> 3) + (x >> 5)
+}
+
+pub use crate::common::macros::WelsMedian;
+
+#[inline(always)]
+pub fn IS_SVC_INTER(uiMbType: u32) -> bool {
+    (uiMbType
+        & (MB_TYPE_16x16
+            | MB_TYPE_16x8
+            | MB_TYPE_8x16
+            | MB_TYPE_8x8
+            | MB_TYPE_8x8_REF0
+            | MB_TYPE_SKIP))
+        != 0
+}
+
+// Function Implementations
+pub fn FillNeighborCacheIntra(pMbCache: &mut SMbCache, mbs: &MbSplit<'_, SMB>) {
+    let uiNeighborAvail = mbs.cur().uiNeighborAvail as u32;
+    let mut uiNeighborIntra: u32 = 0;
+
+    if (uiNeighborAvail & LEFT_MB_POS) != 0 {
+        // The left macroblock's `iNonZeroCount` and `iIntra4x4PredMode` rows, read from
+        // its own struct.
+        let pLeftMb = mbs.left();
+        pMbCache.iNonZeroCoeffCount[8] = pLeftMb.iNonZeroCount[3];
+        pMbCache.iNonZeroCoeffCount[16] = pLeftMb.iNonZeroCount[7];
+        pMbCache.iNonZeroCoeffCount[24] = pLeftMb.iNonZeroCount[11];
+        pMbCache.iNonZeroCoeffCount[32] = pLeftMb.iNonZeroCount[15];
+
+        pMbCache.iNonZeroCoeffCount[13] = pLeftMb.iNonZeroCount[17];
+        pMbCache.iNonZeroCoeffCount[21] = pLeftMb.iNonZeroCount[21];
+        pMbCache.iNonZeroCoeffCount[37] = pLeftMb.iNonZeroCount[19];
+        pMbCache.iNonZeroCoeffCount[45] = pLeftMb.iNonZeroCount[23];
+
+        uiNeighborIntra |= LEFT_MB_POS;
+
+        if (pLeftMb.uiMbType & MB_TYPE_INTRA4x4) != 0 {
+            pMbCache.iIntraPredMode[8] = pLeftMb.iIntra4x4PredMode[4];
+            pMbCache.iIntraPredMode[16] = pLeftMb.iIntra4x4PredMode[5];
+            pMbCache.iIntraPredMode[24] = pLeftMb.iIntra4x4PredMode[6];
+            pMbCache.iIntraPredMode[32] = pLeftMb.iIntra4x4PredMode[3];
+        } else {
+            pMbCache.iIntraPredMode[8] = 2;
+            pMbCache.iIntraPredMode[16] = 2;
+            pMbCache.iIntraPredMode[24] = 2;
+            pMbCache.iIntraPredMode[32] = 2;
+        }
+    } else {
+        pMbCache.iNonZeroCoeffCount[8] = -1;
+        pMbCache.iNonZeroCoeffCount[16] = -1;
+        pMbCache.iNonZeroCoeffCount[24] = -1;
+        pMbCache.iNonZeroCoeffCount[32] = -1;
+        pMbCache.iNonZeroCoeffCount[13] = -1;
+        pMbCache.iNonZeroCoeffCount[21] = -1;
+        pMbCache.iNonZeroCoeffCount[37] = -1;
+        pMbCache.iNonZeroCoeffCount[45] = -1;
+
+        pMbCache.iIntraPredMode[8] = -1;
+        pMbCache.iIntraPredMode[16] = -1;
+        pMbCache.iIntraPredMode[24] = -1;
+        pMbCache.iIntraPredMode[32] = -1;
+    }
+
+    if (uiNeighborAvail & TOP_MB_POS) != 0 {
+        let pTopMb = mbs.top();
+        // One reborrow of each row rather than one per statement: the destination is
+        // the cache's array and the source is the top macroblock's, two allocations.
+        let pCacheNzc = &mut pMbCache.iNonZeroCoeffCount;
+        let pTopNzc = &pTopMb.iNonZeroCount;
+        pCacheNzc[1..5].copy_from_slice(&pTopNzc[12..16]);
+        pCacheNzc[6..8].copy_from_slice(&pTopNzc[20..22]);
+        pCacheNzc[30..32].copy_from_slice(&pTopNzc[22..24]);
+
+        uiNeighborIntra |= TOP_MB_POS;
+
+        if (pTopMb.uiMbType & MB_TYPE_INTRA4x4) != 0 {
+            let pCacheMode = &mut pMbCache.iIntraPredMode;
+            let pTopMode = &pTopMb.iIntra4x4PredMode;
+            pCacheMode[1..5].copy_from_slice(&pTopMode[0..4]);
+        } else {
+            pMbCache.iIntraPredMode[1] = 2;
+            pMbCache.iIntraPredMode[2] = 2;
+            pMbCache.iIntraPredMode[3] = 2;
+            pMbCache.iIntraPredMode[4] = 2;
+        }
+    } else {
+        pMbCache.iIntraPredMode[1..5].fill(-1);
+        pMbCache.iNonZeroCoeffCount[1..5].fill(-1);
+        pMbCache.iNonZeroCoeffCount[6..8].fill(-1);
+        pMbCache.iNonZeroCoeffCount[30..32].fill(-1);
+    }
+
+    if (uiNeighborAvail & TOPLEFT_MB_POS) != 0 {
+        uiNeighborIntra |= 0x04;
+    }
+    if (uiNeighborAvail & TOPRIGHT_MB_POS) != 0 {
+        uiNeighborIntra |= 0x08;
+    }
+    pMbCache.uiNeighborIntra = uiNeighborIntra as u8;
+}
+
+/// Fills the inter-prediction neighbor cache (MVs, reference indices, SAD costs)
+/// for the current macroblock from its left / top / top-left / top-right neighbors.
+///
+/// This merges the two upstream C++ functions
+/// `WelsMdInterMbEnc`'s helpers `FillNeighborCacheInterWithoutBGD`
+/// (codec/encoder/core/src/md.cpp:132) and `FillNeighborCacheInterWithBGD`
+/// (codec/encoder/core/src/md.cpp:253), which are character-identical except for
+/// four extra background-detection guards on the neighbor "skip" decision.
+///
+/// `BGD` is a *const* generic (not a runtime flag) so the `false` instantiation
+/// compiles to exactly the non-BGD code: the `pVaaBgMbFlag` lookups are dead-code
+/// eliminated. This matters for correctness, not just speed — callers may pass an
+/// empty `pVaaBgMbFlag` slice when background detection is disabled, so the
+/// non-BGD path must never index it.
+#[inline(always)]
+fn fill_neighbor_cache_inter<const BGD: bool>(
+    pMbCache: &mut SMbCache,
+    mbs: &MbSplit<'_, SMB>,
+    pVaaBgMbFlag: &[i8],
+    kpMbSkipSad: &SharedMbArray<i32>,
+) {
+    let uiNeighborAvail = mbs.cur().uiNeighborAvail as u32;
+    let kiMbXY = mbs.cur().iMbXY as isize;
+    let iMbWidth = mbs.stride() as i32;
+    let pMvComp = &mut pMbCache.sMvComponents;
+
+    if (uiNeighborAvail & LEFT_MB_POS) != 0 && IS_SVC_INTER(mbs.left().uiMbType) {
+        let pLeftMb = mbs.left();
+        pMvComp.sMotionVectorCache[6] = pLeftMb.sMv[3];
+        pMvComp.sMotionVectorCache[12] = pLeftMb.sMv[7];
+        pMvComp.sMotionVectorCache[18] = pLeftMb.sMv[11];
+        pMvComp.sMotionVectorCache[24] = pLeftMb.sMv[15];
+        pMvComp.iRefIndexCache[6] = pLeftMb.iRefIndex[1];
+        pMvComp.iRefIndexCache[12] = pLeftMb.iRefIndex[1];
+        pMvComp.iRefIndexCache[18] = pLeftMb.iRefIndex[3];
+        pMvComp.iRefIndexCache[24] = pLeftMb.iRefIndex[3];
+        pMbCache.iSadCost[3] = pLeftMb.iSadCost;
+
+        // With BGD enabled, a neighbor sitting on detected background is not
+        // treated as a skip candidate.
+        if pLeftMb.uiMbType == MB_TYPE_SKIP && (!BGD || pVaaBgMbFlag[(kiMbXY - 1) as usize] == 0) {
+            pMbCache.bMbTypeSkip[3] = true;
+            pMbCache.iSadCostSkip[3] = kpMbSkipSad.get((kiMbXY - 1) as usize);
+        } else {
+            pMbCache.bMbTypeSkip[3] = false;
+            pMbCache.iSadCostSkip[3] = 0;
+        }
+    } else {
+        pMvComp.sMotionVectorCache[6] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[12] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[18] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[24] = SMVUnitXY::default();
+        let ref_val = if (uiNeighborAvail & LEFT_MB_POS) != 0 {
+            REF_NOT_IN_LIST
+        } else {
+            REF_NOT_AVAIL
+        };
+        pMvComp.iRefIndexCache[6] = ref_val;
+        pMvComp.iRefIndexCache[12] = ref_val;
+        pMvComp.iRefIndexCache[18] = ref_val;
+        pMvComp.iRefIndexCache[24] = ref_val;
+        pMbCache.iSadCost[3] = 0;
+        pMbCache.bMbTypeSkip[3] = false;
+        pMbCache.iSadCostSkip[3] = 0;
+    }
+
+    if (uiNeighborAvail & TOP_MB_POS) != 0 && IS_SVC_INTER(mbs.top().uiMbType) {
+        let pTopMb = mbs.top();
+        let pTopMv = &pTopMb.sMv;
+        pMvComp.sMotionVectorCache[1..3].copy_from_slice(&pTopMv[12..14]);
+        pMvComp.sMotionVectorCache[3..5].copy_from_slice(&pTopMv[14..16]);
+        pMvComp.iRefIndexCache[1] = pTopMb.iRefIndex[2];
+        pMvComp.iRefIndexCache[2] = pTopMb.iRefIndex[2];
+        pMvComp.iRefIndexCache[3] = pTopMb.iRefIndex[3];
+        pMvComp.iRefIndexCache[4] = pTopMb.iRefIndex[3];
+        pMbCache.iSadCost[1] = pTopMb.iSadCost;
+
+        if pTopMb.uiMbType == MB_TYPE_SKIP
+            && (!BGD || pVaaBgMbFlag[(kiMbXY - iMbWidth as isize) as usize] == 0)
+        {
+            pMbCache.bMbTypeSkip[1] = true;
+            pMbCache.iSadCostSkip[1] = kpMbSkipSad.get((kiMbXY - iMbWidth as isize) as usize);
+        } else {
+            pMbCache.bMbTypeSkip[1] = false;
+            pMbCache.iSadCostSkip[1] = 0;
+        }
+    } else {
+        pMvComp.sMotionVectorCache[1] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[2] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[3] = SMVUnitXY::default();
+        pMvComp.sMotionVectorCache[4] = SMVUnitXY::default();
+        let ref_val = if (uiNeighborAvail & TOP_MB_POS) != 0 {
+            REF_NOT_IN_LIST
+        } else {
+            REF_NOT_AVAIL
+        };
+        pMvComp.iRefIndexCache[1] = ref_val;
+        pMvComp.iRefIndexCache[2] = ref_val;
+        pMvComp.iRefIndexCache[3] = ref_val;
+        pMvComp.iRefIndexCache[4] = ref_val;
+        pMbCache.iSadCost[1] = 0;
+        pMbCache.bMbTypeSkip[1] = false;
+        pMbCache.iSadCostSkip[1] = 0;
+    }
+
+    if (uiNeighborAvail & TOPLEFT_MB_POS) != 0 && IS_SVC_INTER(mbs.top_left().uiMbType) {
+        let pTopLeftMb = mbs.top_left();
+        pMvComp.sMotionVectorCache[0] = pTopLeftMb.sMv[15];
+        pMvComp.iRefIndexCache[0] = pTopLeftMb.iRefIndex[3];
+        pMbCache.iSadCost[0] = pTopLeftMb.iSadCost;
+
+        if pTopLeftMb.uiMbType == MB_TYPE_SKIP
+            && (!BGD || pVaaBgMbFlag[(kiMbXY - iMbWidth as isize - 1) as usize] == 0)
+        {
+            pMbCache.bMbTypeSkip[0] = true;
+            pMbCache.iSadCostSkip[0] = kpMbSkipSad.get((kiMbXY - iMbWidth as isize - 1) as usize);
+        } else {
+            pMbCache.bMbTypeSkip[0] = false;
+            pMbCache.iSadCostSkip[0] = 0;
+        }
+    } else {
+        pMvComp.sMotionVectorCache[0] = SMVUnitXY::default();
+        pMvComp.iRefIndexCache[0] = if (uiNeighborAvail & TOPLEFT_MB_POS) != 0 {
+            REF_NOT_IN_LIST
+        } else {
+            REF_NOT_AVAIL
+        };
+        pMbCache.iSadCost[0] = 0;
+        pMbCache.bMbTypeSkip[0] = false;
+        pMbCache.iSadCostSkip[0] = 0;
+    }
+
+    if (uiNeighborAvail & TOPRIGHT_MB_POS) != 0 && IS_SVC_INTER(mbs.top_right().uiMbType) {
+        let pTopRightMb = mbs.top_right();
+        pMvComp.sMotionVectorCache[5] = pTopRightMb.sMv[12];
+        pMvComp.iRefIndexCache[5] = pTopRightMb.iRefIndex[2];
+        pMbCache.iSadCost[2] = pTopRightMb.iSadCost;
+
+        if pTopRightMb.uiMbType == MB_TYPE_SKIP
+            && (!BGD || pVaaBgMbFlag[(kiMbXY - iMbWidth as isize + 1) as usize] == 0)
+        {
+            pMbCache.bMbTypeSkip[2] = true;
+            pMbCache.iSadCostSkip[2] = kpMbSkipSad.get((kiMbXY - iMbWidth as isize + 1) as usize);
+        } else {
+            pMbCache.bMbTypeSkip[2] = false;
+            pMbCache.iSadCostSkip[2] = 0;
+        }
+    } else {
+        pMvComp.sMotionVectorCache[5] = SMVUnitXY::default();
+        pMvComp.iRefIndexCache[5] = if (uiNeighborAvail & TOPRIGHT_MB_POS) != 0 {
+            REF_NOT_IN_LIST
+        } else {
+            REF_NOT_AVAIL
+        };
+        pMbCache.iSadCost[2] = 0;
+        pMbCache.bMbTypeSkip[2] = false;
+        pMbCache.iSadCostSkip[2] = 0;
+    }
+
+    pMvComp.sMotionVectorCache[9] = SMVUnitXY::default();
+    pMvComp.sMotionVectorCache[21] = SMVUnitXY::default();
+    pMvComp.sMotionVectorCache[11] = SMVUnitXY::default();
+    pMvComp.sMotionVectorCache[17] = SMVUnitXY::default();
+    pMvComp.sMotionVectorCache[23] = SMVUnitXY::default();
+    pMvComp.iRefIndexCache[9] = REF_NOT_AVAIL;
+    pMvComp.iRefIndexCache[11] = REF_NOT_AVAIL;
+    pMvComp.iRefIndexCache[17] = REF_NOT_AVAIL;
+    pMvComp.iRefIndexCache[21] = REF_NOT_AVAIL;
+    pMvComp.iRefIndexCache[23] = REF_NOT_AVAIL;
+}
+
+/// Mirrors `FillNeighborCacheInterWithoutBGD`, codec/encoder/core/src/md.cpp:132.
+pub fn FillNeighborCacheInterWithoutBGD(
+    pMbCache: &mut SMbCache,
+    mbs: &MbSplit<'_, SMB>,
+    _pVaaBgMbFlag: &[i8],
+    kpMbSkipSad: &SharedMbArray<i32>,
+) {
+    fill_neighbor_cache_inter::<false>(pMbCache, mbs, _pVaaBgMbFlag, kpMbSkipSad);
+}
+
+/// Mirrors `FillNeighborCacheInterWithBGD`, codec/encoder/core/src/md.cpp:253.
+pub fn FillNeighborCacheInterWithBGD(
+    pMbCache: &mut SMbCache,
+    mbs: &MbSplit<'_, SMB>,
+    pVaaBgMbFlag: &[i8],
+    kpMbSkipSad: &SharedMbArray<i32>,
+) {
+    fill_neighbor_cache_inter::<true>(pMbCache, mbs, pVaaBgMbFlag, kpMbSkipSad);
+}
+
+pub extern "C" fn InitFillNeighborCacheInterFunc(pFuncList: &mut SWelsFuncPtrList, kiFlag: i32) {
+    pFuncList.pfFillInterNeighborCache = if kiFlag != 0 {
+        FillNeighborCacheInterWithBGD
+    } else {
+        FillNeighborCacheInterWithoutBGD
+    };
+}
+
+pub fn UpdateMbMv_c(pMvBuffer: &mut [SMVUnitXY; MB_BLOCK4x4_NUM], ksMv: SMVUnitXY) {
+    for k in (0..MB_BLOCK4x4_NUM).step_by(4) {
+        pMvBuffer[k] = ksMv;
+        pMvBuffer[k + 1] = ksMv;
+        pMvBuffer[k + 2] = ksMv;
+        pMvBuffer[k + 3] = ksMv;
+    }
+}
+
+pub fn MdInterAnalysisVaaInfo_c(kpSad8x8: &[i32; 4]) -> u8 {
+    // The macroblock's four 8x8 SADs, by value off the bounded row.
+    let iSadBlock = *kpSad8x8;
+    let mut iAverageSadBlock = [0i32; 4];
+
+    let mut iAverageSad = iSadBlock[0];
+    iAverageSad += iSadBlock[1];
+    iAverageSad += iSadBlock[2];
+    iAverageSad += iSadBlock[3];
+
+    iAverageSad >>= 2;
+
+    iAverageSadBlock[0] = (iSadBlock[0] >> 6) - (iAverageSad >> 6);
+    let mut iVarianceSad = iAverageSadBlock[0] * iAverageSadBlock[0];
+
+    iAverageSadBlock[1] = (iSadBlock[1] >> 6) - (iAverageSad >> 6);
+    iVarianceSad += iAverageSadBlock[1] * iAverageSadBlock[1];
+
+    iAverageSadBlock[2] = (iSadBlock[2] >> 6) - (iAverageSad >> 6);
+    iVarianceSad += iAverageSadBlock[2] * iAverageSadBlock[2];
+
+    iAverageSadBlock[3] = (iSadBlock[3] >> 6) - (iAverageSad >> 6);
+    iVarianceSad += iAverageSadBlock[3] * iAverageSadBlock[3];
+
+    if iVarianceSad < INTER_VARIANCE_SAD_THRESHOLD {
+        return 15;
+    }
+
+    let mut uiMbSign: u8 = 0;
+    if iSadBlock[0] > iAverageSad {
+        uiMbSign |= 0x08;
+    }
+    if iSadBlock[1] > iAverageSad {
+        uiMbSign |= 0x04;
+    }
+    if iSadBlock[2] > iAverageSad {
+        uiMbSign |= 0x02;
+    }
+    if iSadBlock[3] > iAverageSad {
+        uiMbSign |= 0x01;
+    }
+    uiMbSign
+}
+
+#[inline(always)]
+pub extern "C" fn AnalysisVaaInfoIntra_c(cEnc: &RecCursor<'_>) -> i32 {
+    use crate::safe::plane::{BlockRows, RefSamples};
+    let span = cEnc.span::<16, 16>(0, 0);
+    let mut iSumAvg: i32 = 0;
+    let mut iSumSqr: i32 = 0;
+
+    for strip in 0..4usize {
+        let r0 = span.row::<16>(strip * 4, 0);
+        let r1 = span.row::<16>(strip * 4 + 1, 0);
+        let r2 = span.row::<16>(strip * 4 + 2, 0);
+        let r3 = span.row::<16>(strip * 4 + 3, 0);
+
+        for bx in 0..4usize {
+            let x = bx * 4;
+            let sum = (r0[x] as u32 + r0[x + 1] as u32 + r0[x + 2] as u32 + r0[x + 3] as u32)
+                + (r1[x] as u32 + r1[x + 1] as u32 + r1[x + 2] as u32 + r1[x + 3] as u32)
+                + (r2[x] as u32 + r2[x + 1] as u32 + r2[x + 2] as u32 + r2[x + 3] as u32)
+                + (r3[x] as u32 + r3[x + 1] as u32 + r3[x + 2] as u32 + r3[x + 3] as u32);
+            let avg = (sum >> 4) as i32;
+            iSumAvg += avg;
+            iSumSqr += avg * avg;
+        }
+    }
+
+    iSumSqr - ((iSumAvg * iSumAvg) >> 4)
+}
+
+pub extern "C" fn InitIntraAnalysisVaaInfo(pFuncList: &mut SWelsFuncPtrList, _kuiCpuFlag: u32) {
+    pFuncList.pfGetVarianceFromIntraVaa = AnalysisVaaInfoIntra_c;
+    pFuncList.pfGetMbSignFromInterVaa = MdInterAnalysisVaaInfo_c;
+    pFuncList.pfUpdateMbMv = UpdateMbMv_c;
+}
+
+#[inline(always)]
+pub fn MdIntraAnalysisVaaInfo(_pEncCtx: &sWelsEncCtx, cEncMb: &RecCursor<'_>) -> bool {
+    let kiVariance = AnalysisVaaInfoIntra_c(cEncMb);
+    kiVariance >= INTRA_VARIANCE_SAD_THRESHOLD
+}
+
+/// Aim the refinement record at one partition.
+///
+/// The quarter-pixel selector is reset here to `pQuarPixBest = 1280`,
+/// `pQuarPixTmp = 1920`, and every `MeRefineFracPixel` call is preceded by one of
+/// these, so a partition that left the pair swapped cannot leak that state into the
+/// next one.
+pub fn InitMeRefinePointer(pMeRefine: &mut SMeRefinePointer, iStride: i32) {
+    pMeRefine.iStride = iStride as usize;
+    pMeRefine.iHalfPixHV = 0;
+    pMeRefine.bQuarPixSwapped = false;
+}
+
+/// The four candidate averages and their costs.
+///
+/// `cEnc` is the source block — the same sample `SWelsME::pEncMb` names, resolved
+/// from the picture at the search block's own coordinates (`iCurMeBlockPixX/Y`). The
+/// candidate sources arrive as `MeQuarSource`, each either a `sBufferInterPredMe`
+/// offset or a displacement of the reference block.
+#[inline(always)]
+pub fn MeRefineQuarPixel(
+    pFunc: &SWelsFuncPtrList,
+    pMe: &mut SWelsME<'_>,
+    pMeRefine: &mut SMeRefinePointer,
+    pMbCache: &mut SMbCache,
+    cEnc: &RecCursor<'_>,
+    cRef: &RecCursor<'_>,
+    kiWidth: i32,
+    kiHeight: i32,
+    pParams: &mut SQuarRefineParams,
+) {
+    let kuiPixel = pMe.uiBlockSize as usize;
+    let Some(pfMeCost) = pFunc.sSampleDealingFuncs.me_cost(kuiPixel) else {
+        return;
+    };
+    let (w, h) = (kiWidth as usize, kiHeight as usize);
+    let span = (h - 1) * ME_REFINE_BUF_STRIDE as usize + w;
+
+    // =========================(0, -1) [TOP] =========================
+    quar_candidate(
+        pMbCache,
+        pMeRefine.quar_pix_tmp(),
+        span,
+        &pParams.pSrcA[0],
+        &pParams.pSrcB[0],
+        cRef,
+        w,
+        h,
+    );
+    let mut iCurCost = {
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+            0,
+            ME_REFINE_BUF_STRIDE as usize,
+        );
+        pfMeCost(cEnc, &cTmp) + pParams.iLms[0]
+    };
+    if iCurCost < pParams.iBestCost {
+        pParams.iBestCost = iCurCost;
+        pParams.iBestQuarPix = ME_QUAR_PIXEL_TOP;
+        pMeRefine.swap_quar();
+    }
+
+    // =========================(0, 1) [BOTTOM] =======================
+    quar_candidate(
+        pMbCache,
+        pMeRefine.quar_pix_tmp(),
+        span,
+        &pParams.pSrcA[1],
+        &pParams.pSrcB[1],
+        cRef,
+        w,
+        h,
+    );
+    iCurCost = {
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+            0,
+            ME_REFINE_BUF_STRIDE as usize,
+        );
+        pfMeCost(cEnc, &cTmp) + pParams.iLms[1]
+    };
+    if iCurCost < pParams.iBestCost {
+        pParams.iBestCost = iCurCost;
+        pParams.iBestQuarPix = ME_QUAR_PIXEL_BOTTOM;
+        pMeRefine.swap_quar();
+    }
+
+    // =========================(-1, 0) [LEFT] ========================
+    quar_candidate(
+        pMbCache,
+        pMeRefine.quar_pix_tmp(),
+        span,
+        &pParams.pSrcA[2],
+        &pParams.pSrcB[2],
+        cRef,
+        w,
+        h,
+    );
+    iCurCost = {
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+            0,
+            ME_REFINE_BUF_STRIDE as usize,
+        );
+        pfMeCost(cEnc, &cTmp) + pParams.iLms[2]
+    };
+    if iCurCost < pParams.iBestCost {
+        pParams.iBestCost = iCurCost;
+        pParams.iBestQuarPix = ME_QUAR_PIXEL_LEFT;
+        pMeRefine.swap_quar();
+    }
+
+    // =========================(1, 0) [RIGHT] ========================
+    quar_candidate(
+        pMbCache,
+        pMeRefine.quar_pix_tmp(),
+        span,
+        &pParams.pSrcA[3],
+        &pParams.pSrcB[3],
+        cRef,
+        w,
+        h,
+    );
+    iCurCost = {
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+            0,
+            ME_REFINE_BUF_STRIDE as usize,
+        );
+        pfMeCost(cEnc, &cTmp) + pParams.iLms[3]
+    };
+    if iCurCost < pParams.iBestCost {
+        pParams.iBestCost = iCurCost;
+        pParams.iBestQuarPix = ME_QUAR_PIXEL_RIGHT;
+        pMeRefine.swap_quar();
+    }
+}
+
+/// The source and reference blocks are resolved from the pictures the layer names,
+/// at the search block's own coordinates — `(iCurMeBlockPixX, iCurMeBlockPixY)` for
+/// the source and that plus the whole-sample part of `sMv` for the reference.
+///
+/// The half- and quarter-pixel scratch is `SMbCache`'s own `sBufferInterPredMe`,
+/// borrowed per use through the `pMbCache` parameter.
+///
+/// `kiMemPredInterOff`, the destination of the final copy, is a `usize` offset into
+/// `sMemPredMb`.
+pub extern "C" fn MeRefineFracPixel(
+    sc: &MdSliceCtx<'_>,
+    kiMemPredInterOff: usize,
+    pMe: &mut SWelsME<'_>,
+    pMeRefine: &mut SMeRefinePointer,
+    pMbCache: &mut SMbCache,
+    iWidth: i32,
+    iHeight: i32,
+) {
+    let pFunc = sc.func;
+    let pCurDqLayer = sc.layer;
+    let iMvx = pMe.sMv.iMvX;
+    let iMvy = pMe.sMv.iMvY;
+
+    let mut iHalfMvx = iMvx;
+    let mut iHalfMvy = iMvy;
+    // The two blocks, by coordinate. `sMv` is quarter-pel here and the integer search
+    // left `pRefMb` at its whole-sample part, so `>> 2` is the displacement.
+    let kiBlockX = pMe.iCurMeBlockPixX as isize;
+    let kiBlockY = pMe.iCurMeBlockPixY as isize;
+    let pEncPicture = sc.enc;
+    let cEnc = pEncPicture.plane(0).cursor(kiBlockX, kiBlockY);
+    let pRefPicture = sc.refv();
+    let cRef = pRefPicture.plane(0).cursor(
+        kiBlockX + ((iMvx as isize) >> 2),
+        kiBlockY + ((iMvy as isize) >> 2),
+    );
+
+    let mut sParams = SQuarRefineParams {
+        iBestCost: 0,
+        iBestHalfPix: 0,
+        pSrcB: [MeQuarSource::default(); 4],
+        pSrcA: [MeQuarSource::default(); 4],
+        iLms: [0; 4],
+        iBestQuarPix: ME_NO_BEST_QUAR_PIXEL,
+    };
+
+    let iMvQuarAddX: [i32; 10] = [0, 0, -1, 1, 0, 0, 0, -1, 1, 0];
+    let pMvQuarAddY = &iMvQuarAddX[3..];
+    /// Where the winning prediction lives when the copy at the end runs: either the
+    /// reference block itself (no fractional part won) or a plane of the scratch.
+    enum BestPred {
+        Ref,
+        Buf(usize),
+    }
+    let mut pBestPredInter = BestPred::Ref;
+
+    let mut iBestCost: i32;
+    let mut iCurCost: i32;
+    let mut iBestHalfPix: i32;
+
+    let (kiW, kiH) = (iWidth as usize, iHeight as usize);
+    let kiBufStride = ME_REFINE_BUF_STRIDE as usize;
+    // The span of one candidate block in the scratch, and of the two half-pixel
+    // filters, which write one extra row or column.
+    let span_wh = |w: usize, h: usize| (h - 1) * kiBufStride + w;
+
+    let Some(pfMeCost) = pFunc.sSampleDealingFuncs.me_cost(pMe.uiBlockSize as usize) else {
+        return;
+    };
+
+    if pCurDqLayer.bSatdInMdFlag {
+        iBestCost = pMe.uSadPredISatd.uiValue as i32
+            + COST_MVD(
+                pMe.pMvdCost,
+                (iMvx - pMe.sMvp.iMvX) as i32,
+                (iMvy - pMe.sMvp.iMvY) as i32,
+            );
+    } else {
+        iBestCost = pfMeCost(&cEnc, &cRef)
+            + COST_MVD(
+                pMe.pMvdCost,
+                (iMvx - pMe.sMvp.iMvX) as i32,
+                (iMvy - pMe.sMvp.iMvY) as i32,
+            );
+    }
+
+    iBestHalfPix = REFINE_ME_NO_BEST_HALF_PIXEL;
+
+    // The vertical half-pel filter writes one extra row (`iHeight + 1`), which is the
+    // `(0, 2)` candidate's block one row down.
+    {
+        let off = pMeRefine.half_pix_v();
+        let mut cDst = PlaneCursorMut::new(
+            &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW, kiH + 1)],
+            0,
+            kiBufStride,
+        );
+        mc_hor_ver02(&cRef.advance(0, -1), &mut cDst, kiW, kiH + 1);
+    }
+
+    // step 1: vertical filter — the `(0, -2)` and `(0, 2)` candidates, the same block
+    // one row apart in the plane the filter just wrote, read through one cursor over
+    // that plane with the second candidate at its anchor advanced. Both costs are
+    // computed before either comparison.
+    let (iCostTop, iCostBottom) = {
+        let off = pMeRefine.half_pix_v();
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[off..][..kiBufStride + span_wh(kiW, kiH)],
+            0,
+            kiBufStride,
+        );
+        (pfMeCost(&cEnc, &cTmp), pfMeCost(&cEnc, &cTmp.advance(0, 1)))
+    };
+
+    // (0, -2) [TOP]
+    iCurCost = iCostTop
+        + COST_MVD(
+            pMe.pMvdCost,
+            (iMvx - pMe.sMvp.iMvX) as i32,
+            (iMvy - 2 - pMe.sMvp.iMvY) as i32,
+        );
+    if iCurCost < iBestCost {
+        iBestCost = iCurCost;
+        iBestHalfPix = REFINE_ME_HALF_PIXEL_TOP;
+        pBestPredInter = BestPred::Buf(pMeRefine.half_pix_v());
+    }
+
+    // (0, 2) [BOTTOM]
+    iCurCost = iCostBottom
+        + COST_MVD(
+            pMe.pMvdCost,
+            (iMvx - pMe.sMvp.iMvX) as i32,
+            (iMvy + 2 - pMe.sMvp.iMvY) as i32,
+        );
+    if iCurCost < iBestCost {
+        iBestCost = iCurCost;
+        iBestHalfPix = REFINE_ME_HALF_PIXEL_BOTTOM;
+        pBestPredInter = BestPred::Buf(pMeRefine.half_pix_v() + kiBufStride);
+    }
+
+    // The horizontal filter writes one extra column, which is `(2, 0)`'s block.
+    {
+        let off = pMeRefine.half_pix_h();
+        let mut cDst = PlaneCursorMut::new(
+            &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW + 1, kiH)],
+            0,
+            kiBufStride,
+        );
+        mc_hor_ver20(&cRef.advance(-1, 0), &mut cDst, kiW + 1, kiH);
+    }
+
+    // step 2: horizontal filter — `(-2, 0)` and `(2, 0)`, one column apart in the
+    // plane the filter just wrote; one cursor over it, as above.
+    let (iCostLeft, iCostRight) = {
+        let off = pMeRefine.half_pix_h();
+        let cTmp = RecCursor::over_owned(
+            &mut pMbCache.sBufferInterPredMe[off..][..1 + span_wh(kiW, kiH)],
+            0,
+            kiBufStride,
+        );
+        (pfMeCost(&cEnc, &cTmp), pfMeCost(&cEnc, &cTmp.advance(1, 0)))
+    };
+
+    // (-2, 0) [LEFT]
+    iCurCost = iCostLeft
+        + COST_MVD(
+            pMe.pMvdCost,
+            (iMvx - 2 - pMe.sMvp.iMvX) as i32,
+            (iMvy - pMe.sMvp.iMvY) as i32,
+        );
+    if iCurCost < iBestCost {
+        iBestCost = iCurCost;
+        iBestHalfPix = REFINE_ME_HALF_PIXEL_LEFT;
+        pBestPredInter = BestPred::Buf(pMeRefine.half_pix_h());
+    }
+
+    // (2, 0) [RIGHT]
+    iCurCost = iCostRight
+        + COST_MVD(
+            pMe.pMvdCost,
+            (iMvx + 2 - pMe.sMvp.iMvX) as i32,
+            (iMvy - pMe.sMvp.iMvY) as i32,
+        );
+    if iCurCost < iBestCost {
+        iBestCost = iCurCost;
+        iBestHalfPix = REFINE_ME_HALF_PIXEL_RIGHT;
+        pBestPredInter = BestPred::Buf(pMeRefine.half_pix_h() + 1);
+    }
+
+    sParams.iBestCost = iBestCost;
+    sParams.iBestHalfPix = iBestHalfPix;
+    sParams.iBestQuarPix = ME_NO_BEST_QUAR_PIXEL;
+
+    if REFINE_ME_NO_BEST_HALF_PIXEL == iBestHalfPix {
+        sParams.pSrcA[0] = MeQuarSource::Buf(pMeRefine.half_pix_v());
+        sParams.pSrcA[1] = MeQuarSource::Buf(pMeRefine.half_pix_v() + kiBufStride);
+        sParams.pSrcA[2] = MeQuarSource::Buf(pMeRefine.half_pix_h());
+        sParams.pSrcA[3] = MeQuarSource::Buf(pMeRefine.half_pix_h() + 1);
+
+        sParams.pSrcB[0] = MeQuarSource::Ref(0, 0);
+        sParams.pSrcB[1] = MeQuarSource::Ref(0, 0);
+        sParams.pSrcB[2] = MeQuarSource::Ref(0, 0);
+        sParams.pSrcB[3] = MeQuarSource::Ref(0, 0);
+
+        sParams.iLms[0] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - 1 - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[1] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy + 1 - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[2] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - 1 - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[3] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx + 1 - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - pMe.sMvp.iMvY) as i32,
+        );
+    } else {
+        match iBestHalfPix {
+            REFINE_ME_HALF_PIXEL_LEFT => {
+                pMeRefine.iHalfPixHV = pMeRefine.half_pix_v();
+                {
+                    let off = pMeRefine.iHalfPixHV;
+                    let mut cDst = PlaneCursorMut::new(
+                        &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW + 1, kiH + 1)],
+                        0,
+                        kiBufStride,
+                    );
+                    mc_hor_ver22(&cRef.advance(-1, -1), &mut cDst, kiW + 1, kiH + 1);
+                }
+
+                iHalfMvx -= 2;
+                sParams.pSrcA[0] = MeQuarSource::Buf(pMeRefine.half_pix_h());
+                sParams.pSrcA[1] = MeQuarSource::Buf(pMeRefine.half_pix_h());
+                sParams.pSrcA[2] = MeQuarSource::Buf(pMeRefine.half_pix_h());
+                sParams.pSrcA[3] = MeQuarSource::Buf(pMeRefine.half_pix_h());
+                sParams.pSrcB[0] = MeQuarSource::Buf(pMeRefine.iHalfPixHV);
+                sParams.pSrcB[1] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + kiBufStride);
+                sParams.pSrcB[2] = MeQuarSource::Ref(-1, 0);
+                sParams.pSrcB[3] = MeQuarSource::Ref(0, 0);
+            }
+            REFINE_ME_HALF_PIXEL_RIGHT => {
+                pMeRefine.iHalfPixHV = pMeRefine.half_pix_v();
+                {
+                    let off = pMeRefine.iHalfPixHV;
+                    let mut cDst = PlaneCursorMut::new(
+                        &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW + 1, kiH + 1)],
+                        0,
+                        kiBufStride,
+                    );
+                    mc_hor_ver22(&cRef.advance(-1, -1), &mut cDst, kiW + 1, kiH + 1);
+                }
+
+                iHalfMvx += 2;
+                sParams.pSrcA[0] = MeQuarSource::Buf(pMeRefine.half_pix_h() + 1);
+                sParams.pSrcA[1] = MeQuarSource::Buf(pMeRefine.half_pix_h() + 1);
+                sParams.pSrcA[2] = MeQuarSource::Buf(pMeRefine.half_pix_h() + 1);
+                sParams.pSrcA[3] = MeQuarSource::Buf(pMeRefine.half_pix_h() + 1);
+                sParams.pSrcB[0] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + 1);
+                sParams.pSrcB[1] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + 1 + kiBufStride);
+                sParams.pSrcB[2] = MeQuarSource::Ref(0, 0);
+                sParams.pSrcB[3] = MeQuarSource::Ref(1, 0);
+            }
+            REFINE_ME_HALF_PIXEL_TOP => {
+                pMeRefine.iHalfPixHV = pMeRefine.half_pix_h();
+                {
+                    let off = pMeRefine.iHalfPixHV;
+                    let mut cDst = PlaneCursorMut::new(
+                        &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW + 1, kiH + 1)],
+                        0,
+                        kiBufStride,
+                    );
+                    mc_hor_ver22(&cRef.advance(-1, -1), &mut cDst, kiW + 1, kiH + 1);
+                }
+
+                iHalfMvy -= 2;
+                sParams.pSrcA[0] = MeQuarSource::Buf(pMeRefine.half_pix_v());
+                sParams.pSrcA[1] = MeQuarSource::Buf(pMeRefine.half_pix_v());
+                sParams.pSrcA[2] = MeQuarSource::Buf(pMeRefine.half_pix_v());
+                sParams.pSrcA[3] = MeQuarSource::Buf(pMeRefine.half_pix_v());
+                sParams.pSrcB[0] = MeQuarSource::Ref(0, -1);
+                sParams.pSrcB[1] = MeQuarSource::Ref(0, 0);
+                sParams.pSrcB[2] = MeQuarSource::Buf(pMeRefine.iHalfPixHV);
+                sParams.pSrcB[3] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + 1);
+            }
+            REFINE_ME_HALF_PIXEL_BOTTOM => {
+                pMeRefine.iHalfPixHV = pMeRefine.half_pix_h();
+                {
+                    let off = pMeRefine.iHalfPixHV;
+                    let mut cDst = PlaneCursorMut::new(
+                        &mut pMbCache.sBufferInterPredMe[off..][..span_wh(kiW + 1, kiH + 1)],
+                        0,
+                        kiBufStride,
+                    );
+                    mc_hor_ver22(&cRef.advance(-1, -1), &mut cDst, kiW + 1, kiH + 1);
+                }
+
+                iHalfMvy += 2;
+                sParams.pSrcA[0] = MeQuarSource::Buf(pMeRefine.half_pix_v() + kiBufStride);
+                sParams.pSrcA[1] = MeQuarSource::Buf(pMeRefine.half_pix_v() + kiBufStride);
+                sParams.pSrcA[2] = MeQuarSource::Buf(pMeRefine.half_pix_v() + kiBufStride);
+                sParams.pSrcA[3] = MeQuarSource::Buf(pMeRefine.half_pix_v() + kiBufStride);
+                sParams.pSrcB[0] = MeQuarSource::Ref(0, 0);
+                sParams.pSrcB[1] = MeQuarSource::Ref(0, 1);
+                sParams.pSrcB[2] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + kiBufStride);
+                sParams.pSrcB[3] = MeQuarSource::Buf(pMeRefine.iHalfPixHV + kiBufStride + 1);
+            }
+            _ => {}
+        }
+
+        sParams.iLms[0] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - 1 - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[1] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy + 1 - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[2] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx - 1 - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - pMe.sMvp.iMvY) as i32,
+        );
+        sParams.iLms[3] = COST_MVD(
+            pMe.pMvdCost,
+            (iHalfMvx + 1 - pMe.sMvp.iMvX) as i32,
+            (iHalfMvy - pMe.sMvp.iMvY) as i32,
+        );
+    }
+
+    MeRefineQuarPixel(
+        pFunc,
+        pMe,
+        pMeRefine,
+        pMbCache,
+        &cEnc,
+        &cRef,
+        iWidth,
+        iHeight,
+        &mut sParams,
+    );
+
+    if iBestCost > sParams.iBestCost {
+        pBestPredInter = BestPred::Buf(pMeRefine.quar_pix_best());
+        iBestCost = sParams.iBestCost;
+    }
+    let iBestQuarPix = sParams.iBestQuarPix;
+
+    pMe.sMv.iMvX = iHalfMvx + iMvQuarAddX[iBestQuarPix as usize] as i16;
+    pMe.sMv.iMvY = iHalfMvy + pMvQuarAddY[iBestQuarPix as usize] as i16;
+    pMe.uiSatdCost = iBestCost as u32;
+
+    if iBestHalfPix + iBestQuarPix == NO_BEST_FRAC_PIX {
+        pBestPredInter = BestPred::Ref;
+    }
+
+    // The final copy.
+    let Some(pfCopyBlockByMode) = pMeRefine.pfCopyBlockByMode else {
+        return;
+    };
+    let kiDstSpan = (kiH - 1) * MB_WIDTH_LUMA as usize + kiW;
+    match pBestPredInter {
+        BestPred::Ref => {
+            let mut cDst = PlaneCursorMut::new(
+                &mut pMbCache.sMemPredMb[kiMemPredInterOff..][..kiDstSpan],
+                0,
+                MB_WIDTH_LUMA as usize,
+            );
+            pfCopyBlockByMode(&cRef, &mut cDst)
+        }
+        BestPred::Buf(off) => {
+            // Two *different* fields of the arena, so the compiler grants both
+            // borrows at once and no `split_at_mut` is needed.
+            let SMbCache {
+                sMemPredMb,
+                sBufferInterPredMe,
+                ..
+            } = &mut *pMbCache;
+            let cSrc = RecCursor::over_owned(
+                &mut sBufferInterPredMe[off..][..span_wh(kiW, kiH)],
+                0,
+                kiBufStride,
+            );
+            let mut cDst = PlaneCursorMut::new(
+                &mut sMemPredMb[kiMemPredInterOff..][..kiDstSpan],
+                0,
+                MB_WIDTH_LUMA as usize,
+            );
+            pfCopyBlockByMode(&cSrc, &mut cDst)
+        }
+    }
+}
+
+pub fn MvdCostInit(pMvdCostInter: &mut [u16], kiMvdSz: i32) {
+    let kiSz = kiMvdSz >> 1;
+    debug_assert!(
+        (52 * kiMvdSz as usize) <= pMvdCostInter.len(),
+        "the MVD cost table is smaller than the 52 QP rows this fills"
+    );
+    let mut iNegMvd = 0usize;
+    let mut iPosMvd = (kiSz + 1) as usize;
+
+    for i in 0..52 {
+        let kiLambda = g_kiQpCostTable[i] as u16;
+        let mut iNegSe = -kiSz;
+        let mut iPosSe = 1i32;
+
+        let mut j = 0;
+        while j < kiSz {
+            for _ in 0..4 {
+                pMvdCostInter[iNegMvd] = kiLambda.wrapping_mul(BsSizeSE(iNegSe) as u16);
+                iNegMvd += 1;
+                iNegSe += 1;
+            }
+            for _ in 0..4 {
+                pMvdCostInter[iPosMvd] = kiLambda.wrapping_mul(BsSizeSE(iPosSe) as u16);
+                iPosMvd += 1;
+                iPosSe += 1;
+            }
+            j += 4;
+        }
+
+        pMvdCostInter[iNegMvd] = kiLambda;
+        iNegMvd += (kiSz + 1) as usize;
+        iPosMvd += (kiSz + 1) as usize;
+    }
+}
+
+pub fn PredictSad(
+    pRefIndexCache: &[i8; 30],
+    pSadCostCache: &[i32; 4],
+    uiRef: i32,
+    pSadPred: &mut i32,
+) {
+    let kiRefB = pRefIndexCache[1] as i32;
+    let mut iRefC = pRefIndexCache[5] as i32;
+    let kiRefA = pRefIndexCache[6] as i32;
+    let kiSadB = pSadCostCache[1];
+    let mut iSadC = pSadCostCache[2];
+    let kiSadA = pSadCostCache[3];
+
+    if iRefC == REF_NOT_AVAIL as i32 {
+        iRefC = pRefIndexCache[0] as i32;
+        iSadC = pSadCostCache[0];
+    }
+
+    if kiRefB == REF_NOT_AVAIL as i32
+        && iRefC == REF_NOT_AVAIL as i32
+        && kiRefA != REF_NOT_AVAIL as i32
+    {
+        *pSadPred = kiSadA;
+    } else {
+        let mut iCount = ((uiRef == kiRefA) as i32) << MB_LEFT_BIT;
+        iCount |= ((uiRef == kiRefB) as i32) << MB_TOP_BIT;
+        iCount |= ((uiRef == iRefC) as i32) << MB_TOPRIGHT_BIT;
+        match iCount as u32 {
+            LEFT_MB_POS => {
+                *pSadPred = kiSadA;
+            }
+            TOP_MB_POS => {
+                *pSadPred = kiSadB;
+            }
+            TOPRIGHT_MB_POS => {
+                *pSadPred = iSadC;
+            }
+            _ => {
+                *pSadPred = WelsMedian(kiSadA, kiSadB, iSadC);
+            }
+        }
+    }
+
+    let iCount = (*pSadPred) << 6;
+    *pSadPred = (REPLACE_SAD_MULTIPLY(iCount) + 32) >> 6;
+}
+
+pub fn PredictSadSkip(
+    pRefIndexCache: &[i8; 30],
+    pMbSkipCache: &[bool; 4],
+    pSadCostCache: &[i32; 4],
+    uiRef: i32,
+    iSadPredSkip: &mut i32,
+) {
+    let kiRefB = pRefIndexCache[1] as i32;
+    let mut iRefC = pRefIndexCache[5] as i32;
+    let kiRefA = pRefIndexCache[6] as i32;
+    let kiSadB = if pMbSkipCache[1] { pSadCostCache[1] } else { 0 };
+    let mut iSadC = if pMbSkipCache[2] { pSadCostCache[2] } else { 0 };
+    let kiSadA = if pMbSkipCache[3] { pSadCostCache[3] } else { 0 };
+    let mut iRefSkip = pMbSkipCache[2];
+
+    if iRefC == REF_NOT_AVAIL as i32 {
+        iRefC = pRefIndexCache[0] as i32;
+        iSadC = if pMbSkipCache[0] { pSadCostCache[0] } else { 0 };
+        iRefSkip = pMbSkipCache[0];
+    }
+
+    if kiRefB == REF_NOT_AVAIL as i32
+        && iRefC == REF_NOT_AVAIL as i32
+        && kiRefA != REF_NOT_AVAIL as i32
+    {
+        *iSadPredSkip = kiSadA;
+    } else {
+        let mut iCount = (((uiRef == kiRefA) && pMbSkipCache[3]) as i32) << MB_LEFT_BIT;
+        iCount |= (((uiRef == kiRefB) && pMbSkipCache[1]) as i32) << MB_TOP_BIT;
+        iCount |= (((uiRef == iRefC) && iRefSkip) as i32) << MB_TOPRIGHT_BIT;
+        match iCount as u32 {
+            LEFT_MB_POS => {
+                *iSadPredSkip = kiSadA;
+            }
+            TOP_MB_POS => {
+                *iSadPredSkip = kiSadB;
+            }
+            TOPRIGHT_MB_POS => {
+                *iSadPredSkip = iSadC;
+            }
+            _ => {
+                *iSadPredSkip = WelsMedian(kiSadA, kiSadB, iSadC);
+            }
+        }
+    }
+}
+
+// WELS_CPU_* flags: one definition, in `common/cpu_core.rs`.
+pub use crate::common::cpu_core::{WELS_CPU_SSE2, WELS_CPU_SSE41, WELS_CPU_SSSE3};
+use crate::common::wels_common_defs::EWelsSliceType;
+use crate::safe::mb_grid::MbSplit;

@@ -1,0 +1,2207 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE_CHROMIUM file.
+
+// Copyright (c) 2013, Cisco Systems
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without modification,
+// are permitted provided that the following conditions are met:
+//
+// * Redistributions of source code must retain the above copyright notice, this
+//   list of conditions and the following disclaimer.
+//
+// * Redistributions in binary form must reproduce the above copyright notice, this
+//   list of conditions and the following disclaimer in the documentation and/or
+//   other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+//! # OpenH264 Video Decoder: In-Loop Deblocking Filter
+//!
+//! `codec/decoder/core/inc/deblocking.h`, `codec/decoder/core/src/deblocking.cpp`.
+//!
+//! The normative H.264/AVC in-loop adaptive deblocking filter: boundary strength (bS)
+//! derivation for P- and B-slices, slice-level iteration, macroblock edge availability
+//! masks, and SIMD dispatch table initialization.
+
+#![deny(unsafe_code)]
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![forbid(unsafe_code)]
+
+// Constants & Configuration Flags
+
+pub const NO_SUPPORTED_FILTER_IDX: i32 = -1;
+pub const LEFT_FLAG_BIT: i32 = 0;
+pub const TOP_FLAG_BIT: i32 = 1;
+pub const LEFT_FLAG_MASK: i32 = 0x01;
+pub const TOP_FLAG_MASK: i32 = 0x02;
+
+pub const MB_BLOCK4x4_NUM: usize = 16;
+pub const LIST_0: usize = 0;
+pub const LIST_1: usize = 1;
+pub const LIST_A: usize = 2;
+pub const REF_NOT_IN_LIST: i8 = -1;
+pub const MV_A: usize = 2;
+
+// AVC Macroblock Types
+pub const MB_TYPE_INTRA4x4: u32 = 0x00000001;
+pub const MB_TYPE_INTRA16x16: u32 = 0x00000002;
+pub const MB_TYPE_INTRA8x8: u32 = 0x00000004;
+pub const MB_TYPE_16x16: u32 = 0x00000008;
+pub const MB_TYPE_16x8: u32 = 0x00000010;
+pub const MB_TYPE_8x16: u32 = 0x00000020;
+pub const MB_TYPE_8x8: u32 = 0x00000040;
+pub const MB_TYPE_8x8_REF0: u32 = 0x00000080;
+pub const MB_TYPE_SKIP: u32 = 0x00000100;
+pub const MB_TYPE_INTRA_PCM: u32 = 0x00000200;
+pub const MB_TYPE_INTRA_BL: u32 = 0x00000400;
+pub const MB_TYPE_DIRECT: u32 = 0x00000800;
+
+pub const MB_TYPE_INTRA: u32 =
+    MB_TYPE_INTRA4x4 | MB_TYPE_INTRA16x16 | MB_TYPE_INTRA8x8 | MB_TYPE_INTRA_PCM;
+
+#[inline(always)]
+pub fn IS_INTRA(mb_type: u32) -> bool {
+    (mb_type & MB_TYPE_INTRA) != 0
+}
+
+#[inline(always)]
+pub fn IS_SKIP(mb_type: u32) -> bool {
+    (mb_type & MB_TYPE_SKIP) != 0
+}
+
+#[inline(always)]
+pub fn IS_INTER_16x16(mb_type: u32) -> bool {
+    (mb_type & MB_TYPE_16x16) != 0
+}
+
+// H.264 / AVC Static Deblocking Lookup Tables
+
+// `g_kuiAlphaTable`, `g_kiBetaTable`, `g_kiTc0Table`, `g_kuiTableBIdx`, and
+// `alpha_table` / `beta_table` / `tc0_table` live in `common::deblocking_common`
+// and reach this module through the glob re-export below.
+
+pub static g_kuiTableB8x8Idx: [[u8; 16]; 2] = [
+    [0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15],
+    [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15],
+];
+
+pub use crate::common::deblocking_common::*;
+pub use crate::decoder::decoder_context::{MAX_DPB_COUNT, PicId, SDeblockingFilter, SRefPic};
+pub use crate::decoder::decoder_core::{DqLayerState, SLayerInfo, SSlice};
+pub use crate::decoder::parameter_sets::{SPps, SSps};
+pub use crate::decoder::picture::SPicture;
+pub use crate::decoder::slice::EWelsSliceType;
+pub use crate::decoder::slice::{SSliceHeader, SSliceHeaderExt};
+use crate::safe::mb_grid::MbArray;
+
+pub type PDeblockingFilterMbFunc = fn(
+    pCurDqLayer: &mut DqLayerState,
+    pDec: &mut SPicture,
+    filter: &mut SDeblockingFilter,
+    boundry_flag: i32,
+);
+
+pub use crate::decoder::decoder_context::SWelsDecoderContext;
+use crate::decoder::decoder_context::{SliceCtx, active_fmo};
+use crate::safe::plane::PlaneCursorMut;
+
+// Boundary Strength Evaluation Macros & Helper Primitives
+
+#[inline(always)]
+pub fn GET_ALPHA_BETA_FROM_QP(
+    iQp: i32,
+    iAlphaOffset: i32,
+    iBetaOffset: i32,
+    iIndexA: &mut i32,
+    iAlpha: &mut i32,
+    iBeta: &mut i32,
+) {
+    *iIndexA = iQp + iAlphaOffset;
+    *iAlpha = alpha_table(*iIndexA) as i32;
+    *iBeta = beta_table(iQp + iBetaOffset) as i32;
+}
+
+#[inline(always)]
+pub fn TC0_TBL_LOOKUP(tc: &mut [i8; 4], iIndexA: i32, pBS: &[u8], bChroma: i8) {
+    let tbl = tc0_table(iIndexA);
+    tc[0] = tbl[(pBS[0] & 3) as usize] + bChroma;
+    tc[1] = tbl[(pBS[1] & 3) as usize] + bChroma;
+    tc[2] = tbl[(pBS[2] & 3) as usize] + bChroma;
+    tc[3] = tbl[(pBS[3] & 3) as usize] + bChroma;
+}
+
+#[inline(always)]
+pub fn MB_BS_MV(
+    pRefPic0: Option<PicId>,
+    pRefPic1: Option<PicId>,
+    iMotionVector: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMbXy: usize,
+    iMbBn: usize,
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> u8 {
+    if pRefPic0 != pRefPic1 {
+        return 1;
+    }
+    let mv_curr = iMotionVector.get(iMbXy)[iIndex];
+    let mv_neigh = iMotionVector.get(iMbBn)[iNeighIndex];
+    if (mv_curr[0] as i32 - mv_neigh[0] as i32).abs() >= 4
+        || (mv_curr[1] as i32 - mv_neigh[1] as i32).abs() >= 4
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+pub fn ON_MB_BS_MV_DIFF(
+    iMV_A: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMV_B: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMbXy: usize,
+    iMbBn: usize,
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> bool {
+    let mv_a = iMV_A.get(iMbXy)[iIndex];
+    let mv_b = iMV_B.get(iMbBn)[iNeighIndex];
+    (mv_a[0] as i32 - mv_b[0] as i32).abs() >= 4 || (mv_a[1] as i32 - mv_b[1] as i32).abs() >= 4
+}
+
+#[inline(always)]
+pub fn IN_MB_BS_MV_DIFF(
+    iMV_A: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMV_B: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMbXy: usize,
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> bool {
+    let mv_a = iMV_A.get(iMbXy)[iIndex];
+    let mv_b = iMV_B.get(iMbXy)[iNeighIndex];
+    (mv_a[0] as i32 - mv_b[0] as i32).abs() >= 4 || (mv_a[1] as i32 - mv_b[1] as i32).abs() >= 4
+}
+
+#[inline(always)]
+pub fn ON_MB_BS(
+    ref_p0: Option<PicId>,
+    ref_q0: Option<PicId>,
+    ref_p1: Option<PicId>,
+    _ref_q1: Option<PicId>,
+    mv0: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    mv1: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
+    iMbXy: usize,
+    iMbBn: usize,
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> u8 {
+    let res = if ref_p0 != ref_p1 {
+        if ref_p0 == ref_q0 {
+            ON_MB_BS_MV_DIFF(mv0, mv0, iMbXy, iMbBn, iIndex, iNeighIndex)
+                || ON_MB_BS_MV_DIFF(mv1, mv1, iMbXy, iMbBn, iIndex, iNeighIndex)
+        } else {
+            ON_MB_BS_MV_DIFF(mv0, mv1, iMbXy, iMbBn, iIndex, iNeighIndex)
+                || ON_MB_BS_MV_DIFF(mv1, mv0, iMbXy, iMbBn, iIndex, iNeighIndex)
+        }
+    } else {
+        (ON_MB_BS_MV_DIFF(mv0, mv0, iMbXy, iMbBn, iIndex, iNeighIndex)
+            || ON_MB_BS_MV_DIFF(mv1, mv1, iMbXy, iMbBn, iIndex, iNeighIndex))
+            && (ON_MB_BS_MV_DIFF(mv0, mv1, iMbXy, iMbBn, iIndex, iNeighIndex)
+                || ON_MB_BS_MV_DIFF(mv1, mv0, iMbXy, iMbBn, iIndex, iNeighIndex))
+    };
+    if res { 1 } else { 0 }
+}
+
+#[inline(always)]
+pub fn SMB_EDGE_MV(
+    pRefIds: &[Option<PicId>; MB_BLOCK4x4_NUM],
+    iMotionVector: &[[i16; MV_A]; MB_BLOCK4x4_NUM],
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> u8 {
+    let p_ref0 = pRefIds[iIndex];
+    let p_ref1 = pRefIds[iNeighIndex];
+    if p_ref0 != p_ref1 {
+        return 1;
+    }
+    let mv0 = iMotionVector[iIndex];
+    let mv1 = iMotionVector[iNeighIndex];
+    let diff0 = (mv0[0] as i32 - mv1[0] as i32).abs();
+    let diff1 = (mv0[1] as i32 - mv1[1] as i32).abs();
+    if ((diff0 & !3) | (diff1 & !3)) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+pub fn BS_EDGE(
+    bsx1: u8,
+    pRefIds: &[Option<PicId>; MB_BLOCK4x4_NUM],
+    iMotionVector: &[[i16; MV_A]; MB_BLOCK4x4_NUM],
+    iIndex: usize,
+    iNeighIndex: usize,
+) -> u8 {
+    let smb = SMB_EDGE_MV(pRefIds, iMotionVector, iIndex, iNeighIndex);
+    (bsx1 | smb) << (if bsx1 != 0 { 1 } else { 0 })
+}
+
+#[inline(always)]
+pub fn IN_SMB_EDGE_MV(
+    refs: &[[Option<PicId>; MB_BLOCK4x4_NUM]; LIST_A],
+    mv: &[&MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>; LIST_A],
+    iMbXy: usize,
+    iIndex: usize,
+    iNeighborIndex: usize,
+) -> u8 {
+    let cond1 = (refs[LIST_0][iIndex] == refs[LIST_0][iNeighborIndex])
+        && (refs[LIST_1][iIndex] == refs[LIST_1][iNeighborIndex]);
+    let cond2 = (refs[LIST_0][iIndex] == refs[LIST_1][iNeighborIndex])
+        && (refs[LIST_1][iIndex] == refs[LIST_0][iNeighborIndex]);
+
+    if cond1 || cond2 {
+        if refs[LIST_0][iIndex] != refs[LIST_1][iIndex] {
+            if refs[LIST_0][iIndex] == refs[LIST_0][iNeighborIndex] {
+                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
+                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
+                {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
+                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
+                {
+                    1
+                } else {
+                    0
+                }
+            }
+        } else {
+            let a = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
+                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iMbXy, iIndex, iNeighborIndex);
+            let b = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
+                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iMbXy, iIndex, iNeighborIndex);
+            if a && b { 1 } else { 0 }
+        }
+    } else {
+        1
+    }
+}
+
+#[inline(always)]
+pub fn IN_BS_EDGE(
+    bsx1: u8,
+    refs: &[[Option<PicId>; MB_BLOCK4x4_NUM]; LIST_A],
+    mv: &[&MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>; LIST_A],
+    iMbXy: usize,
+    iIndex: usize,
+    iNeighborIndex: usize,
+) -> u8 {
+    let smb = IN_SMB_EDGE_MV(refs, mv, iMbXy, iIndex, iNeighborIndex);
+    (bsx1 | smb) << (if bsx1 != 0 { 1 } else { 0 })
+}
+
+/// The macroblock's non-zero-count row.
+#[inline(always)]
+pub fn GetPNzc(pCurDqLayer: &DqLayerState, iMbXy: i32) -> &[i8; 24] {
+    pCurDqLayer.grid.nzc.get(iMbXy as usize)
+}
+
+// Internal Boundary Strength Matrix Computations
+
+#[inline(always)]
+pub fn DeblockingBSInsideMBAvsbase(
+    pNnzTab: &[i8; 24],
+    nBS: &mut [[[u8; 4]; 4]; 2],
+    iLShiftFactor: i32,
+) {
+    let shift = iLShiftFactor as u32;
+
+    nBS[0][1][0] = ((pNnzTab[0] as u8) | (pNnzTab[1] as u8)) << shift;
+    nBS[0][2][0] = ((pNnzTab[1] as u8) | (pNnzTab[2] as u8)) << shift;
+    nBS[0][3][0] = ((pNnzTab[2] as u8) | (pNnzTab[3] as u8)) << shift;
+
+    nBS[0][1][1] = ((pNnzTab[4] as u8) | (pNnzTab[5] as u8)) << shift;
+    nBS[0][2][1] = ((pNnzTab[5] as u8) | (pNnzTab[6] as u8)) << shift;
+    nBS[0][3][1] = ((pNnzTab[6] as u8) | (pNnzTab[7] as u8)) << shift;
+
+    nBS[1][1][0] = ((pNnzTab[0] as u8) | (pNnzTab[4] as u8)) << shift;
+    nBS[1][1][1] = ((pNnzTab[1] as u8) | (pNnzTab[5] as u8)) << shift;
+    nBS[1][1][2] = ((pNnzTab[2] as u8) | (pNnzTab[6] as u8)) << shift;
+    nBS[1][1][3] = ((pNnzTab[3] as u8) | (pNnzTab[7] as u8)) << shift;
+
+    nBS[0][1][2] = ((pNnzTab[8] as u8) | (pNnzTab[9] as u8)) << shift;
+    nBS[0][2][2] = ((pNnzTab[9] as u8) | (pNnzTab[10] as u8)) << shift;
+    nBS[0][3][2] = ((pNnzTab[10] as u8) | (pNnzTab[11] as u8)) << shift;
+
+    nBS[1][2][0] = ((pNnzTab[4] as u8) | (pNnzTab[8] as u8)) << shift;
+    nBS[1][2][1] = ((pNnzTab[5] as u8) | (pNnzTab[9] as u8)) << shift;
+    nBS[1][2][2] = ((pNnzTab[6] as u8) | (pNnzTab[10] as u8)) << shift;
+    nBS[1][2][3] = ((pNnzTab[7] as u8) | (pNnzTab[11] as u8)) << shift;
+
+    nBS[0][1][3] = ((pNnzTab[12] as u8) | (pNnzTab[13] as u8)) << shift;
+    nBS[0][2][3] = ((pNnzTab[13] as u8) | (pNnzTab[14] as u8)) << shift;
+    nBS[0][3][3] = ((pNnzTab[14] as u8) | (pNnzTab[15] as u8)) << shift;
+
+    nBS[1][3][0] = ((pNnzTab[8] as u8) | (pNnzTab[12] as u8)) << shift;
+    nBS[1][3][1] = ((pNnzTab[9] as u8) | (pNnzTab[13] as u8)) << shift;
+    nBS[1][3][2] = ((pNnzTab[10] as u8) | (pNnzTab[14] as u8)) << shift;
+    nBS[1][3][3] = ((pNnzTab[11] as u8) | (pNnzTab[15] as u8)) << shift;
+}
+
+#[inline(always)]
+pub fn DeblockingBSInsideMBAvsbase8x8(
+    pNnzTab: &[i8; 24],
+    nBS: &mut [[[u8; 4]; 4]; 2],
+    iLShiftFactor: i32,
+) {
+    let mut i8x8NnzTab = [0u8; 4];
+    for i in 0..4 {
+        let iBlkIdx = i << 2;
+        i8x8NnzTab[i] = (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx] as usize] as u8)
+            | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 1] as usize] as u8)
+            | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 2] as usize] as u8)
+            | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 3] as usize] as u8);
+    }
+
+    let shift = iLShiftFactor as u32;
+    // vertical
+    let val_v0 = (i8x8NnzTab[0] | i8x8NnzTab[1]) << shift;
+    nBS[0][2][0] = val_v0;
+    nBS[0][2][1] = val_v0;
+
+    let val_v1 = (i8x8NnzTab[2] | i8x8NnzTab[3]) << shift;
+    nBS[0][2][2] = val_v1;
+    nBS[0][2][3] = val_v1;
+
+    // horizontal
+    let val_h0 = (i8x8NnzTab[0] | i8x8NnzTab[2]) << shift;
+    nBS[1][2][0] = val_h0;
+    nBS[1][2][1] = val_h0;
+
+    let val_h1 = (i8x8NnzTab[1] | i8x8NnzTab[3]) << shift;
+    nBS[1][2][2] = val_h1;
+    nBS[1][2][3] = val_h1;
+}
+
+#[inline(always)]
+pub fn DeblockingBSInsideMBNormal(
+    pFilter: &mut SDeblockingFilter,
+    pCurDqLayer: &DqLayerState,
+    pDec: &SPicture,
+    nBS: &mut [[[u8; 4]; 4]; 2],
+    pNnzTab: &[i8; 24],
+    iMbXy: i32,
+) {
+    let iRefIdx = *pDec.pRefIndex[LIST_0].get(iMbXy as usize);
+    let mut iRefs: [Option<PicId>; MB_BLOCK4x4_NUM] = [None; MB_BLOCK4x4_NUM];
+    for i in 0..MB_BLOCK4x4_NUM {
+        if iRefIdx[i] > REF_NOT_IN_LIST {
+            iRefs[i] = pFilter.ref_ids[LIST_0][iRefIdx[i] as usize];
+        } else {
+            iRefs[i] = None;
+        }
+    }
+
+    let is_8x8 = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
+    let pMv = pDec.pMv[LIST_0].get(iMbXy as usize);
+
+    if is_8x8 {
+        let mut i8x8NnzTab = [0u8; 4];
+        for i in 0..4 {
+            let iBlkIdx = i << 2;
+            i8x8NnzTab[i] = (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 1] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 2] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 3] as usize] as u8);
+        }
+
+        let val_v0 = BS_EDGE(
+            i8x8NnzTab[0] | i8x8NnzTab[1],
+            &iRefs,
+            pMv,
+            g_kuiMbCountScan4Idx[1 << 2] as usize,
+            g_kuiMbCountScan4Idx[0] as usize,
+        );
+        nBS[0][2][0] = val_v0;
+        nBS[0][2][1] = val_v0;
+
+        let val_v1 = BS_EDGE(
+            i8x8NnzTab[2] | i8x8NnzTab[3],
+            &iRefs,
+            pMv,
+            g_kuiMbCountScan4Idx[3 << 2] as usize,
+            g_kuiMbCountScan4Idx[2 << 2] as usize,
+        );
+        nBS[0][2][2] = val_v1;
+        nBS[0][2][3] = val_v1;
+
+        let val_h0 = BS_EDGE(
+            i8x8NnzTab[0] | i8x8NnzTab[2],
+            &iRefs,
+            pMv,
+            g_kuiMbCountScan4Idx[2 << 2] as usize,
+            g_kuiMbCountScan4Idx[0] as usize,
+        );
+        nBS[1][2][0] = val_h0;
+        nBS[1][2][1] = val_h0;
+
+        let val_h1 = BS_EDGE(
+            i8x8NnzTab[1] | i8x8NnzTab[3],
+            &iRefs,
+            pMv,
+            g_kuiMbCountScan4Idx[3 << 2] as usize,
+            g_kuiMbCountScan4Idx[1 << 2] as usize,
+        );
+        nBS[1][2][2] = val_h1;
+        nBS[1][2][3] = val_h1;
+    } else {
+        let mut uiBsx4 = [0u8; 4];
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[i + 1] as u8);
+        }
+        nBS[0][1][0] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 1, 0);
+        nBS[0][2][0] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 2, 1);
+        nBS[0][3][0] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 3, 2);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[4 + i + 1] as u8);
+        }
+        nBS[0][1][1] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 5, 4);
+        nBS[0][2][1] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 6, 5);
+        nBS[0][3][1] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 7, 6);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[8 + i + 1] as u8);
+        }
+        nBS[0][1][2] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 9, 8);
+        nBS[0][2][2] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 10, 9);
+        nBS[0][3][2] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 11, 10);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[12 + i] as u8) | (pNnzTab[12 + i + 1] as u8);
+        }
+        nBS[0][1][3] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 13, 12);
+        nBS[0][2][3] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 14, 13);
+        nBS[0][3][3] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 15, 14);
+
+        // horizontal
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[4 + i] as u8);
+        }
+        nBS[1][1][0] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 4, 0);
+        nBS[1][1][1] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 5, 1);
+        nBS[1][1][2] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 6, 2);
+        nBS[1][1][3] = BS_EDGE(uiBsx4[3], &iRefs, pMv, 7, 3);
+
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[8 + i] as u8);
+        }
+        nBS[1][2][0] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 8, 4);
+        nBS[1][2][1] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 9, 5);
+        nBS[1][2][2] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 10, 6);
+        nBS[1][2][3] = BS_EDGE(uiBsx4[3], &iRefs, pMv, 11, 7);
+
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[12 + i] as u8);
+        }
+        nBS[1][3][0] = BS_EDGE(uiBsx4[0], &iRefs, pMv, 12, 8);
+        nBS[1][3][1] = BS_EDGE(uiBsx4[1], &iRefs, pMv, 13, 9);
+        nBS[1][3][2] = BS_EDGE(uiBsx4[2], &iRefs, pMv, 14, 10);
+        nBS[1][3][3] = BS_EDGE(uiBsx4[3], &iRefs, pMv, 15, 11);
+    }
+}
+
+#[inline(always)]
+pub fn DeblockingBSliceBSInsideMBNormal(
+    pFilter: &mut SDeblockingFilter,
+    pCurDqLayer: &DqLayerState,
+    pDec: &SPicture,
+    nBS: &mut [[[u8; 4]; 4]; 2],
+    pNnzTab: &[i8; 24],
+    iMbXy: i32,
+) {
+    let mut iRefs: [[Option<PicId>; MB_BLOCK4x4_NUM]; LIST_A] = [[None; MB_BLOCK4x4_NUM]; LIST_A];
+
+    for l in 0..LIST_A {
+        let iRefIdx = *pDec.pRefIndex[l].get(iMbXy as usize);
+        for i in 0..MB_BLOCK4x4_NUM {
+            if iRefIdx[i] > REF_NOT_IN_LIST {
+                iRefs[l][i] = pFilter.ref_ids[l][iRefIdx[i] as usize];
+            } else {
+                iRefs[l][i] = None;
+            }
+        }
+    }
+
+    let pMv = [&pDec.pMv[LIST_0], &pDec.pMv[LIST_1]];
+    let is_8x8 = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
+
+    if is_8x8 {
+        let mut i8x8NnzTab = [0u8; 4];
+        for i in 0..4 {
+            let iBlkIdx = i << 2;
+            i8x8NnzTab[i] = (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 1] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 2] as usize] as u8)
+                | (pNnzTab[g_kuiMbCountScan4Idx[iBlkIdx + 3] as usize] as u8);
+        }
+
+        let iIndex_v0 = g_kuiMbCountScan4Idx[1 << 2] as usize;
+        let iNeigborIndex_v0 = g_kuiMbCountScan4Idx[0] as usize;
+        let val_v0 = IN_BS_EDGE(
+            i8x8NnzTab[0] | i8x8NnzTab[1],
+            &iRefs,
+            &pMv,
+            iMbXy as usize,
+            iIndex_v0,
+            iNeigborIndex_v0,
+        );
+        nBS[0][2][0] = val_v0;
+        nBS[0][2][1] = val_v0;
+
+        let iIndex_v1 = g_kuiMbCountScan4Idx[3 << 2] as usize;
+        let iNeigborIndex_v1 = g_kuiMbCountScan4Idx[2 << 2] as usize;
+        let val_v1 = IN_BS_EDGE(
+            i8x8NnzTab[2] | i8x8NnzTab[3],
+            &iRefs,
+            &pMv,
+            iMbXy as usize,
+            iIndex_v1,
+            iNeigborIndex_v1,
+        );
+        nBS[0][2][2] = val_v1;
+        nBS[0][2][3] = val_v1;
+
+        let iIndex_h0 = g_kuiMbCountScan4Idx[2 << 2] as usize;
+        let iNeigborIndex_h0 = g_kuiMbCountScan4Idx[0] as usize;
+        let val_h0 = IN_BS_EDGE(
+            i8x8NnzTab[0] | i8x8NnzTab[2],
+            &iRefs,
+            &pMv,
+            iMbXy as usize,
+            iIndex_h0,
+            iNeigborIndex_h0,
+        );
+        nBS[1][2][0] = val_h0;
+        nBS[1][2][1] = val_h0;
+
+        let iIndex_h1 = g_kuiMbCountScan4Idx[3 << 2] as usize;
+        let iNeigborIndex_h1 = g_kuiMbCountScan4Idx[1 << 2] as usize;
+        let val_h1 = IN_BS_EDGE(
+            i8x8NnzTab[1] | i8x8NnzTab[3],
+            &iRefs,
+            &pMv,
+            iMbXy as usize,
+            iIndex_h1,
+            iNeigborIndex_h1,
+        );
+        nBS[1][2][2] = val_h1;
+        nBS[1][2][3] = val_h1;
+    } else {
+        let mut uiBsx4 = [0u8; 4];
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[i + 1] as u8);
+        }
+        nBS[0][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 1, 0);
+        nBS[0][2][0] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 2, 1);
+        nBS[0][3][0] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 3, 2);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[4 + i + 1] as u8);
+        }
+        nBS[0][1][1] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 5, 4);
+        nBS[0][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 6, 5);
+        nBS[0][3][1] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 7, 6);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[8 + i + 1] as u8);
+        }
+        nBS[0][1][2] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 9, 8);
+        nBS[0][2][2] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 10, 9);
+        nBS[0][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 11, 10);
+
+        for i in 0..3 {
+            uiBsx4[i] = (pNnzTab[12 + i] as u8) | (pNnzTab[12 + i + 1] as u8);
+        }
+        nBS[0][1][3] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 13, 12);
+        nBS[0][2][3] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 14, 13);
+        nBS[0][3][3] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 15, 14);
+
+        // horizontal
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[4 + i] as u8);
+        }
+        nBS[1][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 4, 0);
+        nBS[1][1][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 5, 1);
+        nBS[1][1][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 6, 2);
+        nBS[1][1][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 7, 3);
+
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[8 + i] as u8);
+        }
+        nBS[1][2][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 8, 4);
+        nBS[1][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 9, 5);
+        nBS[1][2][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 10, 6);
+        nBS[1][2][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 11, 7);
+
+        for i in 0..4 {
+            uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[12 + i] as u8);
+        }
+        nBS[1][3][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 12, 8);
+        nBS[1][3][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 13, 9);
+        nBS[1][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 14, 10);
+        nBS[1][3][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 15, 11);
+    }
+}
+
+// Marginal Boundary Strength Calculation Routines
+
+/// The 8x8 block a 4x4 block belongs to, from its 4x4 raster index (0..15) — `MB_BLOCK8x8_IDX`
+/// in `deblocking.cpp`. Row is `r / 4` and column `r % 4`, so the 8x8 is
+/// `(row / 2) * 2 + column / 2`. Indexes [`SPicture::pRefPicture`].
+#[inline]
+fn MB_BLOCK8x8_IDX(r: usize) -> usize {
+    ((r >> 3) << 1) + ((r & 3) >> 1)
+}
+
+/// `deblocking.cpp` — the bS at a macroblock edge, from the reference pictures the picture
+/// records for each side rather than from indices resolved through one slice's lists.
+pub fn DeblockingBsMarginalMBAvcbase(
+    pCurDqLayer: &mut DqLayerState,
+    pDec: &SPicture,
+    iEdge: i32,
+    iNeighMb: i32,
+    iMbXy: i32,
+) -> u32 {
+    let mut pBS = [0u8; 4];
+
+    let pBIdx = &g_kuiTableBIdx[iEdge as usize][0..4];
+    let pBnIdx = &g_kuiTableBIdx[iEdge as usize][4..8];
+    let pB8x8Idx = &g_kuiTableB8x8Idx[iEdge as usize][0..8];
+    let pBn8x8Idx = &g_kuiTableB8x8Idx[iEdge as usize][8..16];
+
+    // This edge can separate two slices, and 8.7.2.1 compares the reference *pictures* the two
+    // blocks use, without regard to which list an index came from or its position in that list.
+    // Both sides come from the record `WelsRecordRefPicturesSlice` wrote for each slice.
+    let pRefPicture = &pDec.pRefPicture[LIST_0];
+
+    let is_8x8_curr = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
+    let is_8x8_neigh = *pCurDqLayer
+        .grid
+        .transform_size8x8_flag
+        .get(iNeighMb as usize);
+
+    let pMvArr = &pDec.pMv[LIST_0];
+
+    let pNzcCurr = GetPNzc(pCurDqLayer, iMbXy);
+    let pNzcNeigh = GetPNzc(pCurDqLayer, iNeighMb);
+
+    if is_8x8_curr && is_8x8_neigh {
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                if uiNzc == 0 {
+                    uiNzc |= (pNzcCurr[pB8x8Idx[i * 4 + j] as usize] as u8)
+                        | (pNzcNeigh[pBn8x8Idx[i * 4 + j] as usize] as u8);
+                }
+            }
+            if uiNzc != 0 {
+                pBS[i << 1] = 2;
+                pBS[1 + (i << 1)] = 2;
+            } else {
+                let idx_curr = pB8x8Idx[i * 4] as usize;
+                let idx_neigh = pBn8x8Idx[i * 4] as usize;
+                let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(idx_curr)];
+                let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(idx_neigh)];
+
+                let val = MB_BS_MV(
+                    ref0,
+                    ref1,
+                    pMvArr,
+                    iMbXy as usize,
+                    iNeighMb as usize,
+                    idx_curr,
+                    idx_neigh,
+                );
+                pBS[i << 1] = val;
+                pBS[1 + (i << 1)] = val;
+            }
+        }
+    } else if is_8x8_curr {
+        let mut bn_idx_pos = 0usize;
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                uiNzc |= pNzcCurr[pB8x8Idx[i * 4 + j] as usize] as u8;
+            }
+            for j in 0..2 {
+                let bn_idx = pBnIdx[bn_idx_pos] as usize;
+                if (uiNzc | (pNzcNeigh[bn_idx] as u8)) != 0 {
+                    pBS[j + (i << 1)] = 2;
+                } else {
+                    let b_idx = pB8x8Idx[i * 4] as usize;
+                    let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                    pBS[j + (i << 1)] = MB_BS_MV(
+                        ref0,
+                        ref1,
+                        pMvArr,
+                        iMbXy as usize,
+                        iNeighMb as usize,
+                        b_idx,
+                        bn_idx,
+                    );
+                }
+                bn_idx_pos += 1;
+            }
+        }
+    } else if is_8x8_neigh {
+        let mut b_idx_pos = 0usize;
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                uiNzc |= pNzcNeigh[pBn8x8Idx[i * 4 + j] as usize] as u8;
+            }
+            for j in 0..2 {
+                let b_idx = pBIdx[b_idx_pos] as usize;
+                if (uiNzc | (pNzcCurr[b_idx] as u8)) != 0 {
+                    pBS[j + (i << 1)] = 2;
+                } else {
+                    let bn_idx = pBn8x8Idx[i * 4] as usize;
+                    let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                    pBS[j + (i << 1)] = MB_BS_MV(
+                        ref0,
+                        ref1,
+                        pMvArr,
+                        iMbXy as usize,
+                        iNeighMb as usize,
+                        b_idx,
+                        bn_idx,
+                    );
+                }
+                b_idx_pos += 1;
+            }
+        }
+    } else {
+        // only 4x4 transform
+        for i in 0..4 {
+            let b_idx = pBIdx[i] as usize;
+            let bn_idx = pBnIdx[i] as usize;
+            if ((pNzcCurr[b_idx] as u8) | (pNzcNeigh[bn_idx] as u8)) != 0 {
+                pBS[i] = 2;
+            } else {
+                let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                pBS[i] = MB_BS_MV(
+                    ref0,
+                    ref1,
+                    pMvArr,
+                    iMbXy as usize,
+                    iNeighMb as usize,
+                    b_idx,
+                    bn_idx,
+                );
+            }
+        }
+    }
+
+    u32::from_ne_bytes(pBS)
+}
+
+pub fn DeblockingBSliceBsMarginalMBAvcbase(
+    pCurDqLayer: &mut DqLayerState,
+    pDec: &SPicture,
+    iEdge: i32,
+    iNeighMb: i32,
+    iMbXy: i32,
+) -> u32 {
+    let mut pBS = [0u8; 4];
+
+    let pBIdx = &g_kuiTableBIdx[iEdge as usize][0..4];
+    let pBnIdx = &g_kuiTableBIdx[iEdge as usize][4..8];
+    let pB8x8Idx = &g_kuiTableB8x8Idx[iEdge as usize][0..8];
+    let pBn8x8Idx = &g_kuiTableB8x8Idx[iEdge as usize][8..16];
+
+    // As in `DeblockingBsMarginalMBAvcbase` above, both macroblocks' reference pictures come from
+    // the per-slice record rather than from resolving their indices through the current slice's
+    // two lists (8.7.2.1).
+    let pRefPicture0 = &pDec.pRefPicture[LIST_0];
+    let pRefPicture1 = &pDec.pRefPicture[LIST_1];
+
+    let pNzcCurr = GetPNzc(pCurDqLayer, iMbXy);
+    let pNzcNeigh = GetPNzc(pCurDqLayer, iNeighMb);
+
+    let is_8x8_curr = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
+    let is_8x8_neigh = *pCurDqLayer
+        .grid
+        .transform_size8x8_flag
+        .get(iNeighMb as usize);
+
+    if is_8x8_curr && is_8x8_neigh {
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                if uiNzc == 0 {
+                    uiNzc |= (pNzcCurr[pB8x8Idx[i * 4 + j] as usize] as u8)
+                        | (pNzcNeigh[pBn8x8Idx[i * 4 + j] as usize] as u8);
+                }
+            }
+            if uiNzc != 0 {
+                pBS[i << 1] = 2;
+                pBS[1 + (i << 1)] = 2;
+            } else {
+                pBS[i << 1] = 1;
+                pBS[1 + (i << 1)] = 1;
+
+                let b_idx = pB8x8Idx[i * 4] as usize;
+                let bn_idx = pBn8x8Idx[i * 4] as usize;
+
+                let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
+                    || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
+                {
+                    let pMv0 = &pDec.pMv[LIST_0];
+                    let pMv1 = &pDec.pMv[LIST_1];
+                    let val = ON_MB_BS(
+                        ref_p0,
+                        ref_q0,
+                        ref_p1,
+                        ref_q1,
+                        pMv0,
+                        pMv1,
+                        iMbXy as usize,
+                        iNeighMb as usize,
+                        b_idx,
+                        bn_idx,
+                    );
+                    pBS[i << 1] = val;
+                    pBS[1 + (i << 1)] = val;
+                }
+            }
+        }
+    } else if is_8x8_curr {
+        let mut bn_idx_pos = 0usize;
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                uiNzc |= pNzcCurr[pB8x8Idx[i * 4 + j] as usize] as u8;
+            }
+            for j in 0..2 {
+                let bn_idx = pBnIdx[bn_idx_pos] as usize;
+                if (uiNzc | (pNzcNeigh[bn_idx] as u8)) != 0 {
+                    pBS[j + (i << 1)] = 2;
+                } else {
+                    pBS[j + (i << 1)] = 1;
+                    let b_idx = pB8x8Idx[i * 4] as usize;
+
+                    let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                    if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
+                        || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
+                    {
+                        let pMv0 = &pDec.pMv[LIST_0];
+                        let pMv1 = &pDec.pMv[LIST_1];
+                        pBS[j + (i << 1)] = ON_MB_BS(
+                            ref_p0,
+                            ref_q0,
+                            ref_p1,
+                            ref_q1,
+                            pMv0,
+                            pMv1,
+                            iMbXy as usize,
+                            iNeighMb as usize,
+                            b_idx,
+                            bn_idx,
+                        );
+                    }
+                }
+                bn_idx_pos += 1;
+            }
+        }
+    } else if is_8x8_neigh {
+        let mut b_idx_pos = 0usize;
+        for i in 0..2 {
+            let mut uiNzc = 0u8;
+            for j in 0..4 {
+                uiNzc |= pNzcNeigh[pBn8x8Idx[i * 4 + j] as usize] as u8;
+            }
+            for j in 0..2 {
+                let b_idx = pBIdx[b_idx_pos] as usize;
+                if (uiNzc | (pNzcCurr[b_idx] as u8)) != 0 {
+                    pBS[j + (i << 1)] = 2;
+                } else {
+                    pBS[j + (i << 1)] = 1;
+                    let bn_idx = pBn8x8Idx[i * 4] as usize;
+
+                    let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                    if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
+                        || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
+                    {
+                        let pMv0 = &pDec.pMv[LIST_0];
+                        let pMv1 = &pDec.pMv[LIST_1];
+                        pBS[j + (i << 1)] = ON_MB_BS(
+                            ref_p0,
+                            ref_q0,
+                            ref_p1,
+                            ref_q1,
+                            pMv0,
+                            pMv1,
+                            iMbXy as usize,
+                            iNeighMb as usize,
+                            b_idx,
+                            bn_idx,
+                        );
+                    }
+                }
+                b_idx_pos += 1;
+            }
+        }
+    } else {
+        // 4x4 transform
+        for i in 0..4 {
+            let b_idx = pBIdx[i] as usize;
+            let bn_idx = pBnIdx[i] as usize;
+            if ((pNzcCurr[b_idx] as u8) | (pNzcNeigh[bn_idx] as u8)) != 0 {
+                pBS[i] = 2;
+            } else {
+                pBS[i] = 1;
+
+                let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+
+                if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
+                    || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
+                {
+                    let pMv0 = &pDec.pMv[LIST_0];
+                    let pMv1 = &pDec.pMv[LIST_1];
+                    pBS[i] = ON_MB_BS(
+                        ref_p0,
+                        ref_q0,
+                        ref_p1,
+                        ref_q1,
+                        pMv0,
+                        pMv1,
+                        iMbXy as usize,
+                        iNeighMb as usize,
+                        b_idx,
+                        bn_idx,
+                    );
+                }
+            }
+        }
+    }
+
+    u32::from_ne_bytes(pBS)
+}
+
+// Macroblock Availability
+
+#[inline]
+pub fn DeblockingAvailableNoInterlayer(pCurDqLayer: &DqLayerState, iFilterIdc: i32) -> i32 {
+    let iMbY = pCurDqLayer.iMbY;
+    let iMbX = pCurDqLayer.iMbX;
+    let iMbXy = pCurDqLayer.iMbXyIndex;
+    let bLeftFlag: bool;
+    let bTopFlag: bool;
+
+    if 2 == iFilterIdc {
+        let pSliceIdc = &pCurDqLayer.grid.slice_idc;
+        bLeftFlag =
+            (iMbX > 0) && (*pSliceIdc.get(iMbXy as usize) == *pSliceIdc.get((iMbXy - 1) as usize));
+        bTopFlag = (iMbY > 0)
+            && (*pSliceIdc.get(iMbXy as usize)
+                == *pSliceIdc.get((iMbXy - pCurDqLayer.iMbWidth) as usize));
+    } else {
+        bLeftFlag = iMbX > 0;
+        bTopFlag = iMbY > 0;
+    }
+    ((bLeftFlag as i32) << LEFT_FLAG_BIT) | ((bTopFlag as i32) << TOP_FLAG_BIT)
+}
+
+// Edge Filtering Dispatch Subroutines
+
+#[inline]
+pub fn FilteringEdgeLumaH(
+    pFilter: &mut SDeblockingFilter,
+    pPix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+    pBS: &[u8; 4],
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+    let mut tc = [0i8; 4];
+
+    GET_ALPHA_BETA_FROM_QP(
+        pFilter.iLumaQP as i32,
+        pFilter.iSliceAlphaC0Offset as i32,
+        pFilter.iSliceBetaOffset as i32,
+        &mut iIndexA,
+        &mut iAlpha,
+        &mut iBeta,
+    );
+
+    if (iAlpha | iBeta) != 0 {
+        TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 0);
+        deblock_luma_lt4(pPix, iStride as isize, 1, iAlpha, iBeta, &tc);
+    }
+}
+
+#[inline]
+pub fn FilteringEdgeLumaV(
+    pFilter: &mut SDeblockingFilter,
+    pPix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+    pBS: &[u8; 4],
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+    let mut tc = [0i8; 4];
+
+    GET_ALPHA_BETA_FROM_QP(
+        pFilter.iLumaQP as i32,
+        pFilter.iSliceAlphaC0Offset as i32,
+        pFilter.iSliceBetaOffset as i32,
+        &mut iIndexA,
+        &mut iAlpha,
+        &mut iBeta,
+    );
+
+    if (iAlpha | iBeta) != 0 {
+        TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 0);
+        deblock_luma_lt4(pPix, 1, iStride as isize, iAlpha, iBeta, &tc);
+    }
+}
+
+#[inline]
+pub fn FilteringEdgeLumaIntraH(
+    pFilter: &mut SDeblockingFilter,
+    pPix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    GET_ALPHA_BETA_FROM_QP(
+        pFilter.iLumaQP as i32,
+        pFilter.iSliceAlphaC0Offset as i32,
+        pFilter.iSliceBetaOffset as i32,
+        &mut iIndexA,
+        &mut iAlpha,
+        &mut iBeta,
+    );
+
+    if (iAlpha | iBeta) != 0 {
+        deblock_luma_eq4(pPix, iStride as isize, 1, iAlpha, iBeta);
+    }
+}
+
+#[inline]
+pub fn FilteringEdgeLumaIntraV(
+    pFilter: &mut SDeblockingFilter,
+    pPix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    GET_ALPHA_BETA_FROM_QP(
+        pFilter.iLumaQP as i32,
+        pFilter.iSliceAlphaC0Offset as i32,
+        pFilter.iSliceBetaOffset as i32,
+        &mut iIndexA,
+        &mut iAlpha,
+        &mut iBeta,
+    );
+
+    if (iAlpha | iBeta) != 0 {
+        deblock_luma_eq4(pPix, 1, iStride as isize, iAlpha, iBeta);
+    }
+}
+
+pub fn FilteringEdgeChromaH<'a>(
+    pFilter: &mut SDeblockingFilter,
+    pPixCb: &mut PlaneCursorMut<'a>,
+    pPixCr: &mut PlaneCursorMut<'a>,
+    iStride: i32,
+    pBS: &[u8; 4],
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+    let mut tc = [0i8; 4];
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 1);
+            deblock_chroma_lt4(pPixCb, pPixCr, iStride as isize, 1, iAlpha, iBeta, &tc);
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                let pPixCbCr = if i == 0 { &mut *pPixCb } else { &mut *pPixCr };
+                TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 1);
+                deblock_chroma_lt42(pPixCbCr, iStride as isize, 1, iAlpha, iBeta, &tc);
+            }
+        }
+    }
+}
+
+pub fn FilteringEdgeChromaV<'a>(
+    pFilter: &mut SDeblockingFilter,
+    pPixCb: &mut PlaneCursorMut<'a>,
+    pPixCr: &mut PlaneCursorMut<'a>,
+    iStride: i32,
+    pBS: &[u8; 4],
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+    let mut tc = [0i8; 4];
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 1);
+            deblock_chroma_lt4(pPixCb, pPixCr, 1, iStride as isize, iAlpha, iBeta, &tc);
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                let pPixCbCr = if i == 0 { &mut *pPixCb } else { &mut *pPixCr };
+                TC0_TBL_LOOKUP(&mut tc, iIndexA, pBS, 1);
+                deblock_chroma_lt42(pPixCbCr, 1, iStride as isize, iAlpha, iBeta, &tc);
+            }
+        }
+    }
+}
+
+pub fn FilteringEdgeChromaIntraH<'a>(
+    pFilter: &mut SDeblockingFilter,
+    pPixCb: &mut PlaneCursorMut<'a>,
+    pPixCr: &mut PlaneCursorMut<'a>,
+    iStride: i32,
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            deblock_chroma_eq4(pPixCb, pPixCr, iStride as isize, 1, iAlpha, iBeta);
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                let pPixCbCr = if i == 0 { &mut *pPixCb } else { &mut *pPixCr };
+                deblock_chroma_eq42(pPixCbCr, iStride as isize, 1, iAlpha, iBeta);
+            }
+        }
+    }
+}
+
+pub fn FilteringEdgeChromaIntraV<'a>(
+    pFilter: &mut SDeblockingFilter,
+    pPixCb: &mut PlaneCursorMut<'a>,
+    pPixCr: &mut PlaneCursorMut<'a>,
+    iStride: i32,
+) {
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            deblock_chroma_eq4(pPixCb, pPixCr, 1, iStride as isize, iAlpha, iBeta);
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                let pPixCbCr = if i == 0 { &mut *pPixCb } else { &mut *pPixCr };
+                deblock_chroma_eq42(pPixCbCr, 1, iStride as isize, iAlpha, iBeta);
+            }
+        }
+    }
+}
+
+// Inter Macroblock Deblocking Sequence
+
+fn DeblockingInterMb(
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+    pFilter: &mut SDeblockingFilter,
+    nBS: &[[[u8; 4]; 4]; 2],
+    iBoundryFlag: i32,
+) {
+    let iMbXyIndex = pCurDqLayer.iMbXyIndex;
+    let iMbX = pCurDqLayer.iMbX;
+    let iMbY = pCurDqLayer.iMbY;
+
+    let iCurLumaQp = *pCurDqLayer.grid.luma_qp.get(iMbXyIndex as usize) as i32;
+    let pCurChromaQp = *pCurDqLayer.grid.chroma_qp.get(iMbXyIndex as usize);
+    let iLineSize = pDec.linesize(0);
+    let iLineSizeUV = pDec.linesize(1);
+
+    let [planeY, planeCb, planeCr] = pDec.planes_mut();
+    let (xY, yY) = ((iMbX << 4) as isize, (iMbY << 4) as isize);
+    let (xC, yC) = ((iMbX << 3) as isize, (iMbY << 3) as isize);
+
+    // Vertical margin
+    if (iBoundryFlag & LEFT_FLAG_MASK) != 0 {
+        let iLeftXyIndex = (iMbXyIndex - 1) as usize;
+        pFilter.iLumaQP =
+            ((iCurLumaQp + *pCurDqLayer.grid.luma_qp.get(iLeftXyIndex) as i32 + 1) >> 1) as i8;
+        for i in 0..2 {
+            pFilter.iChromaQP[i] = ((pCurChromaQp[i] as i32
+                + pCurDqLayer.grid.chroma_qp.get(iLeftXyIndex)[i] as i32
+                + 1)
+                >> 1) as i8;
+        }
+
+        if nBS[0][0][0] == 0x04 {
+            FilteringEdgeLumaIntraV(pFilter, &mut planeY.cursor_mut(xY, yY), iLineSize);
+            FilteringEdgeChromaIntraV(
+                pFilter,
+                &mut planeCb.cursor_mut(xC, yC),
+                &mut planeCr.cursor_mut(xC, yC),
+                iLineSizeUV,
+            );
+        } else {
+            let bs_word = u32::from_ne_bytes(nBS[0][0]);
+            if bs_word != 0 {
+                FilteringEdgeLumaV(
+                    pFilter,
+                    &mut planeY.cursor_mut(xY, yY),
+                    iLineSize,
+                    &nBS[0][0],
+                );
+                FilteringEdgeChromaV(
+                    pFilter,
+                    &mut planeCb.cursor_mut(xC, yC),
+                    &mut planeCr.cursor_mut(xC, yC),
+                    iLineSizeUV,
+                    &nBS[0][0],
+                );
+            }
+        }
+    }
+
+    pFilter.iLumaQP = iCurLumaQp as i8;
+    pFilter.iChromaQP[0] = pCurChromaQp[0];
+    pFilter.iChromaQP[1] = pCurChromaQp[1];
+
+    let is_8x8 = *pCurDqLayer
+        .grid
+        .transform_size8x8_flag
+        .get(iMbXyIndex as usize);
+
+    let bs_01 = u32::from_ne_bytes(nBS[0][1]);
+    if bs_01 != 0 && !is_8x8 {
+        FilteringEdgeLumaV(
+            pFilter,
+            &mut planeY.cursor_mut(xY + 4, yY),
+            iLineSize,
+            &nBS[0][1],
+        );
+    }
+
+    let bs_02 = u32::from_ne_bytes(nBS[0][2]);
+    if bs_02 != 0 {
+        FilteringEdgeLumaV(
+            pFilter,
+            &mut planeY.cursor_mut(xY + 8, yY),
+            iLineSize,
+            &nBS[0][2],
+        );
+        FilteringEdgeChromaV(
+            pFilter,
+            &mut planeCb.cursor_mut(xC + 4, yC),
+            &mut planeCr.cursor_mut(xC + 4, yC),
+            iLineSizeUV,
+            &nBS[0][2],
+        );
+    }
+
+    let bs_03 = u32::from_ne_bytes(nBS[0][3]);
+    if bs_03 != 0 && !is_8x8 {
+        FilteringEdgeLumaV(
+            pFilter,
+            &mut planeY.cursor_mut(xY + 12, yY),
+            iLineSize,
+            &nBS[0][3],
+        );
+    }
+
+    // Horizontal margin
+    if (iBoundryFlag & TOP_FLAG_MASK) != 0 {
+        let iTopXyIndex = (iMbXyIndex - pCurDqLayer.iMbWidth) as usize;
+        pFilter.iLumaQP =
+            ((iCurLumaQp + *pCurDqLayer.grid.luma_qp.get(iTopXyIndex) as i32 + 1) >> 1) as i8;
+        for i in 0..2 {
+            pFilter.iChromaQP[i] = ((pCurChromaQp[i] as i32
+                + pCurDqLayer.grid.chroma_qp.get(iTopXyIndex)[i] as i32
+                + 1)
+                >> 1) as i8;
+        }
+
+        if nBS[1][0][0] == 0x04 {
+            FilteringEdgeLumaIntraH(pFilter, &mut planeY.cursor_mut(xY, yY), iLineSize);
+            FilteringEdgeChromaIntraH(
+                pFilter,
+                &mut planeCb.cursor_mut(xC, yC),
+                &mut planeCr.cursor_mut(xC, yC),
+                iLineSizeUV,
+            );
+        } else {
+            let bs_word = u32::from_ne_bytes(nBS[1][0]);
+            if bs_word != 0 {
+                FilteringEdgeLumaH(
+                    pFilter,
+                    &mut planeY.cursor_mut(xY, yY),
+                    iLineSize,
+                    &nBS[1][0],
+                );
+                FilteringEdgeChromaH(
+                    pFilter,
+                    &mut planeCb.cursor_mut(xC, yC),
+                    &mut planeCr.cursor_mut(xC, yC),
+                    iLineSizeUV,
+                    &nBS[1][0],
+                );
+            }
+        }
+    }
+
+    pFilter.iLumaQP = iCurLumaQp as i8;
+    pFilter.iChromaQP[0] = pCurChromaQp[0];
+    pFilter.iChromaQP[1] = pCurChromaQp[1];
+
+    let bs_11 = u32::from_ne_bytes(nBS[1][1]);
+    if bs_11 != 0 && !is_8x8 {
+        FilteringEdgeLumaH(
+            pFilter,
+            &mut planeY.cursor_mut(xY, yY + 4),
+            iLineSize,
+            &nBS[1][1],
+        );
+    }
+
+    let bs_12 = u32::from_ne_bytes(nBS[1][2]);
+    if bs_12 != 0 {
+        FilteringEdgeLumaH(
+            pFilter,
+            &mut planeY.cursor_mut(xY, yY + 8),
+            iLineSize,
+            &nBS[1][2],
+        );
+        FilteringEdgeChromaH(
+            pFilter,
+            &mut planeCb.cursor_mut(xC, yC + 4),
+            &mut planeCr.cursor_mut(xC, yC + 4),
+            iLineSizeUV,
+            &nBS[1][2],
+        );
+    }
+
+    let bs_13 = u32::from_ne_bytes(nBS[1][3]);
+    if bs_13 != 0 && !is_8x8 {
+        FilteringEdgeLumaH(
+            pFilter,
+            &mut planeY.cursor_mut(xY, yY + 12),
+            iLineSize,
+            &nBS[1][3],
+        );
+    }
+}
+
+// Intra Macroblock Deblocking Pipelines
+
+pub fn FilteringEdgeLumaHV(
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+    pFilter: &mut SDeblockingFilter,
+    iBoundryFlag: i32,
+) {
+    let iMbXyIndex = pCurDqLayer.iMbXyIndex;
+    let iMbX = pCurDqLayer.iMbX;
+    let iMbY = pCurDqLayer.iMbY;
+    let iMbWidth = pCurDqLayer.iMbWidth;
+    let iLineSize = pDec.linesize(0);
+
+    // The macroblock's origin as a coordinate, and the plane it walks.
+    let planeY = pDec.plane_mut(0);
+    let (xY, yY) = ((iMbX << 4) as isize, (iMbY << 4) as isize);
+    let iCurQp = *pCurDqLayer.grid.luma_qp.get(iMbXyIndex as usize) as i32;
+
+    let mut iTc = [0i8; 4];
+    let uiBSx4 = [3u8; 4];
+
+    // Luma V
+    if (iBoundryFlag & LEFT_FLAG_MASK) != 0 {
+        pFilter.iLumaQP =
+            ((iCurQp + *pCurDqLayer.grid.luma_qp.get((iMbXyIndex - 1) as usize) as i32 + 1) >> 1)
+                as i8;
+        FilteringEdgeLumaIntraV(pFilter, &mut planeY.cursor_mut(xY, yY), iLineSize);
+    }
+
+    pFilter.iLumaQP = iCurQp as i8;
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    GET_ALPHA_BETA_FROM_QP(
+        pFilter.iLumaQP as i32,
+        pFilter.iSliceAlphaC0Offset as i32,
+        pFilter.iSliceBetaOffset as i32,
+        &mut iIndexA,
+        &mut iAlpha,
+        &mut iBeta,
+    );
+
+    let is_8x8 = *pCurDqLayer
+        .grid
+        .transform_size8x8_flag
+        .get(iMbXyIndex as usize);
+
+    if (iAlpha | iBeta) != 0 {
+        TC0_TBL_LOOKUP(&mut iTc, iIndexA, &uiBSx4, 0);
+
+        if !is_8x8 {
+            deblock_luma_lt4(
+                &mut planeY.cursor_mut(xY + 4, yY),
+                1,
+                iLineSize as isize,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+
+        deblock_luma_lt4(
+            &mut planeY.cursor_mut(xY + 8, yY),
+            1,
+            iLineSize as isize,
+            iAlpha,
+            iBeta,
+            &iTc,
+        );
+
+        if !is_8x8 {
+            deblock_luma_lt4(
+                &mut planeY.cursor_mut(xY + 12, yY),
+                1,
+                iLineSize as isize,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+    }
+
+    // Luma H
+    if (iBoundryFlag & TOP_FLAG_MASK) != 0 {
+        pFilter.iLumaQP = ((iCurQp
+            + *pCurDqLayer
+                .grid
+                .luma_qp
+                .get((iMbXyIndex - iMbWidth) as usize) as i32
+            + 1)
+            >> 1) as i8;
+        FilteringEdgeLumaIntraH(pFilter, &mut planeY.cursor_mut(xY, yY), iLineSize);
+    }
+
+    pFilter.iLumaQP = iCurQp as i8;
+    if (iAlpha | iBeta) != 0 {
+        if !is_8x8 {
+            deblock_luma_lt4(
+                &mut planeY.cursor_mut(xY, yY + 4),
+                iLineSize as isize,
+                1,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+
+        deblock_luma_lt4(
+            &mut planeY.cursor_mut(xY, yY + 8),
+            iLineSize as isize,
+            1,
+            iAlpha,
+            iBeta,
+            &iTc,
+        );
+
+        if !is_8x8 {
+            deblock_luma_lt4(
+                &mut planeY.cursor_mut(xY, yY + 12),
+                iLineSize as isize,
+                1,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+    }
+}
+
+pub fn FilteringEdgeChromaHV(
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+    pFilter: &mut SDeblockingFilter,
+    iBoundryFlag: i32,
+) {
+    let iMbXyIndex = pCurDqLayer.iMbXyIndex;
+    let iMbX = pCurDqLayer.iMbX;
+    let iMbY = pCurDqLayer.iMbY;
+    let iMbWidth = pCurDqLayer.iMbWidth;
+    let iLineSize = pDec.linesize(1);
+
+    let [_, planeCb, planeCr] = pDec.planes_mut();
+    let (xC, yC) = ((iMbX << 3) as isize, (iMbY << 3) as isize);
+    let pCurQp = *pCurDqLayer.grid.chroma_qp.get(iMbXyIndex as usize);
+
+    let mut iTc = [0i8; 4];
+    let uiBSx4 = [3u8; 4];
+
+    // Chroma V
+    if (iBoundryFlag & LEFT_FLAG_MASK) != 0 {
+        for i in 0..2 {
+            pFilter.iChromaQP[i] = ((pCurQp[i] as i32
+                + pCurDqLayer.grid.chroma_qp.get((iMbXyIndex - 1) as usize)[i] as i32
+                + 1)
+                >> 1) as i8;
+        }
+        FilteringEdgeChromaIntraV(
+            pFilter,
+            &mut planeCb.cursor_mut(xC, yC),
+            &mut planeCr.cursor_mut(xC, yC),
+            iLineSize,
+        );
+    }
+
+    pFilter.iChromaQP[0] = pCurQp[0];
+    pFilter.iChromaQP[1] = pCurQp[1];
+
+    let mut iIndexA = 0i32;
+    let mut iAlpha = 0i32;
+    let mut iBeta = 0i32;
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            TC0_TBL_LOOKUP(&mut iTc, iIndexA, &uiBSx4, 1);
+            deblock_chroma_lt4(
+                &mut planeCb.cursor_mut(xC + 4, yC),
+                &mut planeCr.cursor_mut(xC + 4, yC),
+                1,
+                iLineSize as isize,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                let mut pDestCbCr = if i == 0 {
+                    planeCb.cursor_mut(xC + 4, yC)
+                } else {
+                    planeCr.cursor_mut(xC + 4, yC)
+                };
+                TC0_TBL_LOOKUP(&mut iTc, iIndexA, &uiBSx4, 1);
+                deblock_chroma_lt42(&mut pDestCbCr, 1, iLineSize as isize, iAlpha, iBeta, &iTc);
+            }
+        }
+    }
+
+    // Chroma H
+    if (iBoundryFlag & TOP_FLAG_MASK) != 0 {
+        for i in 0..2 {
+            pFilter.iChromaQP[i] = ((pCurQp[i] as i32
+                + pCurDqLayer
+                    .grid
+                    .chroma_qp
+                    .get((iMbXyIndex - iMbWidth) as usize)[i] as i32
+                + 1)
+                >> 1) as i8;
+        }
+        FilteringEdgeChromaIntraH(
+            pFilter,
+            &mut planeCb.cursor_mut(xC, yC),
+            &mut planeCr.cursor_mut(xC, yC),
+            iLineSize,
+        );
+    }
+
+    pFilter.iChromaQP[0] = pCurQp[0];
+    pFilter.iChromaQP[1] = pCurQp[1];
+
+    if pFilter.iChromaQP[0] == pFilter.iChromaQP[1] {
+        GET_ALPHA_BETA_FROM_QP(
+            pFilter.iChromaQP[0] as i32,
+            pFilter.iSliceAlphaC0Offset as i32,
+            pFilter.iSliceBetaOffset as i32,
+            &mut iIndexA,
+            &mut iAlpha,
+            &mut iBeta,
+        );
+        if (iAlpha | iBeta) != 0 {
+            TC0_TBL_LOOKUP(&mut iTc, iIndexA, &uiBSx4, 1);
+            deblock_chroma_lt4(
+                &mut planeCb.cursor_mut(xC, yC + 4),
+                &mut planeCr.cursor_mut(xC, yC + 4),
+                iLineSize as isize,
+                1,
+                iAlpha,
+                iBeta,
+                &iTc,
+            );
+        }
+    } else {
+        for i in 0..2 {
+            GET_ALPHA_BETA_FROM_QP(
+                pFilter.iChromaQP[i] as i32,
+                pFilter.iSliceAlphaC0Offset as i32,
+                pFilter.iSliceBetaOffset as i32,
+                &mut iIndexA,
+                &mut iAlpha,
+                &mut iBeta,
+            );
+            if (iAlpha | iBeta) != 0 {
+                TC0_TBL_LOOKUP(&mut iTc, iIndexA, &uiBSx4, 1);
+                let mut pDestCbCr = if i == 0 {
+                    planeCb.cursor_mut(xC, yC + 4)
+                } else {
+                    planeCr.cursor_mut(xC, yC + 4)
+                };
+                deblock_chroma_lt42(&mut pDestCbCr, iLineSize as isize, 1, iAlpha, iBeta, &iTc);
+            }
+        }
+    }
+}
+
+#[inline]
+fn DeblockingIntraMb(
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+    pFilter: &mut SDeblockingFilter,
+    iBoundryFlag: i32,
+) {
+    FilteringEdgeLumaHV(pCurDqLayer, pDec, pFilter, iBoundryFlag);
+    FilteringEdgeChromaHV(pCurDqLayer, pDec, pFilter, iBoundryFlag);
+}
+
+// Macroblock-Level Top-Level Deblocking Dispatcher
+
+/// `MbUsesList1` — `deblocking.cpp`. True when any 8x8 block of `iMbXy` predicts from
+/// list 1, read from the per-slice record so the answer is that macroblock's own slice's. A
+/// macroblock of an I or P slice always answers false.
+#[inline]
+fn MbUsesList1(pDec: &SPicture, iMbXy: i32) -> bool {
+    pDec.pRefPicture[LIST_1]
+        .get(iMbXy as usize)
+        .iter()
+        .any(|r| r.is_some())
+}
+
+pub fn WelsDeblockingMb(
+    pCurDqLayer: &mut DqLayerState,
+    pDec: &mut SPicture,
+    pFilter: &mut SDeblockingFilter,
+    iBoundryFlag: i32,
+) {
+    let mut nBS = [[[0u8; 4]; 4]; 2];
+
+    let iMbXyIndex = pCurDqLayer.iMbXyIndex;
+    let iCurMbType = *pDec.pMbType.get(iMbXyIndex as usize);
+
+    let pSliceHeader = &pCurDqLayer
+        .sLayerInfo
+        .sSliceInLayer
+        .sSliceHeaderExt
+        .sSliceHeader;
+    let bBSlice = pSliceHeader.eSliceType == EWelsSliceType::B_SLICE;
+
+    match iCurMbType {
+        MB_TYPE_INTRA4x4 | MB_TYPE_INTRA8x8 | MB_TYPE_INTRA16x16 | MB_TYPE_INTRA_PCM => {
+            DeblockingIntraMb(pCurDqLayer, pDec, pFilter, iBoundryFlag);
+        }
+        _ => {
+            if (iBoundryFlag & LEFT_FLAG_MASK) != 0 {
+                let iMbNb = iMbXyIndex - 1;
+                let uiMbType = *pDec.pMbType.get(iMbNb as usize);
+
+                // The left neighbour can belong to another slice, and 8.7.2.1's two-list
+                // derivation is the one to use whenever *either* macroblock uses two lists: a B
+                // neighbour of a P macroblock goes through the B routine too, while a B neighbour
+                // that predicts from list 0 alone stays on the one-list routine.
+                let val = if IS_INTRA(uiMbType) {
+                    0x04040404u32
+                } else if bBSlice || MbUsesList1(pDec, iMbNb) {
+                    DeblockingBSliceBsMarginalMBAvcbase(pCurDqLayer, pDec, 0, iMbNb, iMbXyIndex)
+                } else {
+                    DeblockingBsMarginalMBAvcbase(pCurDqLayer, pDec, 0, iMbNb, iMbXyIndex)
+                };
+                nBS[0][0] = val.to_ne_bytes();
+            } else {
+                nBS[0][0] = [0u8; 4];
+            }
+
+            if (iBoundryFlag & TOP_FLAG_MASK) != 0 {
+                let iMbNb = iMbXyIndex - pCurDqLayer.iMbWidth;
+                let uiMbType = *pDec.pMbType.get(iMbNb as usize);
+
+                // As for the left edge above.
+                let val = if IS_INTRA(uiMbType) {
+                    0x04040404u32
+                } else if bBSlice || MbUsesList1(pDec, iMbNb) {
+                    DeblockingBSliceBsMarginalMBAvcbase(pCurDqLayer, pDec, 1, iMbNb, iMbXyIndex)
+                } else {
+                    DeblockingBsMarginalMBAvcbase(pCurDqLayer, pDec, 1, iMbNb, iMbXyIndex)
+                };
+                nBS[1][0] = val.to_ne_bytes();
+            } else {
+                nBS[1][0] = [0u8; 4];
+            }
+
+            // The skip short-cut (all internal edges bS = 0) holds for P_Skip, one 16x16
+            // partition with one motion vector, but not for B_Skip, whose four 8x8 quadrants
+            // inherit direct motion that can differ per 8x8 or per 4x4; 8.7.2.1 derives bS from
+            // that motion, so a B_Skip falls through to `DeblockingBSliceBSInsideMBNormal`.
+            if IS_SKIP(iCurMbType) && !bBSlice {
+                nBS[0][1] = [0u8; 4];
+                nBS[0][2] = [0u8; 4];
+                nBS[0][3] = [0u8; 4];
+                nBS[1][1] = [0u8; 4];
+                nBS[1][2] = [0u8; 4];
+                nBS[1][3] = [0u8; 4];
+            } else if IS_INTER_16x16(iCurMbType) {
+                let is_8x8 = *pCurDqLayer
+                    .grid
+                    .transform_size8x8_flag
+                    .get(pCurDqLayer.iMbXyIndex as usize);
+                if !is_8x8 {
+                    DeblockingBSInsideMBAvsbase(GetPNzc(pCurDqLayer, iMbXyIndex), &mut nBS, 1);
+                } else {
+                    DeblockingBSInsideMBAvsbase8x8(GetPNzc(pCurDqLayer, iMbXyIndex), &mut nBS, 1);
+                }
+            } else if bBSlice {
+                DeblockingBSliceBSInsideMBNormal(
+                    pFilter,
+                    pCurDqLayer,
+                    pDec,
+                    &mut nBS,
+                    GetPNzc(pCurDqLayer, iMbXyIndex),
+                    iMbXyIndex,
+                );
+            } else {
+                DeblockingBSInsideMBNormal(
+                    pFilter,
+                    pCurDqLayer,
+                    pDec,
+                    &mut nBS,
+                    GetPNzc(pCurDqLayer, iMbXyIndex),
+                    iMbXyIndex,
+                );
+            }
+
+            DeblockingInterMb(pCurDqLayer, pDec, pFilter, &nBS, iBoundryFlag);
+        }
+    }
+}
+
+// Slice-Level In-Loop Deblocking Filter Pipelines
+
+/// The two reference lists as [`PicId`]s — `SDeblockingFilter::ref_ids`'s one writer.
+#[inline]
+fn snapshot_ref_ids(refs: &SRefPic) -> [[Option<PicId>; MAX_DPB_COUNT]; LIST_A] {
+    refs.pRefList
+}
+
+/// `WelsRecordRefPicturesMb` — `deblocking.cpp:1250`. Records, for one macroblock, the
+/// reference picture each of its four 8x8 blocks predicts from, resolved through the reference
+/// lists of the slice being decoded.
+///
+/// 8.7.2.1 makes an edge's boundary strength depend on which *pictures* the two blocks
+/// reference, and a reference index names a picture only together with the lists of the slice
+/// that coded it; deblocking filters across slice boundaries, so a neighbour's index has to be
+/// resolved before its slice's lists are gone. A list the slice type does not use records
+/// `None` — 8.4.2.1 gives a P macroblock no list-1 prediction.
+pub fn WelsRecordRefPicturesMb(
+    pCtx: &SliceCtx<'_>,
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+    iMbXy: i32,
+) {
+    /// 4x4 raster index of each of the four 8x8 blocks — `kuiBlock8x8Scan4Idx` in `deblocking.cpp`.
+    const BLOCK8x8_SCAN4_IDX: [usize; 4] = [0, 2, 8, 10];
+
+    let iMbXy = iMbXy as usize;
+    // An intra macroblock references no picture — 8.7.2.1 gives its edges bS 3 or 4 without
+    // looking — and its `pRefIndex` is never written, so it records "no reference".
+    let bIntra = IS_INTRA(*pDec.pMbType.get(iMbXy));
+    let eSliceType = pCurDqLayer.sLayerInfo.sSliceInLayer.eSliceType;
+    for listIdx in LIST_0..LIST_A {
+        let bListUsed = !bIntra
+            && ((eSliceType == EWelsSliceType::B_SLICE as u8)
+                || (eSliceType == EWelsSliceType::P_SLICE as u8 && listIdx == LIST_0));
+        let mut recorded = [None; 4];
+        for (i, &scan4) in BLOCK8x8_SCAN4_IDX.iter().enumerate() {
+            let iRefIdx = pDec.pRefIndex[listIdx].get(iMbXy)[scan4];
+            if bListUsed && iRefIdx > REF_NOT_IN_LIST {
+                recorded[i] = pCtx.sRefPic.pRefList[listIdx][iRefIdx as usize];
+            }
+        }
+        *pDec.pRefPicture[listIdx].get_mut(iMbXy) = recorded;
+    }
+}
+
+/// `WelsRecordRefPicturesSlice` — `deblocking.cpp:1284`. [`WelsRecordRefPicturesMb`] over every
+/// macroblock of the slice just decoded, walking it as [`WelsDeblockingFilterSlice`] below does.
+///
+/// Called before deblocking and before the `uiDisableDeblockingFilterIdc` test, so a slice that
+/// does not filter its own edges still leaves behind what a neighbouring slice reads across the
+/// boundary.
+pub fn WelsRecordRefPicturesSlice(
+    pCtx: &SliceCtx<'_>,
+    pCurDqLayer: &DqLayerState,
+    pDec: &mut SPicture,
+) {
+    let pSliceHeaderExt = &pCurDqLayer.sLayerInfo.sSliceInLayer.sSliceHeaderExt;
+    let iTotalMbCount = pCtx
+        .sps_of(pSliceHeaderExt.sSliceHeader.sps_ref)
+        .map_or(0, |sps| sps.uiTotalMbCount as i32);
+    let fmo_id = pCtx.fmo_id;
+    let iTotalNumMb = pCurDqLayer.sLayerInfo.sSliceInLayer.iTotalMbInCurSlice;
+    let mut iCountNumMb = 0i32;
+    let mut iNextMbXyIndex = pSliceHeaderExt.sSliceHeader.iFirstMbInSlice;
+    let pps_id = pSliceHeaderExt.sSliceHeader.pps_id;
+
+    if iTotalNumMb <= 0 || iNextMbXyIndex < 0 || iNextMbXyIndex >= iTotalMbCount {
+        return;
+    }
+
+    loop {
+        WelsRecordRefPicturesMb(pCtx, pCurDqLayer, pDec, iNextMbXyIndex);
+
+        iCountNumMb += 1;
+        if iCountNumMb >= iTotalNumMb {
+            break;
+        }
+
+        if pCtx
+            .pps_of(pps_id)
+            .is_some_and(|pps| pps.uiNumSliceGroups > 1)
+        {
+            // Flexible Macroblock Ordering slice group transition
+            iNextMbXyIndex = FmoNextMb(active_fmo(pCtx.sFmoList, fmo_id), iNextMbXyIndex);
+        } else {
+            iNextMbXyIndex += 1;
+        }
+        if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbCount {
+            break;
+        }
+    }
+}
+
+pub fn WelsDeblockingFilterSlice(
+    pCtx: &SliceCtx<'_>,
+    pCurDqLayer: &mut DqLayerState,
+    pDec: &mut SPicture,
+    pDeblockMb: Option<PDeblockingFilterMbFunc>,
+) {
+    let pSliceHeaderExt = &pCurDqLayer.sLayerInfo.sSliceInLayer.sSliceHeaderExt;
+    let iMbWidth = pCurDqLayer.iMbWidth;
+    let iTotalMbCount = pCtx
+        .sps_of(pSliceHeaderExt.sSliceHeader.sps_ref)
+        .map_or(0, |sps| sps.uiTotalMbCount as i32);
+
+    let mut pFilter = SDeblockingFilter::default();
+    let fmo_id = pCtx.fmo_id;
+    let mut iNextMbXyIndex: i32;
+    let iTotalNumMb = pCurDqLayer.sLayerInfo.sSliceInLayer.iTotalMbInCurSlice;
+    let mut iCountNumMb = 0i32;
+    let mut iBoundryFlag: i32;
+    let iFilterIdc = pSliceHeaderExt.sSliceHeader.uiDisableDeblockingFilterIdc as i32;
+
+    pFilter.eSliceType = pCurDqLayer.sLayerInfo.sSliceInLayer.eSliceType as i32;
+
+    pFilter.iSliceAlphaC0Offset = pSliceHeaderExt.sSliceHeader.iSliceAlphaC0Offset as i8;
+    pFilter.iSliceBetaOffset = pSliceHeaderExt.sSliceHeader.iSliceBetaOffset as i8;
+
+    pFilter.ref_ids = snapshot_ref_ids(pCtx.sRefPic);
+
+    let pps_id = pSliceHeaderExt.sSliceHeader.pps_id;
+
+    if iFilterIdc == 0 || iFilterIdc == 2 {
+        iNextMbXyIndex = pSliceHeaderExt.sSliceHeader.iFirstMbInSlice;
+        pCurDqLayer.iMbX = iNextMbXyIndex % iMbWidth;
+        pCurDqLayer.iMbY = iNextMbXyIndex / iMbWidth;
+        pCurDqLayer.iMbXyIndex = iNextMbXyIndex;
+
+        loop {
+            iBoundryFlag = DeblockingAvailableNoInterlayer(pCurDqLayer, iFilterIdc);
+
+            if let Some(func) = pDeblockMb {
+                func(pCurDqLayer, pDec, &mut pFilter, iBoundryFlag);
+            }
+
+            iCountNumMb += 1;
+            if iCountNumMb >= iTotalNumMb {
+                break;
+            }
+
+            if pCtx
+                .pps_of(pps_id)
+                .is_some_and(|pps| pps.uiNumSliceGroups > 1)
+            {
+                // Flexible Macroblock Ordering slice group transition
+                iNextMbXyIndex = FmoNextMb(active_fmo(pCtx.sFmoList, fmo_id), iNextMbXyIndex);
+            } else {
+                iNextMbXyIndex += 1;
+            }
+
+            if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbCount {
+                break;
+            }
+
+            pCurDqLayer.iMbX = iNextMbXyIndex % iMbWidth;
+            pCurDqLayer.iMbY = iNextMbXyIndex / iMbWidth;
+            pCurDqLayer.iMbXyIndex = iNextMbXyIndex;
+        }
+    }
+}
+
+pub fn WelsDeblockingInitFilter(
+    pCtx: &SliceCtx<'_>,
+    pCurDqLayer: &DqLayerState,
+    pFilter: &mut SDeblockingFilter,
+    iFilterIdc: &mut i32,
+) {
+    let pSliceHeaderExt = &pCurDqLayer.sLayerInfo.sSliceInLayer.sSliceHeaderExt;
+
+    *pFilter = SDeblockingFilter::default();
+    *iFilterIdc = pSliceHeaderExt.sSliceHeader.uiDisableDeblockingFilterIdc as i32;
+
+    pFilter.eSliceType = pCurDqLayer.sLayerInfo.sSliceInLayer.eSliceType as i32;
+
+    pFilter.iSliceAlphaC0Offset = pSliceHeaderExt.sSliceHeader.iSliceAlphaC0Offset as i8;
+    pFilter.iSliceBetaOffset = pSliceHeaderExt.sSliceHeader.iSliceBetaOffset as i8;
+
+    pFilter.ref_ids = snapshot_ref_ids(pCtx.sRefPic);
+}
+
+// WELS_CPU_* flags: one definition, in `common/cpu_core.rs`.
+pub use crate::common::cpu_core::{
+    WELS_CPU_LSX, WELS_CPU_MMI, WELS_CPU_MSA, WELS_CPU_NEON, WELS_CPU_SSSE3,
+};
+pub use crate::decoder::decode_slice::g_kuiMbCountScan4Idx;
+use crate::decoder::fmo::FmoNextMb;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safe::mb_grid::MbDims;
+
+    // Boundary strength is decided by reference-picture identity, never by picture order
+    // count; the two differ when the DPB holds two distinct pictures with a duplicate POC (an
+    // IDR resets the POC counter, as does MMCO 5). Each test below holds the MVs equal and
+    // varies only the reference.
+
+    /// Two distinct slots, the shape every one of these tests needs.
+    fn two_refs() -> (Option<PicId>, Option<PicId>) {
+        let p = crate::safe::pool::Pool::new(vec![(), ()]);
+        (Some(p.id(0)), Some(p.id(1)))
+    }
+
+    /// Two different references read as boundary strength 1 even though every
+    /// motion vector agrees; one reference against itself falls through to the MVs.
+    #[test]
+    fn p3_mb_bs_mv_separates_distinct_references() {
+        let (a, b) = two_refs();
+        let mvs = MbArray::from_vec(vec![[[0i16; MV_A]; MB_BLOCK4x4_NUM]; 2], MbDims::new(2, 1));
+
+        {
+            let mv = &mvs;
+            assert_eq!(
+                MB_BS_MV(a, b, mv, 0, 1, 0, 0),
+                1,
+                "two slots must read as different references"
+            );
+            assert_eq!(
+                MB_BS_MV(a, a, mv, 0, 1, 0, 0),
+                0,
+                "one reference against itself falls through to the MV comparison"
+            );
+            // A null slot is a reference too, and it is not any picture.
+            assert_eq!(MB_BS_MV(None, None, mv, 0, 1, 0, 0), 0);
+            assert_eq!(MB_BS_MV(a, None, mv, 0, 1, 0, 0), 1);
+        }
+    }
+
+    /// The same property one level down, in the 8x8 edge path.
+    #[test]
+    fn p3_smb_edge_mv_separates_distinct_references() {
+        let (a, b) = two_refs();
+        let mvs = [[0i16; MV_A]; MB_BLOCK4x4_NUM];
+
+        {
+            let mut refs: [Option<PicId>; MB_BLOCK4x4_NUM] = [a; MB_BLOCK4x4_NUM];
+            assert_eq!(SMB_EDGE_MV(&refs, &mvs, 0, 1), 0, "one slot, equal MVs");
+
+            refs[1] = b;
+            assert_eq!(
+                SMB_EDGE_MV(&refs, &mvs, 0, 1),
+                1,
+                "a second slot is a second reference"
+            );
+        }
+    }
+
+    /// B-slice edge: `ON_MB_BS` picks between the "lists agree" and "lists crossed" arms by
+    /// comparing `ref_p0` with `ref_p1` and then `ref_p0` with `ref_q0`. With all four MV sets
+    /// equal, the arm chosen is visible in the result.
+    #[test]
+    fn p3_on_mb_bs_arm_selection_is_by_identity() {
+        let (a, b) = two_refs();
+        // Chosen so the two arms disagree: straight comparisons (l0 vs l0, l1 vs l1)
+        // exceed the 4-quarter-pel threshold, crossed ones (l0 vs l1) do not. That
+        // makes the `ref_p0 == ref_p1` arm — an AND of both — false while the
+        // `ref_p0 != ref_p1, ref_p0 == ref_q0` arm is true.
+        let mut mv_l0 =
+            MbArray::from_vec(vec![[[0i16; MV_A]; MB_BLOCK4x4_NUM]; 2], MbDims::new(2, 1));
+        let mut mv_l1 =
+            MbArray::from_vec(vec![[[0i16; MV_A]; MB_BLOCK4x4_NUM]; 2], MbDims::new(2, 1));
+        mv_l0.get_mut(0)[0][0] = 64; // current MB, list 0
+        mv_l1.get_mut(1)[0][0] = 64; // neighbour MB, list 1
+
+        {
+            let m0 = &mv_l0;
+            let m1 = &mv_l1;
+
+            // All four references are one slot.
+            let same = ON_MB_BS(a, a, a, a, m0, m1, 0, 1, 0, 0);
+
+            // p0/q0 are that slot; p1/q1 are a *different* slot.
+            let distinct = ON_MB_BS(a, a, b, b, m0, m1, 0, 1, 0, 0);
+
+            assert_eq!(same, 0, "one slot everywhere takes the lists-agree arm");
+            assert_eq!(distinct, 1, "a second slot is a different reference");
+        }
+    }
+}
