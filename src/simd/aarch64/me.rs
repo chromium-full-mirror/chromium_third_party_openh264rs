@@ -322,13 +322,11 @@ pub fn sum_of_16x16_block_of_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::cpu_core::{WELS_CPU_NEON, WELS_CPU_SSE2};
     use crate::encoder::svc_motion_estimate::{
         LIST_SIZE_SUM_8x8, LIST_SIZE_SUM_16x16, SumOf8x8BlockOfFrame_c, SumOf16x16BlockOfFrame_c,
-        WelsInitMeFunc, sum_of_8x8_single_block as scalar_8x8_single,
+        sum_of_8x8_single_block as scalar_8x8_single,
         sum_of_16x16_single_block as scalar_16x16_single,
     };
-    use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
 
     #[test]
     fn neon_me_kernels_match_scalar_over_tight_spans_and_extreme_values() {
@@ -414,6 +412,10 @@ mod tests {
     #[test]
     #[cfg(not(feature = "scalar"))]
     fn wels_init_me_func_installs_simd_kernels_when_cpu_flags_set() {
+        use crate::common::cpu_core::{WELS_CPU_NEON, WELS_CPU_SSE2};
+        use crate::encoder::svc_motion_estimate::WelsInitMeFunc;
+        use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
+
         let mut scalar_list = SWelsFuncPtrList::default();
         WelsInitMeFunc(&mut scalar_list, 0, true);
 

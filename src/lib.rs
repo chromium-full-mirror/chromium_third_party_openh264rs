@@ -11,7 +11,6 @@
     unused_variables,
     unused_imports,
     unused_qualifications,
-    trivial_numeric_casts,
     unused_assignments,
     unused_mut,
     unreachable_patterns,

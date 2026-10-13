@@ -38,9 +38,9 @@
 
 use crate::api::codec_api::*;
 use crate::encoder::ref_list_mgr_svc::{SLTRMarkingFeedback, SLTRRecoverRequest};
-use crate::encoder::wels_encoder_ext::{
-    SDeliveryStatus, SDumpLayer, SLTRConfig, SLevelInfo, SProfileInfo,
-};
+#[cfg(target_pointer_width = "64")]
+use crate::encoder::wels_encoder_ext::SDumpLayer;
+use crate::encoder::wels_encoder_ext::{SDeliveryStatus, SLTRConfig, SLevelInfo, SProfileInfo};
 use core::mem::{align_of, size_of};
 
 macro_rules! assert_size {
@@ -72,13 +72,16 @@ macro_rules! assert_offset {
 // Structs a decoder consumer passes or reads on the call path.
 // ===========================================================================
 
-assert_size!(SBufferInfo, 72);
-assert_align!(SBufferInfo, 8);
-assert_offset!(SBufferInfo, iBufferStatus, 0);
-assert_offset!(SBufferInfo, uiInBsTimeStamp, 8);
-assert_offset!(SBufferInfo, uiOutYuvTimeStamp, 16);
-assert_offset!(SBufferInfo, UsrData, 24);
-assert_offset!(SBufferInfo, pDst, 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert_size!(SBufferInfo, 72);
+    assert_align!(SBufferInfo, 8);
+    assert_offset!(SBufferInfo, iBufferStatus, 0);
+    assert_offset!(SBufferInfo, uiInBsTimeStamp, 8);
+    assert_offset!(SBufferInfo, uiOutYuvTimeStamp, 16);
+    assert_offset!(SBufferInfo, UsrData, 24);
+    assert_offset!(SBufferInfo, pDst, 48);
+};
 
 assert_size!(SSysMEMBuffer, 20);
 assert_align!(SSysMEMBuffer, 4);
@@ -128,15 +131,18 @@ assert_offset!(SDecoderStatistics, iCurrentActiveSpsId, 92);
 assert_offset!(SDecoderStatistics, iCurrentActivePpsId, 96);
 assert_offset!(SDecoderStatistics, iStatisticsLogInterval, 100);
 
-assert_size!(SParserBsInfo, 48);
-assert_align!(SParserBsInfo, 8);
-assert_offset!(SParserBsInfo, iNalNum, 0);
-assert_offset!(SParserBsInfo, pNalLenInByte, 8);
-assert_offset!(SParserBsInfo, pDstBuff, 16);
-assert_offset!(SParserBsInfo, iSpsWidthInPixel, 24);
-assert_offset!(SParserBsInfo, iSpsHeightInPixel, 28);
-assert_offset!(SParserBsInfo, uiInBsTimeStamp, 32);
-assert_offset!(SParserBsInfo, uiOutBsTimeStamp, 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert_size!(SParserBsInfo, 48);
+    assert_align!(SParserBsInfo, 8);
+    assert_offset!(SParserBsInfo, iNalNum, 0);
+    assert_offset!(SParserBsInfo, pNalLenInByte, 8);
+    assert_offset!(SParserBsInfo, pDstBuff, 16);
+    assert_offset!(SParserBsInfo, iSpsWidthInPixel, 24);
+    assert_offset!(SParserBsInfo, iSpsHeightInPixel, 28);
+    assert_offset!(SParserBsInfo, uiInBsTimeStamp, 32);
+    assert_offset!(SParserBsInfo, uiOutBsTimeStamp, 40);
+};
 
 assert_size!(SVideoProperty, 8);
 assert_align!(SVideoProperty, 4);
@@ -205,48 +211,54 @@ assert_offset!(SEncParamExt, bEnableDenoise, 908);
 assert_offset!(SEncParamExt, bIsLosslessLink, 913);
 assert_offset!(SEncParamExt, bPsnrY, 920);
 
-assert_size!(SDecodingParam, 32);
-assert_align!(SDecodingParam, 8);
-assert_offset!(SDecodingParam, pFileNameRestructed, 0);
-assert_offset!(SDecodingParam, uiCpuLoad, 8);
-assert_offset!(SDecodingParam, uiTargetDqLayer, 12);
-assert_offset!(SDecodingParam, eEcActiveIdc, 16);
-assert_offset!(SDecodingParam, bParseOnly, 20);
-assert_offset!(SDecodingParam, sVideoProperty, 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert_size!(SDecodingParam, 32);
+    assert_align!(SDecodingParam, 8);
+    assert_offset!(SDecodingParam, pFileNameRestructed, 0);
+    assert_offset!(SDecodingParam, uiCpuLoad, 8);
+    assert_offset!(SDecodingParam, uiTargetDqLayer, 12);
+    assert_offset!(SDecodingParam, eEcActiveIdc, 16);
+    assert_offset!(SDecodingParam, bParseOnly, 20);
+    assert_offset!(SDecodingParam, sVideoProperty, 24);
 
-assert_size!(SLayerBSInfo, 56);
-assert_align!(SLayerBSInfo, 8);
-assert_offset!(SLayerBSInfo, eFrameType, 4);
-assert_offset!(SLayerBSInfo, uiLayerType, 8);
-assert_offset!(SLayerBSInfo, iSubSeqId, 12);
-assert_offset!(SLayerBSInfo, iNalCount, 16);
-assert_offset!(SLayerBSInfo, pNalLengthInByte, 24);
-assert_offset!(SLayerBSInfo, pBsBuf, 32);
-assert_offset!(SLayerBSInfo, rPsnr, 40);
+    assert_size!(SLayerBSInfo, 56);
+    assert_align!(SLayerBSInfo, 8);
+    assert_offset!(SLayerBSInfo, eFrameType, 4);
+    assert_offset!(SLayerBSInfo, uiLayerType, 8);
+    assert_offset!(SLayerBSInfo, iSubSeqId, 12);
+    assert_offset!(SLayerBSInfo, iNalCount, 16);
+    assert_offset!(SLayerBSInfo, pNalLengthInByte, 24);
+    assert_offset!(SLayerBSInfo, pBsBuf, 32);
+    assert_offset!(SLayerBSInfo, rPsnr, 40);
 
-assert_size!(SFrameBSInfo, 7192);
-assert_align!(SFrameBSInfo, 8);
-assert_offset!(SFrameBSInfo, iLayerNum, 0);
-assert_offset!(SFrameBSInfo, sLayerInfo, 8);
-assert_offset!(SFrameBSInfo, eFrameType, 7176);
-assert_offset!(SFrameBSInfo, iFrameSizeInBytes, 7180);
-assert_offset!(SFrameBSInfo, uiTimeStamp, 7184);
+    assert_size!(SFrameBSInfo, 7192);
+    assert_align!(SFrameBSInfo, 8);
+    assert_offset!(SFrameBSInfo, iLayerNum, 0);
+    assert_offset!(SFrameBSInfo, sLayerInfo, 8);
+    assert_offset!(SFrameBSInfo, eFrameType, 7176);
+    assert_offset!(SFrameBSInfo, iFrameSizeInBytes, 7180);
+    assert_offset!(SFrameBSInfo, uiTimeStamp, 7184);
 
-assert_size!(SSourcePicture, 80);
-assert_align!(SSourcePicture, 8);
-assert_offset!(SSourcePicture, iStride, 4);
-assert_offset!(SSourcePicture, pData, 24);
-assert_offset!(SSourcePicture, iPicWidth, 56);
-assert_offset!(SSourcePicture, iPicHeight, 60);
-assert_offset!(SSourcePicture, uiTimeStamp, 64);
+    assert_size!(SSourcePicture, 80);
+    assert_align!(SSourcePicture, 8);
+    assert_offset!(SSourcePicture, iStride, 4);
+    assert_offset!(SSourcePicture, pData, 24);
+    assert_offset!(SSourcePicture, iPicWidth, 56);
+    assert_offset!(SSourcePicture, iPicHeight, 60);
+    assert_offset!(SSourcePicture, uiTimeStamp, 64);
+};
 
 assert_size!(SBitrateInfo, 8);
 assert_align!(SBitrateInfo, 4);
 assert_offset!(SBitrateInfo, iLayer, 0);
 assert_offset!(SBitrateInfo, iBitrate, 4);
 
-assert_size!(SDumpLayer, 16);
-assert_align!(SDumpLayer, 8);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert_size!(SDumpLayer, 16);
+    assert_align!(SDumpLayer, 8);
+};
 
 assert_size!(SProfileInfo, 8);
 assert_align!(SProfileInfo, 4);
@@ -266,28 +278,32 @@ assert_align!(SDeliveryStatus, 4);
 ///
 /// The alignment and every offset pin below are the same on both — `iStatisticsTs`
 /// is an `int64_t` and carries the 8-byte alignment on its own.
+#[cfg(target_pointer_width = "64")]
 const SENCODER_STATISTICS_SIZE: usize =
     (64 + 3 * size_of::<core::ffi::c_ulong>()).next_multiple_of(align_of::<SEncoderStatistics>());
 
-assert_size!(SEncoderStatistics, SENCODER_STATISTICS_SIZE);
-assert_align!(SEncoderStatistics, 8);
-assert_offset!(SEncoderStatistics, uiWidth, 0);
-assert_offset!(SEncoderStatistics, uiHeight, 4);
-assert_offset!(SEncoderStatistics, fAverageFrameSpeedInMs, 8);
-assert_offset!(SEncoderStatistics, fAverageFrameRate, 12);
-assert_offset!(SEncoderStatistics, fLatestFrameRate, 16);
-assert_offset!(SEncoderStatistics, uiBitRate, 20);
-assert_offset!(SEncoderStatistics, uiAverageFrameQP, 24);
-assert_offset!(SEncoderStatistics, uiInputFrameCount, 28);
-assert_offset!(SEncoderStatistics, uiSkippedFrameCount, 32);
-assert_offset!(SEncoderStatistics, uiResolutionChangeTimes, 36);
-assert_offset!(SEncoderStatistics, uiIDRReqNum, 40);
-assert_offset!(SEncoderStatistics, uiIDRSentNum, 44);
-assert_offset!(SEncoderStatistics, uiLTRSentNum, 48);
-assert_offset!(SEncoderStatistics, iStatisticsTs, 56);
-assert_offset!(SEncoderStatistics, iTotalEncodedBytes, 64);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert_size!(SEncoderStatistics, SENCODER_STATISTICS_SIZE);
+    assert_align!(SEncoderStatistics, 8);
+    assert_offset!(SEncoderStatistics, uiWidth, 0);
+    assert_offset!(SEncoderStatistics, uiHeight, 4);
+    assert_offset!(SEncoderStatistics, fAverageFrameSpeedInMs, 8);
+    assert_offset!(SEncoderStatistics, fAverageFrameRate, 12);
+    assert_offset!(SEncoderStatistics, fLatestFrameRate, 16);
+    assert_offset!(SEncoderStatistics, uiBitRate, 20);
+    assert_offset!(SEncoderStatistics, uiAverageFrameQP, 24);
+    assert_offset!(SEncoderStatistics, uiInputFrameCount, 28);
+    assert_offset!(SEncoderStatistics, uiSkippedFrameCount, 32);
+    assert_offset!(SEncoderStatistics, uiResolutionChangeTimes, 36);
+    assert_offset!(SEncoderStatistics, uiIDRReqNum, 40);
+    assert_offset!(SEncoderStatistics, uiIDRSentNum, 44);
+    assert_offset!(SEncoderStatistics, uiLTRSentNum, 48);
+    assert_offset!(SEncoderStatistics, iStatisticsTs, 56);
+    assert_offset!(SEncoderStatistics, iTotalEncodedBytes, 64);
+};
 
-#[cfg(feature = "c-api")]
+#[cfg(all(feature = "c-api", target_pointer_width = "64"))]
 const _: () = {
     assert_size!(ISVCEncoderVtbl, 72);
     assert_align!(ISVCEncoderVtbl, 8);
@@ -375,16 +391,19 @@ mod tests {
     /// Restates the const asserts so `cargo test` reports these layout pins by name.
     #[test]
     fn abi_layout_matches_c_headers() {
-        assert_eq!(size_of::<SFrameBSInfo>(), 7192);
-        assert_eq!(size_of::<SLayerBSInfo>(), 56);
-        assert_eq!(size_of::<SSourcePicture>(), 80);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(size_of::<SFrameBSInfo>(), 7192);
+            assert_eq!(size_of::<SLayerBSInfo>(), 56);
+            assert_eq!(size_of::<SSourcePicture>(), 80);
+            assert_eq!(core::mem::offset_of!(SFrameBSInfo, eFrameType), 7176);
+            assert_eq!(size_of::<SBufferInfo>(), 72);
+            assert_eq!(size_of::<SParserBsInfo>(), 48);
+        }
         assert_eq!(size_of::<SEncParamExt>(), 924);
-        assert_eq!(core::mem::offset_of!(SFrameBSInfo, eFrameType), 7176);
-        assert_eq!(size_of::<SBufferInfo>(), 72);
         assert_eq!(size_of::<SSysMEMBuffer>(), 20);
         assert_eq!(size_of::<SDecoderCapability>(), 36);
         assert_eq!(size_of::<SDecoderStatistics>(), 104);
-        assert_eq!(size_of::<SParserBsInfo>(), 48);
         assert_eq!(size_of::<SVideoProperty>(), 8);
         assert_eq!(size_of::<SVuiSarInfo>(), 12);
     }

@@ -463,6 +463,11 @@ impl SWelsSvcCodingParam {
             layer.sSliceArgument.uiSliceNum = 0;
             layer.sSliceArgument.uiSliceSizeConstraint = 1500;
 
+            layer.bAspectRatioPresent = false;
+            layer.eAspectRatio = ESampleAspectRatio::ASP_UNSPECIFIED;
+            layer.sAspectRatioExtWidth = 0;
+            layer.sAspectRatioExtHeight = 0;
+
             let kiLesserSliceNum = if MAX_SLICES_NUM < MAX_SLICES_NUM_TMP {
                 MAX_SLICES_NUM
             } else {
@@ -471,6 +476,15 @@ impl SWelsSvcCodingParam {
             for idx in 0..kiLesserSliceNum.min(layer.sSliceArgument.uiSliceMbNum.len()) {
                 layer.sSliceArgument.uiSliceMbNum[idx] = 0;
             }
+
+            // See codec_app_def.h: defaults write no colour information to the header.
+            layer.bVideoSignalTypePresent = false;
+            layer.uiVideoFormat = EVideoFormatSPS::VF_UNDEF as u8;
+            layer.bFullRange = false;
+            layer.bColorDescriptionPresent = false;
+            layer.uiColorPrimaries = EColorPrimaries::CP_UNDEF as u8;
+            layer.uiTransferCharacteristics = ETransferCharacteristics::TRC_UNDEF as u8;
+            layer.uiColorMatrix = EColorMatrix::CM_UNDEF as u8;
         }
 
         self.uiGopSize = 1;
@@ -731,6 +745,27 @@ impl SWelsSvcCodingParam {
             self.sSpatialLayers[idx].sSliceArgument =
                 pCodingParam.sSpatialLayers[idx].sSliceArgument;
             self.sSpatialLayers[idx].iDLayerQp = pCodingParam.sSpatialLayers[idx].iDLayerQp;
+
+            // See codec_app_def.h and parameter_sets.h for more info about members bVideoSignalTypePresent through uiColorMatrix.
+            self.sSpatialLayers[idx].bVideoSignalTypePresent =
+                pCodingParam.sSpatialLayers[idx].bVideoSignalTypePresent;
+            self.sSpatialLayers[idx].uiVideoFormat = pCodingParam.sSpatialLayers[idx].uiVideoFormat;
+            self.sSpatialLayers[idx].bFullRange = pCodingParam.sSpatialLayers[idx].bFullRange;
+            self.sSpatialLayers[idx].bColorDescriptionPresent =
+                pCodingParam.sSpatialLayers[idx].bColorDescriptionPresent;
+            self.sSpatialLayers[idx].uiColorPrimaries =
+                pCodingParam.sSpatialLayers[idx].uiColorPrimaries;
+            self.sSpatialLayers[idx].uiTransferCharacteristics =
+                pCodingParam.sSpatialLayers[idx].uiTransferCharacteristics;
+            self.sSpatialLayers[idx].uiColorMatrix = pCodingParam.sSpatialLayers[idx].uiColorMatrix;
+
+            self.sSpatialLayers[idx].bAspectRatioPresent =
+                pCodingParam.sSpatialLayers[idx].bAspectRatioPresent;
+            self.sSpatialLayers[idx].eAspectRatio = pCodingParam.sSpatialLayers[idx].eAspectRatio;
+            self.sSpatialLayers[idx].sAspectRatioExtWidth =
+                pCodingParam.sSpatialLayers[idx].sAspectRatioExtWidth;
+            self.sSpatialLayers[idx].sAspectRatioExtHeight =
+                pCodingParam.sSpatialLayers[idx].sAspectRatioExtHeight;
 
             uiProfileIdc = if !self.bSimulcastAVC {
                 PRO_SCALABLE_BASELINE
@@ -1188,5 +1223,152 @@ mod tests {
         let p = NewCodingParam();
         assert_eq!(p.uiGopSize, 1);
         assert_eq!(p.iNumRefFrame, AUTO_REF_PIC_COUNT);
+        for layer in &p.sSpatialLayers {
+            assert!(!layer.bVideoSignalTypePresent);
+            assert_eq!(layer.uiVideoFormat, EVideoFormatSPS::VF_UNDEF as u8);
+            assert!(!layer.bFullRange);
+            assert!(!layer.bColorDescriptionPresent);
+            assert_eq!(layer.uiColorPrimaries, EColorPrimaries::CP_UNDEF as u8);
+            assert_eq!(
+                layer.uiTransferCharacteristics,
+                ETransferCharacteristics::TRC_UNDEF as u8
+            );
+            assert_eq!(layer.uiColorMatrix, EColorMatrix::CM_UNDEF as u8);
+            assert!(!layer.bAspectRatioPresent);
+            assert_eq!(layer.eAspectRatio, ESampleAspectRatio::ASP_UNSPECIFIED);
+            assert_eq!(layer.sAspectRatioExtWidth, 0);
+            assert_eq!(layer.sAspectRatioExtHeight, 0);
+        }
+    }
+
+    #[test]
+    fn test_param_transcode_copies_vui_and_aspect_ratio_fields() {
+        let mut ext = SEncParamExt::default();
+        SWelsSvcCodingParam::FillDefaultExt(&mut ext);
+        ext.iPicWidth = 320;
+        ext.iPicHeight = 240;
+        ext.iTargetBitrate = 500_000;
+        ext.iSpatialLayerNum = 2;
+
+        ext.sSpatialLayers[0].iVideoWidth = 160;
+        ext.sSpatialLayers[0].iVideoHeight = 120;
+        ext.sSpatialLayers[0].iSpatialBitrate = 200_000;
+        ext.sSpatialLayers[0].bVideoSignalTypePresent = true;
+        ext.sSpatialLayers[0].uiVideoFormat = EVideoFormatSPS::VF_NTSC as u8;
+        ext.sSpatialLayers[0].bFullRange = true;
+        ext.sSpatialLayers[0].bColorDescriptionPresent = true;
+        ext.sSpatialLayers[0].uiColorPrimaries = EColorPrimaries::CP_BT709 as u8;
+        ext.sSpatialLayers[0].uiTransferCharacteristics = ETransferCharacteristics::TRC_BT709 as u8;
+        ext.sSpatialLayers[0].uiColorMatrix = EColorMatrix::CM_BT709 as u8;
+        ext.sSpatialLayers[0].bAspectRatioPresent = true;
+        ext.sSpatialLayers[0].eAspectRatio = ESampleAspectRatio::ASP_EXT_SAR;
+        ext.sSpatialLayers[0].sAspectRatioExtWidth = 4;
+        ext.sSpatialLayers[0].sAspectRatioExtHeight = 3;
+
+        ext.sSpatialLayers[1].iVideoWidth = 320;
+        ext.sSpatialLayers[1].iVideoHeight = 240;
+        ext.sSpatialLayers[1].iSpatialBitrate = 300_000;
+        ext.sSpatialLayers[1].bVideoSignalTypePresent = true;
+        ext.sSpatialLayers[1].uiVideoFormat = EVideoFormatSPS::VF_PAL as u8;
+        ext.sSpatialLayers[1].bFullRange = false;
+        ext.sSpatialLayers[1].bColorDescriptionPresent = true;
+        ext.sSpatialLayers[1].uiColorPrimaries = EColorPrimaries::CP_SMPTE170M as u8;
+        ext.sSpatialLayers[1].uiTransferCharacteristics =
+            ETransferCharacteristics::TRC_SMPTE170M as u8;
+        ext.sSpatialLayers[1].uiColorMatrix = EColorMatrix::CM_SMPTE170M as u8;
+        ext.sSpatialLayers[1].bAspectRatioPresent = true;
+        ext.sSpatialLayers[1].eAspectRatio = ESampleAspectRatio::ASP_16x11;
+        ext.sSpatialLayers[1].sAspectRatioExtWidth = 16;
+        ext.sSpatialLayers[1].sAspectRatioExtHeight = 11;
+
+        let mut svc_param = SWelsSvcCodingParam::default();
+        assert_eq!(svc_param.ParamTranscode(&ext), 0);
+
+        for idx in 0..2 {
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].bVideoSignalTypePresent,
+                ext.sSpatialLayers[idx].bVideoSignalTypePresent
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].uiVideoFormat,
+                ext.sSpatialLayers[idx].uiVideoFormat
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].bFullRange,
+                ext.sSpatialLayers[idx].bFullRange
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].bColorDescriptionPresent,
+                ext.sSpatialLayers[idx].bColorDescriptionPresent
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].uiColorPrimaries,
+                ext.sSpatialLayers[idx].uiColorPrimaries
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].uiTransferCharacteristics,
+                ext.sSpatialLayers[idx].uiTransferCharacteristics
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].uiColorMatrix,
+                ext.sSpatialLayers[idx].uiColorMatrix
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].bAspectRatioPresent,
+                ext.sSpatialLayers[idx].bAspectRatioPresent
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].eAspectRatio,
+                ext.sSpatialLayers[idx].eAspectRatio
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].sAspectRatioExtWidth,
+                ext.sSpatialLayers[idx].sAspectRatioExtWidth
+            );
+            assert_eq!(
+                svc_param.sSpatialLayers[idx].sAspectRatioExtHeight,
+                ext.sSpatialLayers[idx].sAspectRatioExtHeight
+            );
+        }
+
+        // Verify that InitializeExt + EncodeParameterSets emits the VUI fields into SPS.
+        let mut enc = crate::api::encoder::Encoder::new();
+        let mut single_ext = SEncParamExt::default();
+        assert_eq!(enc.default_params(&mut single_ext), 0);
+        single_ext.iPicWidth = 320;
+        single_ext.iPicHeight = 240;
+        single_ext.iTargetBitrate = 500_000;
+        single_ext.sSpatialLayers[0].iVideoWidth = 320;
+        single_ext.sSpatialLayers[0].iVideoHeight = 240;
+        single_ext.sSpatialLayers[0].iSpatialBitrate = 500_000;
+        single_ext.sSpatialLayers[0].bVideoSignalTypePresent = true;
+        single_ext.sSpatialLayers[0].uiVideoFormat = EVideoFormatSPS::VF_UNDEF as u8;
+        single_ext.sSpatialLayers[0].bFullRange = true;
+        single_ext.sSpatialLayers[0].bColorDescriptionPresent = true;
+        single_ext.sSpatialLayers[0].uiColorPrimaries = EColorPrimaries::CP_BT709 as u8;
+        single_ext.sSpatialLayers[0].uiTransferCharacteristics =
+            ETransferCharacteristics::TRC_BT709 as u8;
+        single_ext.sSpatialLayers[0].uiColorMatrix = EColorMatrix::CM_BT709 as u8;
+        single_ext.sSpatialLayers[0].bAspectRatioPresent = true;
+        single_ext.sSpatialLayers[0].eAspectRatio = ESampleAspectRatio::ASP_EXT_SAR;
+        single_ext.sSpatialLayers[0].sAspectRatioExtWidth = 16;
+        single_ext.sSpatialLayers[0].sAspectRatioExtHeight = 9;
+
+        assert_eq!(enc.initialize_ext(&single_ext), 0);
+        let sps = &enc.0.m_pEncContext.as_ref().unwrap().sps_array()[0];
+        assert!(sps.bVideoSignalTypePresent);
+        assert_eq!(sps.uiVideoFormat, EVideoFormatSPS::VF_UNDEF as u8);
+        assert!(sps.bFullRange);
+        assert!(sps.bColorDescriptionPresent);
+        assert_eq!(sps.uiColorPrimaries, EColorPrimaries::CP_BT709 as u8);
+        assert_eq!(
+            sps.uiTransferCharacteristics,
+            ETransferCharacteristics::TRC_BT709 as u8
+        );
+        assert_eq!(sps.uiColorMatrix, EColorMatrix::CM_BT709 as u8);
+        assert!(sps.bAspectRatioPresent);
+        assert_eq!(sps.eAspectRatio, ESampleAspectRatio::ASP_EXT_SAR as i32);
+        assert_eq!(sps.sAspectRatioExtWidth, 16);
+        assert_eq!(sps.sAspectRatioExtHeight, 9);
     }
 }

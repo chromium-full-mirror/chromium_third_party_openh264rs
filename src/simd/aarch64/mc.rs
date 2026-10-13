@@ -816,8 +816,9 @@ fn avg_any<A: RefSamples, B: RefSamples>(
 
 /// `McChromaWidthEq8_AArch64_neon`: `umull`/`umlal` by the four byte weights, the
 /// bottom row of one output row being the top row of the next.
-#[inline(always)]
-unsafe fn chroma8_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
+#[inline]
+#[target_feature(enable = "neon")]
+fn chroma8_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
     src: &S,
     dst: &mut PlaneCursorMut<'_>,
     w: &[u8; 4],
@@ -825,34 +826,29 @@ unsafe fn chroma8_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
     const { assert!(H > 0 && SH >= H + 1) };
     let s = src.span::<9, SH>(0, 0);
     let mut d = dst.span_mut::<8, H>(0, 0);
-    let (s_ptr, s_stride) = s.as_ptr_and_stride();
-    let (d_ptr, d_stride) = d.as_mut_ptr_and_stride();
-    // SAFETY: `s` and `d` were bounds-checked to `9 x SH` (`SH >= H + 1`) and `8 x H`.
-    unsafe {
-        let (wa, wb, wc, wd) = (
-            vdup_n_u8(w[0]),
-            vdup_n_u8(w[1]),
-            vdup_n_u8(w[2]),
-            vdup_n_u8(w[3]),
+    let (wa, wb, wc, wd) = (
+        vdup_n_u8(w[0]),
+        vdup_n_u8(w[1]),
+        vdup_n_u8(w[2]),
+        vdup_n_u8(w[3]),
+    );
+    let (mut a, mut b) = (ld8(&s.row::<8>(0, 0)), ld8(&s.row::<8>(0, 1)));
+    for y in 0..H {
+        let (c, e) = (ld8(&s.row::<8>(y + 1, 0)), ld8(&s.row::<8>(y + 1, 1)));
+        let t = vaddq_u16(
+            vmlal_u8(vmull_u8(a, wa), b, wb),
+            vmlal_u8(vmull_u8(c, wc), e, wd),
         );
-        let (mut a, mut b) = (vld1_u8(s_ptr), vld1_u8(s_ptr.add(1)));
-        for y in 0..H {
-            let row_ptr = s_ptr.add((y + 1) * s_stride);
-            let (c, e) = (vld1_u8(row_ptr), vld1_u8(row_ptr.add(1)));
-            let t = vaddq_u16(
-                vmlal_u8(vmull_u8(a, wa), b, wb),
-                vmlal_u8(vmull_u8(c, wc), e, wd),
-            );
-            vst1_u8(d_ptr.add(y * d_stride), vrshrn_n_u16::<6>(t));
-            a = c;
-            b = e;
-        }
+        st8(d.row_mut::<8>(y, 0), vrshrn_n_u16::<6>(t));
+        a = c;
+        b = e;
     }
 }
 
 /// `McChromaWidthEq4_AArch64_neon`, two 4-byte rows packed per 8-lane register.
-#[inline(always)]
-unsafe fn chroma4_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
+#[inline]
+#[target_feature(enable = "neon")]
+fn chroma4_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
     src: &S,
     dst: &mut PlaneCursorMut<'_>,
     w: &[u8; 4],
@@ -860,70 +856,58 @@ unsafe fn chroma4_block<S: RefSamples + Copy, const H: usize, const SH: usize>(
     const { assert!(H > 0 && SH >= H + 1) };
     let s = src.span::<5, SH>(0, 0);
     let mut d = dst.span_mut::<4, H>(0, 0);
-    let (s_ptr, s_stride) = s.as_ptr_and_stride();
-    let (d_ptr, d_stride) = d.as_mut_ptr_and_stride();
-    // SAFETY: `s` and `d` were bounds-checked to `5 x SH` (`SH >= H + 1`) and `4 x H`.
-    unsafe {
-        let (wa, wb, wc, wd) = (
-            vdup_n_u8(w[0]),
-            vdup_n_u8(w[1]),
-            vdup_n_u8(w[2]),
-            vdup_n_u8(w[3]),
+    let (wa, wb, wc, wd) = (
+        vdup_n_u8(w[0]),
+        vdup_n_u8(w[1]),
+        vdup_n_u8(w[2]),
+        vdup_n_u8(w[3]),
+    );
+    let (mut r0a, mut r0b) = (
+        u32::from_ne_bytes(s.row::<4>(0, 0)),
+        u32::from_ne_bytes(s.row::<4>(0, 1)),
+    );
+    let mut y = 0;
+    while y + 2 <= H {
+        let (r1a, r1b) = (
+            u32::from_ne_bytes(s.row::<4>(y + 1, 0)),
+            u32::from_ne_bytes(s.row::<4>(y + 1, 1)),
         );
-        let (mut r0a, mut r0b) = (
-            core::ptr::read_unaligned(s_ptr as *const u32),
-            core::ptr::read_unaligned(s_ptr.add(1) as *const u32),
+        let (r2a, r2b) = (
+            u32::from_ne_bytes(s.row::<4>(y + 2, 0)),
+            u32::from_ne_bytes(s.row::<4>(y + 2, 1)),
         );
-        let mut y = 0;
-        while y + 2 <= H {
-            let p1 = s_ptr.add((y + 1) * s_stride);
-            let p2 = s_ptr.add((y + 2) * s_stride);
-            let (r1a, r1b) = (
-                core::ptr::read_unaligned(p1 as *const u32),
-                core::ptr::read_unaligned(p1.add(1) as *const u32),
-            );
-            let (r2a, r2b) = (
-                core::ptr::read_unaligned(p2 as *const u32),
-                core::ptr::read_unaligned(p2.add(1) as *const u32),
-            );
-            let a = vreinterpret_u8_u64(vcreate_u64((r0a as u64) | ((r1a as u64) << 32)));
-            let b = vreinterpret_u8_u64(vcreate_u64((r0b as u64) | ((r1b as u64) << 32)));
-            let c = vreinterpret_u8_u64(vcreate_u64((r1a as u64) | ((r2a as u64) << 32)));
-            let e = vreinterpret_u8_u64(vcreate_u64((r1b as u64) | ((r2b as u64) << 32)));
-            let t = vaddq_u16(
-                vmlal_u8(vmull_u8(a, wa), b, wb),
-                vmlal_u8(vmull_u8(c, wc), e, wd),
-            );
-            let out = vget_lane_u64::<0>(vreinterpret_u64_u8(vrshrn_n_u16::<6>(t)));
-            core::ptr::write_unaligned(d_ptr.add(y * d_stride) as *mut u32, out as u32);
-            core::ptr::write_unaligned(
-                d_ptr.add((y + 1) * d_stride) as *mut u32,
-                (out >> 32) as u32,
-            );
-            r0a = r2a;
-            r0b = r2b;
-            y += 2;
-        }
-        while y < H {
-            let p1 = s_ptr.add((y + 1) * s_stride);
-            let (r1a, r1b) = (
-                core::ptr::read_unaligned(p1 as *const u32),
-                core::ptr::read_unaligned(p1.add(1) as *const u32),
-            );
-            let a = vreinterpret_u8_u64(vcreate_u64(r0a as u64));
-            let b = vreinterpret_u8_u64(vcreate_u64(r0b as u64));
-            let c = vreinterpret_u8_u64(vcreate_u64(r1a as u64));
-            let e = vreinterpret_u8_u64(vcreate_u64(r1b as u64));
-            let t = vaddq_u16(
-                vmlal_u8(vmull_u8(a, wa), b, wb),
-                vmlal_u8(vmull_u8(c, wc), e, wd),
-            );
-            let out = vget_lane_u32::<0>(vreinterpret_u32_u8(vrshrn_n_u16::<6>(t)));
-            core::ptr::write_unaligned(d_ptr.add(y * d_stride) as *mut u32, out);
-            r0a = r1a;
-            r0b = r1b;
-            y += 1;
-        }
+        let a = vreinterpret_u8_u64(vcreate_u64((r0a as u64) | ((r1a as u64) << 32)));
+        let b = vreinterpret_u8_u64(vcreate_u64((r0b as u64) | ((r1b as u64) << 32)));
+        let c = vreinterpret_u8_u64(vcreate_u64((r1a as u64) | ((r2a as u64) << 32)));
+        let e = vreinterpret_u8_u64(vcreate_u64((r1b as u64) | ((r2b as u64) << 32)));
+        let t = vaddq_u16(
+            vmlal_u8(vmull_u8(a, wa), b, wb),
+            vmlal_u8(vmull_u8(c, wc), e, wd),
+        );
+        let out = vget_lane_u64::<0>(vreinterpret_u64_u8(vrshrn_n_u16::<6>(t)));
+        *d.row_mut::<4>(y, 0) = (out as u32).to_ne_bytes();
+        *d.row_mut::<4>(y + 1, 0) = ((out >> 32) as u32).to_ne_bytes();
+        r0a = r2a;
+        r0b = r2b;
+        y += 2;
+    }
+    while y < H {
+        let (r1a, r1b) = (
+            u32::from_ne_bytes(s.row::<4>(y + 1, 0)),
+            u32::from_ne_bytes(s.row::<4>(y + 1, 1)),
+        );
+        let a = vreinterpret_u8_u64(vcreate_u64(r0a as u64));
+        let b = vreinterpret_u8_u64(vcreate_u64(r0b as u64));
+        let c = vreinterpret_u8_u64(vcreate_u64(r1a as u64));
+        let e = vreinterpret_u8_u64(vcreate_u64(r1b as u64));
+        let t = vaddq_u16(
+            vmlal_u8(vmull_u8(a, wa), b, wb),
+            vmlal_u8(vmull_u8(c, wc), e, wd),
+        );
+        st4(d.row_mut::<4>(y, 0), vrshrn_n_u16::<6>(t));
+        r0a = r1a;
+        r0b = r1b;
+        y += 1;
     }
 }
 
@@ -1150,24 +1134,8 @@ fn neon_copy_block<const W: usize, const H: usize, S: RefSamples + Copy>(
 ) {
     let s = src.span::<W, H>(0, 0);
     let mut d = dst.span_mut::<W, H>(0, 0);
-    let (s_ptr, s_stride) = s.as_ptr_and_stride();
-    let (d_ptr, d_stride) = d.as_mut_ptr_and_stride();
-    // SAFETY: `s` and `d` were bounds-checked to `W x H`.
-    unsafe {
-        for y in 0..H {
-            match W {
-                16 => vst1q_u8(d_ptr.add(y * d_stride), vld1q_u8(s_ptr.add(y * s_stride))),
-                8 => vst1_u8(d_ptr.add(y * d_stride), vld1_u8(s_ptr.add(y * s_stride))),
-                4 => core::ptr::write_unaligned(
-                    d_ptr.add(y * d_stride) as *mut u32,
-                    core::ptr::read_unaligned(s_ptr.add(y * s_stride) as *const u32),
-                ),
-                _ => core::ptr::write_unaligned(
-                    d_ptr.add(y * d_stride) as *mut u16,
-                    core::ptr::read_unaligned(s_ptr.add(y * s_stride) as *const u16),
-                ),
-            }
-        }
+    for y in 0..H {
+        *d.row_mut::<W>(y, 0) = s.row::<W>(y, 0);
     }
 }
 
