@@ -88,15 +88,19 @@ name = "decoder_resolution_change_test"
 required-features = ["c-api"]
 
 [[test]]
-name = "e2e_conformance_test"
-required-features = ["c-api"]
-
-[[test]]
 name = "encode_options_test"
 required-features = ["c-api"]
 
 [[test]]
+name = "encoder_ext_test"
+required-features = ["c-api"]
+
+[[test]]
 name = "encoder_force_idr_ltr_test"
+required-features = ["c-api"]
+
+[[test]]
+name = "encoder_output_sha1_test"
 required-features = ["c-api"]
 
 [[test]]

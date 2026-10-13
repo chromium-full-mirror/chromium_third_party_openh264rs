@@ -227,9 +227,20 @@ fn test_asset_ba1_ft_c() {
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_ba1_sony_d() {
+    // I slices, one slice per picture. Deblocking enabled.
     test_single_bitstream_asset_ex(
         "res/BA1_Sony_D.jsv",
         "d94b5ceed5686a03ea682b53d415dee999d27eb6",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_ba2_sony_f() {
+    // I/P slices, one slice per picture. Deblocking enabled. POC type 0.
+    test_single_bitstream_asset_ex(
+        "res/BA2_Sony_F.jsv",
+        "134e864d7b6f24d0cbc0331c512788c27d8aba4e",
         false,
     );
 }
@@ -271,6 +282,70 @@ fn test_asset_basqp1_sony_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_caba2_sva_b() {
+    // I/P slices, one slice per picture. Deblocking enabled. CABAC. POC type 0.
+    // num_ref_frames=5.
+    test_single_bitstream_asset_ex(
+        "res/CABA2_SVA_B.264",
+        "3ce8754cf9ab0372dee4de37f3a851d80f5cd76f",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_caba3_sva_b() {
+    // IPB slices with CABAC. Temporal direct prediction. num_ref_frames=5.
+    test_single_bitstream_asset_ex(
+        "res/CABA3_SVA_B.264",
+        "1b811ad90ac4ce9beb034cb8c993ad4e2935f46a",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_cabast3_sony_e() {
+    // 4 slices per picture at first_mb_in_slice 0 / 99 / 198 / 297, with the slice
+    // types changing inside the picture — I/P/I/P in the reference pictures, I/P/B/I
+    // in the non-reference ones — and deblocking across the boundaries between them.
+    // 25 pictures. CABAC. IPB slices, POC type 0, 1 ref frame, temporal direct.
+    test_single_bitstream_asset_ex(
+        "res/CABAST3_Sony_E.jsv",
+        "cb772948a52c128971dd2eaa28d0a66fc7e7a733",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_canl1_sony_e() {
+    // I slices, one slice per picture. Deblocking disabled. CABAC. POC type 0.
+    test_single_bitstream_asset_ex(
+        "res/CANL1_Sony_E.jsv",
+        "ba24ac54c8b39a648e7c676c3d9d0160d635830b",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_canl1_toshiba_g() {
+    // I slices, one slice per picture. Deblocking disabled. CABAC. POC type 2.
+    test_single_bitstream_asset_ex(
+        "res/CANL1_TOSHIBA_G.264",
+        "a6ce8c15a4e0c4a553c3f8212d3976ff4b90ac18",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_canl2_sony_e() {
+    // I/P slices, one slice per picture. Deblocking disabled. CABAC. POC type 0.
+    test_single_bitstream_asset_ex(
+        "res/CANL2_Sony_E.jsv",
+        "cea24d25144d72216301f48c307a21f660c97136",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_ci1_ft_b() {
     test_single_bitstream_asset_ex(
         "res/CI1_FT_B.264",
@@ -284,6 +359,16 @@ fn test_asset_ci_mw_d() {
     test_single_bitstream_asset_ex(
         "res/CI_MW_D.264",
         "289f29a103c8d95adf2909c646466904be8b06d7",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_cvbs3_sony_c() {
+    // IPB slices with CAVLC. Temporal direct prediction. direct_8x8_inference=on. num_ref_frames=4.
+    test_single_bitstream_asset_ex(
+        "res/CVBS3_Sony_C.jsv",
+        "094e116aab7b1dd8b16279482ad176b67004a285",
         false,
     );
 }
@@ -362,9 +447,22 @@ fn test_asset_mr2_tandberg_e() {
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_nl1_sony_d() {
+    // I slices, one slice per picture. Deblocking disabled
+    // (disable_deblocking_filter_idc=1).
     test_single_bitstream_asset_ex(
         "res/NL1_Sony_D.jsv",
         "e401e30669938443c2f02522fd4d5aa1382931a0",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_nl2_sony_h() {
+    // I/P slices, one slice per picture. Deblocking disabled. POC type 0.
+    // Constrained Baseline, yuv420p progressive, 176x144.
+    test_single_bitstream_asset_ex(
+        "res/NL2_Sony_H.jsv",
+        "c68a79d2056fe78279775414b532cd58dc2d9318",
         false,
     );
 }
@@ -416,6 +514,7 @@ fn test_asset_sva_ba1_b() {
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_sva_ba2_d() {
+    // I/P slices, one slice per picture. Deblocking enabled. POC type 2.
     test_single_bitstream_asset_ex(
         "res/SVA_BA2_D.264",
         "98ff2d67860462d8d8bcc9352097c06cc401d97e",
@@ -425,6 +524,8 @@ fn test_asset_sva_ba2_d() {
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_sva_base_b() {
+    // 3 slices per picture. CAVLC. I/P slices, POC type 2, 5 ref frames.
+    // disable_deblocking_filter_idc=0, so deblocking filters across slice boundaries.
     test_single_bitstream_asset_ex(
         "res/SVA_Base_B.264",
         "91f514d81cd33de9f6fbf5dbefdb189cc2e7ecf4",
@@ -452,6 +553,8 @@ fn test_asset_sva_fm1_e() {
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_sva_nl1_b() {
+    // I slices, one slice per picture. Deblocking disabled
+    // (disable_deblocking_filter_idc=1).
     test_single_bitstream_asset_ex(
         "res/SVA_NL1_B.264",
         "6d63f72a0c0d833b1db0ba438afff3b4180fb3e6",
@@ -709,6 +812,8 @@ fn test_asset_fmo_2groups_64x64() {
 //    (`parse_mb_syn_cabac.cpp:1399`).
 //  * `_inter` — I+P, CAVLC: lists 6 and 7 through `WelsResidualBlockCavlc8x8`
 //    (`parse_mb_syn_cavlc.cpp:979`).
+//  * `_cabac_inter` — I+P+B, CABAC: lists 6 and 7 through
+//    `ParseResidualBlockCabac8x8`.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 fn test_asset_cqm8x8_intra_176x144() {
@@ -724,6 +829,44 @@ fn test_asset_cqm8x8_inter_176x144() {
     test_single_bitstream_asset_ex(
         "res/cqm8x8_inter_176x144.264",
         "af78d465b33871858868f29eb61b79e7a4c5e5e1",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_cqm8x8_cabac_inter_176x144() {
+    test_single_bitstream_asset_ex(
+        "res/cqm8x8_cabac_inter_176x144.264",
+        "15745e18965e4169b8d77feb2a3ac7fdb60a177a",
+        false,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// High-profile 8x8 transform and weighted prediction across multiple slices
+//
+//  * `high_8x8_multislice_176x144` — High profile (`transform_8x8_mode_flag = 1`),
+//    CABAC, I/P/B slices, 3 slices per picture (`-x264-params slices=3:8x8dct=1`),
+//    filtering 8x8 transform macroblocks across slice boundaries.
+//  * `multislice_weighted_176x144` — Main profile, CABAC, I/P/B slices, 3 slices per
+//    picture with explicit P-slice (`weighted_pred_flag = 1`) and implicit B-slice
+//    (`weighted_bipred_idc = 2`) weighted prediction (`slices=3:weightp=2:weightb=1`),
+//    where each slice carries its own `pred_weight_table`.
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_high_8x8_multislice_176x144() {
+    test_single_bitstream_asset_ex(
+        "res/high_8x8_multislice_176x144.264",
+        "e1f880c0a650e08a5bc7675dfb488d4ef47ea655",
+        false,
+    );
+}
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn test_asset_multislice_weighted_176x144() {
+    test_single_bitstream_asset_ex(
+        "res/multislice_weighted_176x144.264",
+        "dea28402c0f14935d2cfd1bc4c28c6ed654ff7c4",
         false,
     );
 }

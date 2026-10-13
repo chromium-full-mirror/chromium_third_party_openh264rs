@@ -7,16 +7,14 @@
 // `#[path]`-included into several test crates, each of which uses only some helpers.
 #![allow(dead_code)]
 
+pub mod frame_gen;
 pub mod sha1;
-pub mod y4m;
 
 /// The library's deterministic PRNG, so a seed printed by a unit test replays here.
 #[path = "../../src/safe/prng.rs"]
 pub mod prng;
 #[allow(unused_imports)]
 pub use sha1::Sha1Hasher;
-#[allow(unused_imports)]
-pub use y4m::compare_y4m_buffers;
 
 /// Directory containing test bitstream assets (`OPENH264_TEST_DATA_DIR` or `tests/data`).
 pub fn stream_dir() -> std::path::PathBuf {
