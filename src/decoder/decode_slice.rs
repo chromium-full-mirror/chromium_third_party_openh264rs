@@ -926,64 +926,74 @@ pub fn WelsMbInterSampleConstruction(
     let iMbXy = dq.iMbXyIndex as usize;
     let (mb_x, mb_y) = (dq.iMbX as isize, dq.iMbY as isize);
 
+    let cbp = *dq.grid.cbp.get(iMbXy) as u8;
+    let cbp_luma = cbp & 15;
+    let cbp_chroma = cbp >> 4;
     let pTransformSize8x8 = *dq.grid.transform_size8x8_flag.get(iMbXy);
     let pNzc = *dq.grid.nzc.get(iMbXy);
     let tcoeff: &[i16; 384] = dq.grid.scaled_tcoeff.get(iMbXy);
 
-    if pTransformSize8x8 {
-        if let Some(idct8x8) = ctx.pIdctResAddPredFunc8x8 {
-            for i in 0..4 {
-                let iIndex = g_kuiMbCountScan4Idx[i << 2] as usize;
-                if pNzc[iIndex] != 0
-                    || pNzc[iIndex + 1] != 0
-                    || pNzc[iIndex + 4] != 0
-                    || pNzc[iIndex + 5] != 0
-                {
-                    let (dx, dy) = (((iIndex % 4) << 2) as isize, ((iIndex >> 2) << 2) as isize);
-                    if let Some(rs) = slice_array::<i16, 64>(tcoeff, i << 6) {
-                        idct8x8(
+    if cbp_luma != 0 {
+        if pTransformSize8x8 {
+            if let Some(idct8x8) = ctx.pIdctResAddPredFunc8x8 {
+                for i in 0..4 {
+                    if (cbp_luma & (1 << i)) != 0 {
+                        let iIndex = g_kuiMbCountScan4Idx[i << 2] as usize;
+                        if pNzc[iIndex] != 0
+                            || pNzc[iIndex + 1] != 0
+                            || pNzc[iIndex + 4] != 0
+                            || pNzc[iIndex + 5] != 0
+                        {
+                            let (dx, dy) =
+                                (((iIndex % 4) << 2) as isize, ((iIndex >> 2) << 2) as isize);
+                            if let Some(rs) = slice_array::<i16, 64>(tcoeff, i << 6) {
+                                idct8x8(
+                                    &mut pDec
+                                        .plane_mut(0)
+                                        .cursor_mut((mb_x << 4) + dx, (mb_y << 4) + dy),
+                                    rs,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(idct4x4) = ctx.pIdctFourResAddPredFunc {
+            for (q, (dx, dy, nz)) in [(0, 0, 0usize), (8, 0, 2), (0, 8, 8), (8, 8, 10)]
+                .into_iter()
+                .enumerate()
+            {
+                if (cbp_luma & (1 << q)) != 0 {
+                    if let (Some(rs), Some(nzc)) = (
+                        slice_array::<i16, 64>(tcoeff, q << 6),
+                        slice_array::<i8, 6>(&pNzc, nz),
+                    ) {
+                        idct4x4(
                             &mut pDec
                                 .plane_mut(0)
                                 .cursor_mut((mb_x << 4) + dx, (mb_y << 4) + dy),
                             rs,
+                            nzc,
                         );
                     }
                 }
             }
         }
-    } else {
+    }
+
+    if cbp_chroma != 0 {
         if let Some(idct4x4) = ctx.pIdctFourResAddPredFunc {
-            for (q, (dx, dy, nz)) in [(0, 0, 0usize), (8, 0, 2), (0, 8, 8), (8, 8, 10)]
-                .into_iter()
-                .enumerate()
-            {
+            for (plane, (coeff, nz)) in [(256usize, 16usize), (320, 18)].into_iter().enumerate() {
                 if let (Some(rs), Some(nzc)) = (
-                    slice_array::<i16, 64>(tcoeff, q << 6),
+                    slice_array::<i16, 64>(tcoeff, coeff),
                     slice_array::<i8, 6>(&pNzc, nz),
                 ) {
                     idct4x4(
-                        &mut pDec
-                            .plane_mut(0)
-                            .cursor_mut((mb_x << 4) + dx, (mb_y << 4) + dy),
+                        &mut pDec.plane_mut(plane + 1).cursor_mut(mb_x << 3, mb_y << 3),
                         rs,
                         nzc,
                     );
                 }
-            }
-        }
-    }
-
-    if let Some(idct4x4) = ctx.pIdctFourResAddPredFunc {
-        for (plane, (coeff, nz)) in [(256usize, 16usize), (320, 18)].into_iter().enumerate() {
-            if let (Some(rs), Some(nzc)) = (
-                slice_array::<i16, 64>(tcoeff, coeff),
-                slice_array::<i8, 6>(&pNzc, nz),
-            ) {
-                idct4x4(
-                    &mut pDec.plane_mut(plane + 1).cursor_mut(mb_x << 3, mb_y << 3),
-                    rs,
-                    nzc,
-                );
             }
         }
     }
@@ -1320,7 +1330,17 @@ fn BiWeightPrediction(
     }
 }
 
+#[inline(always)]
+fn avg_row<const W: usize>(out: &mut [u8], t: &[u8]) {
+    let out = &mut out[..W];
+    let t = &t[..W];
+    for i in 0..W {
+        out[i] = ((out[i] as u16 + t[i] as u16 + 1) >> 1) as u8;
+    }
+}
+
 /// Matches `BiPrediction` in `rec_mb.cpp`.
+#[inline]
 fn BiPrediction(
     dst: &mut SPicture,
     at: McDst,
@@ -1332,28 +1352,67 @@ fn BiPrediction(
     {
         let src = tmp.plane(0).cursor(tmp_at.luma.0, tmp_at.luma.1);
         let mut cur = dst.plane_mut(0).cursor_mut(at.luma.0, at.luma.1);
-        for i in 0..iBlkHeight as isize {
-            let t = src.row(i, 0, iBlkWidth as usize);
-            let out = cur.row_mut(i, 0, iBlkWidth as usize);
-            for (p, &t) in out.iter_mut().zip(t) {
-                let iPredTemp = (*p as i32 + t as i32 + 1) >> 1;
-                *p = WELS_CLIP3(iPredTemp, 0, 255) as u8;
+        let h = iBlkHeight as isize;
+        match iBlkWidth {
+            16 => {
+                for i in 0..h {
+                    avg_row::<16>(cur.row_mut(i, 0, 16), src.row(i, 0, 16));
+                }
+            }
+            8 => {
+                for i in 0..h {
+                    avg_row::<8>(cur.row_mut(i, 0, 8), src.row(i, 0, 8));
+                }
+            }
+            4 => {
+                for i in 0..h {
+                    avg_row::<4>(cur.row_mut(i, 0, 4), src.row(i, 0, 4));
+                }
+            }
+            w => {
+                let w = w as usize;
+                for i in 0..h {
+                    let t = src.row(i, 0, w);
+                    let out = cur.row_mut(i, 0, w);
+                    for (p, &t) in out.iter_mut().zip(t) {
+                        *p = ((*p as u16 + t as u16 + 1) >> 1) as u8;
+                    }
+                }
             }
         }
     }
 
     // UV
     let iBlkWidth = iBlkWidth >> 1;
-    let iBlkHeight = iBlkHeight >> 1;
+    let h = (iBlkHeight >> 1) as isize;
     for k in 0..2usize {
         let src = tmp.plane(k + 1).cursor(tmp_at.chroma.0, tmp_at.chroma.1);
         let mut cur = dst.plane_mut(k + 1).cursor_mut(at.chroma.0, at.chroma.1);
-        for i in 0..iBlkHeight as isize {
-            let t = src.row(i, 0, iBlkWidth as usize);
-            let out = cur.row_mut(i, 0, iBlkWidth as usize);
-            for (p, &t) in out.iter_mut().zip(t) {
-                let iPredTemp = (*p as i32 + t as i32 + 1) >> 1;
-                *p = WELS_CLIP3(iPredTemp, 0, 255) as u8;
+        match iBlkWidth {
+            8 => {
+                for i in 0..h {
+                    avg_row::<8>(cur.row_mut(i, 0, 8), src.row(i, 0, 8));
+                }
+            }
+            4 => {
+                for i in 0..h {
+                    avg_row::<4>(cur.row_mut(i, 0, 4), src.row(i, 0, 4));
+                }
+            }
+            2 => {
+                for i in 0..h {
+                    avg_row::<2>(cur.row_mut(i, 0, 2), src.row(i, 0, 2));
+                }
+            }
+            w => {
+                let w = w as usize;
+                for i in 0..h {
+                    let t = src.row(i, 0, w);
+                    let out = cur.row_mut(i, 0, w);
+                    for (p, &t) in out.iter_mut().zip(t) {
+                        *p = ((*p as u16 + t as u16 + 1) >> 1) as u8;
+                    }
+                }
             }
         }
     }
@@ -1382,7 +1441,7 @@ pub fn GetInterPred(
         .sSliceHeaderExt
         .sSliceHeader;
     let geom = (sh.iMbWidth << 4, sh.iMbHeight << 4);
-    let pwt = pCurDqLayer.sPredWeightTable;
+    let pwt = pCurDqLayer.sPredWeightTable.as_ref();
     let bWeight = pCurDqLayer.bUseWeightPredictionFlag;
     let mb = McDst::mb(pCurDqLayer.iMbX, pCurDqLayer.iMbY);
 
@@ -1395,7 +1454,7 @@ pub fn GetInterPred(
             let at = $at;
             BaseMC(geom, &src, pDec, at, $x, $y, $w, $h, $mvs);
             if bWeight {
-                WeightPrediction(pwt.as_ref(), pDec, at, LIST_0, $iref as i32, $w, $h);
+                WeightPrediction(pwt, pDec, at, LIST_0, $iref as i32, $w, $h);
             }
         }};
     }
@@ -1529,9 +1588,10 @@ pub fn GetInterBPred(
         .sSliceHeaderExt
         .sSliceHeader;
     let geom = (sh.iMbWidth << 4, sh.iMbHeight << 4);
-    let pwt = pCurDqLayer.sPredWeightTable;
+    let pwt = pCurDqLayer.sPredWeightTable.as_ref();
     let bUseWeightedBiPredIdc = pCurDqLayer.bUseWeightedBiPredIdc;
     let mb = McDst::mb(pCurDqLayer.iMbX, pCurDqLayer.iMbY);
+    let tmp_origin = McDst::mb(0, 0);
 
     let mut iMVs;
     let mut iRefIndex0: i8 = 0;
@@ -1548,25 +1608,25 @@ pub fn GetInterBPred(
             BaseMC(geom, &src, pDec, $at, $x, $y, $w, $h, $mvs);
         }};
     }
-    /// LIST_1's hypothesis, into `pTempDec`.
+    /// LIST_1's hypothesis, into `pTempDec` at `(0, 0)` so the scratchpad stays in L1 cache.
     macro_rules! mc1 {
-        ($at:expr, $list:expr, $iref:expr, $x:expr, $y:expr, $w:expr, $h:expr, $mvs:expr) => {{
+        ($list:expr, $iref:expr, $x:expr, $y:expr, $w:expr, $h:expr, $mvs:expr) => {{
             let src = match ref_for_other(pRefs, sRefPic, $iref, $list, &*pDec) {
                 Ok(src) => src,
                 Err(ret) => return ret,
             };
-            BaseMC(geom, &src, pTempDec, $at, $x, $y, $w, $h, $mvs);
+            BaseMC(geom, &src, pTempDec, tmp_origin, $x, $y, $w, $h, $mvs);
         }};
     }
     macro_rules! blend {
-        ($at:expr, $tat:expr, $r0:expr, $r1:expr, $w:expr, $h:expr) => {{
+        ($at:expr, $r0:expr, $r1:expr, $w:expr, $h:expr) => {{
             if bUseWeightedBiPredIdc {
                 BiWeightPrediction(
-                    pwt.as_ref(),
+                    pwt,
                     pDec,
                     $at,
                     pTempDec,
-                    $tat,
+                    tmp_origin,
                     $r0 as i32,
                     $r1 as i32,
                     bWeightedBipredIdcIs1,
@@ -1574,7 +1634,7 @@ pub fn GetInterBPred(
                     $h,
                 );
             } else {
-                BiPrediction(pDec, $at, pTempDec, $tat, $w, $h);
+                BiPrediction(pDec, $at, pTempDec, tmp_origin, $w, $h);
             }
         }};
     }
@@ -1587,8 +1647,8 @@ pub fn GetInterBPred(
 
             iMVs = pMv(LIST_1, 0);
             iRefIndex1 = pRef(LIST_1, 0);
-            mc1!(mb, LIST_1, iRefIndex1, iMBOffsetX, iMBOffsetY, 16, 16, iMVs);
-            blend!(mb, mb, iRefIndex0, iRefIndex1, 16, 16);
+            mc1!(LIST_1, iRefIndex1, iMBOffsetX, iMBOffsetY, 16, 16, iMVs);
+            blend!(mb, iRefIndex0, iRefIndex1, 16, 16);
         } else {
             let listIdx = if (iMBType & MB_TYPE_P0L0) != 0 {
                 LIST_0
@@ -1599,7 +1659,7 @@ pub fn GetInterBPred(
             iRefIndex = pRef(listIdx, 0);
             mc0!(mb, listIdx, iRefIndex, iMBOffsetX, iMBOffsetY, 16, 16, iMVs);
             if bWeightedBipredIdcIs1 {
-                WeightPrediction(pwt.as_ref(), pDec, mb, listIdx, iRefIndex as i32, 16, 16);
+                WeightPrediction(pwt, pDec, mb, listIdx, iRefIndex as i32, 16, 16);
             }
         }
     } else if IS_INTER_16x8(iMBType) {
@@ -1623,17 +1683,17 @@ pub fn GetInterBPred(
                 iMVs = pMv(LIST_1, iPartIdx);
                 iRefIndex1 = pRef(LIST_1, iPartIdx);
                 if bL0 {
-                    mc1!(at, LIST_1, iRefIndex1, iMBOffsetX, iYOffset, 16, 8, iMVs);
+                    mc1!(LIST_1, iRefIndex1, iMBOffsetX, iYOffset, 16, 8, iMVs);
                 } else {
                     mc0!(at, LIST_1, iRefIndex1, iMBOffsetX, iYOffset, 16, 8, iMVs);
                 }
             }
             if bL0 && bL1 {
-                blend!(at, at, iRefIndex0, iRefIndex1, 16, 8);
+                blend!(at, iRefIndex0, iRefIndex1, 16, 8);
             } else if (bL0 || bL1) && bWeightedBipredIdcIs1 {
                 let listIdx = if bL0 { LIST_0 } else { LIST_1 };
                 iRefIndex = pRef(listIdx, iPartIdx);
-                WeightPrediction(pwt.as_ref(), pDec, at, listIdx, iRefIndex as i32, 16, 8);
+                WeightPrediction(pwt, pDec, at, listIdx, iRefIndex as i32, 16, 8);
             }
         }
     } else if IS_INTER_8x16(iMBType) {
@@ -1653,17 +1713,17 @@ pub fn GetInterBPred(
                 iMVs = pMv(LIST_1, iPartIdx);
                 iRefIndex1 = pRef(LIST_1, iPartIdx);
                 if bL0 {
-                    mc1!(at, LIST_1, iRefIndex1, iXOffset, iMBOffsetY, 8, 16, iMVs);
+                    mc1!(LIST_1, iRefIndex1, iXOffset, iMBOffsetY, 8, 16, iMVs);
                 } else {
                     mc0!(at, LIST_1, iRefIndex1, iXOffset, iMBOffsetY, 8, 16, iMVs);
                 }
             }
             if bL0 && bL1 {
-                blend!(at, at, iRefIndex0, iRefIndex1, 8, 16);
+                blend!(at, iRefIndex0, iRefIndex1, 8, 16);
             } else if (bL0 || bL1) && bWeightedBipredIdcIs1 {
                 let listIdx = if bL0 { LIST_0 } else { LIST_1 };
                 iRefIndex = pRef(listIdx, iPartIdx);
-                WeightPrediction(pwt.as_ref(), pDec, at, listIdx, iRefIndex as i32, 8, 16);
+                WeightPrediction(pwt, pDec, at, listIdx, iRefIndex as i32, 8, 16);
             }
         }
     } else if IS_Inter_8x8(iMBType) {
@@ -1690,8 +1750,8 @@ pub fn GetInterBPred(
                     iMVs = pMv(LIST_0, iIIdx);
                     mc0!(blk8, LIST_0, iRefIndex0, iXOffset, iYOffset, 8, 8, iMVs);
                     iMVs = pMv(LIST_1, iIIdx);
-                    mc1!(blk8, LIST_1, iRefIndex1, iXOffset, iYOffset, 8, 8, iMVs);
-                    blend!(blk8, blk8, iRefIndex0, iRefIndex1, 8, 8);
+                    mc1!(LIST_1, iRefIndex1, iXOffset, iYOffset, 8, 8, iMVs);
+                    blend!(blk8, iRefIndex0, iRefIndex1, 8, 8);
                 } else {
                     let listIdx = if IS_TYPE_L0(iSubMBType) {
                         LIST_0
@@ -1702,7 +1762,7 @@ pub fn GetInterBPred(
                     iRefIndex = pRef(listIdx, iIIdx);
                     mc0!(blk8, listIdx, iRefIndex, iXOffset, iYOffset, 8, 8, iMVs);
                     if bWeightedBipredIdcIs1 {
-                        WeightPrediction(pwt.as_ref(), pDec, blk8, listIdx, iRefIndex as i32, 8, 8);
+                        WeightPrediction(pwt, pDec, blk8, listIdx, iRefIndex as i32, 8, 8);
                     }
                 }
             } else if IS_SUB_8x4(iSubMBType) {
@@ -1711,8 +1771,8 @@ pub fn GetInterBPred(
                     iMVs = pMv(LIST_0, iIIdx);
                     mc0!(blk8, LIST_0, iRefIndex0, iXOffset, iYOffset, 8, 4, iMVs);
                     iMVs = pMv(LIST_1, iIIdx);
-                    mc1!(blk8, LIST_1, iRefIndex1, iXOffset, iYOffset, 8, 4, iMVs);
-                    blend!(blk8, blk8, iRefIndex0, iRefIndex1, 8, 4);
+                    mc1!(LIST_1, iRefIndex1, iXOffset, iYOffset, 8, 4, iMVs);
+                    blend!(blk8, iRefIndex0, iRefIndex1, 8, 4);
 
                     let lower = blk8.blk(0, 4);
                     iMVs = pMv(LIST_0, iIIdx + 4);
@@ -1728,7 +1788,6 @@ pub fn GetInterBPred(
                     );
                     iMVs = pMv(LIST_1, iIIdx + 4);
                     mc1!(
-                        lower,
                         LIST_1,
                         iRefIndex1,
                         iXOffset,
@@ -1737,7 +1796,7 @@ pub fn GetInterBPred(
                         4,
                         iMVs
                     );
-                    blend!(lower, lower, iRefIndex0, iRefIndex1, 8, 4);
+                    blend!(lower, iRefIndex0, iRefIndex1, 8, 4);
                 } else {
                     // B_L0_8x4 B_L1_8x4
                     let listIdx = if IS_TYPE_L0(iSubMBType) {
@@ -1752,7 +1811,7 @@ pub fn GetInterBPred(
                     // (sub-)macroblock partition, so the top 8x4 is weighted before the
                     // destination advances (`rec_mb.cpp:940-944`).
                     if bWeightedBipredIdcIs1 {
-                        WeightPrediction(pwt.as_ref(), pDec, blk8, listIdx, iRefIndex as i32, 8, 4);
+                        WeightPrediction(pwt, pDec, blk8, listIdx, iRefIndex as i32, 8, 4);
                     }
                     let lower = blk8.blk(0, 4);
                     iMVs = pMv(listIdx, iIIdx + 4);
@@ -1768,7 +1827,7 @@ pub fn GetInterBPred(
                     );
                     if bWeightedBipredIdcIs1 {
                         WeightPrediction(
-                            pwt.as_ref(),
+                            pwt,
                             pDec,
                             lower,
                             listIdx,
@@ -1784,8 +1843,8 @@ pub fn GetInterBPred(
                     iMVs = pMv(LIST_0, iIIdx);
                     mc0!(blk8, LIST_0, iRefIndex0, iXOffset, iYOffset, 4, 8, iMVs);
                     iMVs = pMv(LIST_1, iIIdx);
-                    mc1!(blk8, LIST_1, iRefIndex1, iXOffset, iYOffset, 4, 8, iMVs);
-                    blend!(blk8, blk8, iRefIndex0, iRefIndex1, 4, 8);
+                    mc1!(LIST_1, iRefIndex1, iXOffset, iYOffset, 4, 8, iMVs);
+                    blend!(blk8, iRefIndex0, iRefIndex1, 4, 8);
 
                     let right = blk8.blk(4, 0);
                     iMVs = pMv(LIST_0, iIIdx + 1);
@@ -1801,7 +1860,6 @@ pub fn GetInterBPred(
                     );
                     iMVs = pMv(LIST_1, iIIdx + 1);
                     mc1!(
-                        right,
                         LIST_1,
                         iRefIndex1,
                         iXOffset + 4,
@@ -1810,7 +1868,7 @@ pub fn GetInterBPred(
                         8,
                         iMVs
                     );
-                    blend!(right, right, iRefIndex0, iRefIndex1, 4, 8);
+                    blend!(right, iRefIndex0, iRefIndex1, 4, 8);
                 } else {
                     // B_L0_4x8 B_L1_4x8
                     let listIdx = if IS_TYPE_L0(iSubMBType) {
@@ -1824,7 +1882,7 @@ pub fn GetInterBPred(
                     // The left 4x8 is weighted before the destination advances —
                     // 8.4.2.3, as for B_L0_8x4 above (`rec_mb.cpp:994-998`).
                     if bWeightedBipredIdcIs1 {
-                        WeightPrediction(pwt.as_ref(), pDec, blk8, listIdx, iRefIndex as i32, 4, 8);
+                        WeightPrediction(pwt, pDec, blk8, listIdx, iRefIndex as i32, 4, 8);
                     }
                     let right = blk8.blk(4, 0);
                     iMVs = pMv(listIdx, iIIdx + 1);
@@ -1840,7 +1898,7 @@ pub fn GetInterBPred(
                     );
                     if bWeightedBipredIdcIs1 {
                         WeightPrediction(
-                            pwt.as_ref(),
+                            pwt,
                             pDec,
                             right,
                             listIdx,
@@ -1858,10 +1916,6 @@ pub fn GetInterBPred(
                         let iBlk4Y = ((j >> 1) << 2) as i32;
 
                         let at = blk8.blk(iBlk4X as isize, iBlk4Y as isize);
-                        // Both hypotheses belong at the same 4x4 block
-                        // (`rec_mb.cpp:1023`): the LIST_1 luma destination takes the
-                        // 4x4 step, like its chroma, not the 8x8 one.
-                        let tat = at;
 
                         iMVs = pMv(LIST_0, iIIdx + iJIdx);
                         mc0!(
@@ -1876,7 +1930,6 @@ pub fn GetInterBPred(
                         );
                         iMVs = pMv(LIST_1, iIIdx + iJIdx);
                         mc1!(
-                            tat,
                             LIST_1,
                             iRefIndex1,
                             iXOffset + iBlk4X,
@@ -1885,7 +1938,7 @@ pub fn GetInterBPred(
                             4,
                             iMVs
                         );
-                        blend!(at, tat, iRefIndex0, iRefIndex1, 4, 4);
+                        blend!(at, iRefIndex0, iRefIndex1, 4, 4);
                     }
                 } else {
                     let listIdx = if IS_TYPE_L0(iSubMBType) {
@@ -1912,7 +1965,7 @@ pub fn GetInterBPred(
                         );
                         if bWeightedBipredIdcIs1 {
                             WeightPrediction(
-                                pwt.as_ref(),
+                                pwt,
                                 pDec,
                                 at,
                                 listIdx,
@@ -1934,16 +1987,9 @@ pub fn GetInterBPred(
 /// `decode_slice.cpp`.
 #[inline]
 fn temp_pred_pic<'v>(pCtx: &'v mut SliceCtx<'_>) -> Option<&'v mut SPicture> {
-    let (w, h) = {
-        let sps = pCtx.active_sps()?;
-        ((sps.iMbWidth << 4) as i32, (sps.iMbHeight << 4) as i32)
-    };
-    let needs_alloc = pCtx
-        .pTempDec
-        .as_ref()
-        .is_none_or(|p| p.iWidthInPixel != w || p.iHeightInPixel != h);
-    if needs_alloc {
-        *pCtx.pTempDec = alloc_picture(pCtx.bParseOnly, w, h);
+    let _sps = pCtx.active_sps()?;
+    if pCtx.pTempDec.is_none() {
+        *pCtx.pTempDec = alloc_picture(pCtx.bParseOnly, 16, 16);
     }
     pCtx.pTempDec.as_deref_mut()
 }
@@ -2048,7 +2094,11 @@ pub fn RecChroma(
 ) -> i32 {
     let pIdctFourResAddPredFunc = pCtx.pIdctFourResAddPredFunc;
     let (mb_x, mb_y) = (pDqLayer.iMbX as isize, pDqLayer.iMbY as isize);
-    let uiCbpC = ((*pDqLayer.grid.cbp.get(iMBXY as usize)) as u8) >> 4;
+    let uiCbpC = if pCtx.uiChromaFormatIdc() != 0 {
+        ((*pDqLayer.grid.cbp.get(iMBXY as usize)) as u8) >> 4
+    } else {
+        0
+    };
 
     if uiCbpC == 1 || uiCbpC == 2 {
         if let Some(func) = pIdctFourResAddPredFunc {
@@ -2372,12 +2422,22 @@ pub fn WelsTargetSliceConstruction(
                 }
             }
 
+            let use_fmo = pCtx
+                .pps_of(
+                    dq.sLayerInfo
+                        .sSliceInLayer
+                        .sSliceHeaderExt
+                        .sSliceHeader
+                        .pps_id,
+                )
+                .is_some_and(|pps| pps.uiNumSliceGroups > 1);
+            let bParseOnly = pCtx.bParseOnly;
+
             loop {
                 if iCountNumMb >= iTotalNumMb {
                     break;
                 }
 
-                let bParseOnly = pCtx.bParseOnly;
                 if !bParseOnly {
                     let ret = WelsTargetMbConstruction(pCtx, dq, pDec.as_deref_mut(), pRefs);
                     if ret != ERR_NONE {
@@ -2401,26 +2461,27 @@ pub fn WelsTargetSliceConstruction(
                     return ERR_INFO_MB_NUM_EXCEED_FAIL;
                 }
 
-                if pCtx
-                    .pps_of(
-                        dq.sLayerInfo
-                            .sSliceInLayer
-                            .sSliceHeaderExt
-                            .sSliceHeader
-                            .pps_id,
-                    )
-                    .is_some_and(|pps| pps.uiNumSliceGroups > 1)
-                {
+                if use_fmo {
                     iNextMbXyIndex = FmoNextMb(pCtx.active_fmo(), iNextMbXyIndex);
+                    if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbTargetLayer {
+                        break;
+                    }
+                    if dq.iMbWidth > 0 {
+                        dq.iMbX = iNextMbXyIndex % dq.iMbWidth;
+                        dq.iMbY = iNextMbXyIndex / dq.iMbWidth;
+                    }
                 } else {
                     iNextMbXyIndex += 1;
-                }
-                if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbTargetLayer {
-                    break;
-                }
-                if dq.iMbWidth > 0 {
-                    dq.iMbX = iNextMbXyIndex % dq.iMbWidth;
-                    dq.iMbY = iNextMbXyIndex / dq.iMbWidth;
+                    if iNextMbXyIndex >= iTotalMbTargetLayer {
+                        break;
+                    }
+                    if dq.iMbWidth > 0 {
+                        dq.iMbX += 1;
+                        if dq.iMbX >= dq.iMbWidth {
+                            dq.iMbX = 0;
+                            dq.iMbY += 1;
+                        }
+                    }
                 }
                 dq.iMbXyIndex = iNextMbXyIndex;
             }
@@ -2714,9 +2775,6 @@ pub fn WelsActualDecodeMbCavlcISlice(
         }
 
         if *dq.grid.cbp.get(iMbXy) != 0 || MB_TYPE_INTRA16x16 == *pDec.pMbType.get(iMbXy) {
-            let scaled_tcoeff_mb = dq.grid.scaled_tcoeff.get_mut(iMbXy);
-            scaled_tcoeff_mb.fill(0);
-
             let ret = BsGetSe(buf, pBs, &mut iCode);
             if ret != 0 {
                 return ret;
@@ -2807,6 +2865,7 @@ fn WelsDecodeMbCavlcResidual(
     };
 
     if MB_TYPE_INTRA16x16 == mb_type {
+        scaled_tcoeff_mb[..256].fill(0);
         // step 1: luma DC
         let ret = WelsResidualBlockCavlc(
             pVlcTable,
@@ -2861,6 +2920,7 @@ fn WelsDecodeMbCavlcResidual(
             };
             for iId8x8 in 0..4usize {
                 if (uiCbpL & (1 << iId8x8)) != 0 {
+                    scaled_tcoeff_mb[iId8x8 << 6..(iId8x8 + 1) << 6].fill(0);
                     let mut iIndex = (iId8x8 << 2) as i32;
                     for iId4x4 in 0..4 {
                         let len = (iScanIdxEnd as isize - iScanIdxStart as isize + 1) as i32;
@@ -2904,6 +2964,7 @@ fn WelsDecodeMbCavlcResidual(
             };
             for iId8x8 in 0..4usize {
                 if (uiCbpL & (1 << iId8x8)) != 0 {
+                    scaled_tcoeff_mb[iId8x8 << 6..(iId8x8 + 1) << 6].fill(0);
                     let mut iIndex = (iId8x8 << 2) as i32;
                     for _iId4x4 in 0..4 {
                         let len = (iScanIdxEnd as isize - iScanIdxStart as isize + 1) as i32;
@@ -2944,6 +3005,7 @@ fn WelsDecodeMbCavlcResidual(
     // chroma
     // step 1: DC
     if 1 == uiCbpC || 2 == uiCbpC {
+        scaled_tcoeff_mb[256..384].fill(0);
         for i in 0..2usize {
             let iMbResProperty = if is_intra {
                 if i != 0 { CHROMA_DC_V } else { CHROMA_DC_U }
@@ -3301,9 +3363,6 @@ pub fn WelsActualDecodeMbCavlcPSlice(
         }
 
         if *dq.grid.cbp.get(iMbXy) != 0 || MB_TYPE_INTRA16x16 == *pDec.pMbType.get(iMbXy) {
-            let scaled_tcoeff_mb = dq.grid.scaled_tcoeff.get_mut(iMbXy);
-            scaled_tcoeff_mb.fill(0);
-
             let ret = BsGetSe(buf, pBs, &mut iCode);
             if ret != 0 {
                 return ret;
@@ -3694,9 +3753,6 @@ pub fn WelsActualDecodeMbCavlcBSlice(
         }
 
         if *dq.grid.cbp.get(iMbXy) != 0 || MB_TYPE_INTRA16x16 == *pDec.pMbType.get(iMbXy) {
-            let scaled_tcoeff_mb = dq.grid.scaled_tcoeff.get_mut(iMbXy);
-            scaled_tcoeff_mb.fill(0);
-
             let ret = BsGetSe(buf, pBs, &mut iCode);
             if ret != 0 {
                 return ret;
@@ -3758,13 +3814,6 @@ pub fn WelsDecodeMbCavlcBSlice(
 ) -> i32 {
     {
         let (buf, pBs) = pNalCur.sNalData.sVclNal.sSliceBitsRead.split(pCtx.sRawData);
-        // Resolved to the one flag either is read for.
-        let ppRefPicL0 = pRefs
-            .resolve(pCtx.ref_id(LIST_0, 0), Some(&*pDec))
-            .map(|p| p.bIsComplete);
-        let ppRefPicL1 = pRefs
-            .resolve(pCtx.ref_id(LIST_1, 0), Some(&*pDec))
-            .map(|p| p.bIsComplete);
         let iMbXy = dq.iMbXyIndex as usize;
         let mut uiCode = 0u32;
 
@@ -3801,8 +3850,12 @@ pub fn WelsDecodeMbCavlcBSlice(
             (pDec.pRefIndex[LIST_1].get_mut(iMbXy)).fill(0);
 
             let bIsPending = pCtx.iThreadCount > 1;
-            let is_complete0 = ppRefPicL0.is_some_and(|c| c || bIsPending);
-            let is_complete1 = ppRefPicL1.is_some_and(|c| c || bIsPending);
+            let is_complete0 = pRefs
+                .resolve(pCtx.ref_id(LIST_0, 0), Some(&*pDec))
+                .is_some_and(|p| p.bIsComplete || bIsPending);
+            let is_complete1 = pRefs
+                .resolve(pCtx.ref_id(LIST_1, 0), Some(&*pDec))
+                .is_some_and(|p| p.bIsComplete || bIsPending);
             *pCtx.bMbRefConcealed =
                 pCtx.bRPLRError || *pCtx.bMbRefConcealed || !is_complete0 || !is_complete1;
 
@@ -4392,9 +4445,6 @@ fn WelsDecodeMbCabacResidualHelper(
                 }
             }
 
-            // The zeroing happens before the delta-QP parse.
-            dq.grid.scaled_tcoeff.get_mut(iMbXy).fill(0);
-
             let mut iQpDelta = 0i32;
             let ret = ParseDeltaQpCabac(pCtx, &mut *dq, &mut iQpDelta);
             if ret != ERR_NONE {
@@ -4414,6 +4464,7 @@ fn WelsDecodeMbCabacResidualHelper(
             }
 
             if mb_type == MB_TYPE_INTRA16x16 {
+                scaled_tcoeff_mb[..256].fill(0);
                 let ret = ParseResidualBlockCabac(
                     pNeighAvail,
                     pNonZeroCount,
@@ -4474,6 +4525,7 @@ fn WelsDecodeMbCabacResidualHelper(
                 if *dq.grid.transform_size8x8_flag.get(iMbXy) {
                     for iId8x8 in 0..4 {
                         if (uiCbpLuma & (1 << iId8x8)) != 0 {
+                            scaled_tcoeff_mb[iId8x8 * 64..(iId8x8 + 1) * 64].fill(0);
                             let iIdx = iId8x8 * 4;
                             let len = (iScanIdxEnd as isize - iScanIdxStart as isize + 1) as i32;
                             let scan_ptr = &g_kuiZigzagScan8x8[iScanIdxStart..];
@@ -4517,6 +4569,7 @@ fn WelsDecodeMbCabacResidualHelper(
                     };
                     for iId8x8 in 0..4 {
                         if (uiCbpLuma & (1 << iId8x8)) != 0 {
+                            scaled_tcoeff_mb[iId8x8 * 64..(iId8x8 + 1) * 64].fill(0);
                             let mut iIdx = iId8x8 * 4;
                             for _ in 0..4 {
                                 let len =
@@ -4559,6 +4612,7 @@ fn WelsDecodeMbCabacResidualHelper(
             }
 
             if uiCbpChroma == 1 || uiCbpChroma == 2 {
+                scaled_tcoeff_mb[256..384].fill(0);
                 for i in 0..2 {
                     let res_prop = if IS_INTRA(mb_type) {
                         if i != 0 { CHROMA_DC_V } else { CHROMA_DC_U }
@@ -5421,6 +5475,9 @@ pub fn WelsDecodeSlice(
         )
         .map_or(0, |sps| sps.uiTotalMbCount as i32);
 
+    let use_fmo = pCtx
+        .active_pps()
+        .is_some_and(|pps| pps.uiNumSliceGroups > 1);
     let mut uiEosFlag: u32 = 0;
 
     loop {
@@ -5451,17 +5508,21 @@ pub fn WelsDecodeSlice(
             break;
         }
 
-        if pCtx
-            .active_pps()
-            .is_some_and(|pps| pps.uiNumSliceGroups > 1)
-        {
+        if use_fmo {
             iNextMbXyIndex = FmoNextMb(pCtx.active_fmo(), iNextMbXyIndex);
+            if pCurDqLayer.iMbWidth > 0 {
+                pCurDqLayer.iMbX = iNextMbXyIndex % pCurDqLayer.iMbWidth;
+                pCurDqLayer.iMbY = iNextMbXyIndex / pCurDqLayer.iMbWidth;
+            }
         } else {
             iNextMbXyIndex += 1;
-        }
-        if pCurDqLayer.iMbWidth > 0 {
-            pCurDqLayer.iMbX = iNextMbXyIndex % pCurDqLayer.iMbWidth;
-            pCurDqLayer.iMbY = iNextMbXyIndex / pCurDqLayer.iMbWidth;
+            if pCurDqLayer.iMbWidth > 0 {
+                pCurDqLayer.iMbX += 1;
+                if pCurDqLayer.iMbX >= pCurDqLayer.iMbWidth {
+                    pCurDqLayer.iMbX = 0;
+                    pCurDqLayer.iMbY += 1;
+                }
+            }
         }
         pCurDqLayer.iMbXyIndex = iNextMbXyIndex;
     }

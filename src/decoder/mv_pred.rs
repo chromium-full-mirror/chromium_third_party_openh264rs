@@ -1167,9 +1167,10 @@ pub fn MapColToList0(
 // ============================================================================
 
 /// Updates motion vector and reference index cache for a 16x16 macroblock.
+#[inline(always)]
 pub fn UpdateP16x16MotionInfo(
     pCurDqLayer: &mut DqLayerState,
-    mut pDec: Option<&mut SPicture>,
+    pDec: Option<&mut SPicture>,
     listIdx: usize,
     iRef: i8,
     iMVs: &[i16; 2],
@@ -1177,39 +1178,17 @@ pub fn UpdateP16x16MotionInfo(
     let kiMV = *iMVs;
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
 
-    for i in (0..16).step_by(4) {
-        let kuiScan4Idx = g_kuiScan4[i] as usize;
-        let kuiScan4IdxPlus4 = 4 + kuiScan4Idx;
-
-        if let Some(pic) = pDec.as_deref_mut() {
-            let ref_ptr = pic.pRefIndex[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
-
-            let mv_ptr = pic.pMv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        } else {
-            let ref_ptr = pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
-
-            let mv_ptr = pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        }
+    if let Some(pic) = pDec {
+        *pic.pRefIndex[listIdx].get_mut(iMbXy) = [iRef; 16];
+        *pic.pMv[listIdx].get_mut(iMbXy) = [kiMV; 16];
+    } else {
+        *pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy) = [iRef; 16];
+        *pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy) = [kiMV; 16];
     }
 }
 
 /// Updates reference index cache for a 16x16 macroblock.
+#[inline(always)]
 pub fn UpdateP16x16RefIdx(
     pCurDqLayer: &mut DqLayerState,
     pDec: Option<&mut SPicture>,
@@ -1219,52 +1198,33 @@ pub fn UpdateP16x16RefIdx(
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
 
     if let Some(pic) = pDec {
-        let ref_ptr = pic.pRefIndex[listIdx as usize].get_mut(iMbXy);
-        for i in (0..16).step_by(4) {
-            let kuiScan4Idx = g_kuiScan4[i] as usize;
-            let kuiScan4IdxPlus4 = 4 + kuiScan4Idx;
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
-        }
+        *pic.pRefIndex[listIdx as usize].get_mut(iMbXy) = [iRef; 16];
     }
 }
 
 /// Updates motion vector only cache for a 16x16 macroblock.
+#[inline(always)]
 pub fn UpdateP16x16MotionOnly(
     pCurDqLayer: &mut DqLayerState,
-    mut pDec: Option<&mut SPicture>,
+    pDec: Option<&mut SPicture>,
     listIdx: i32,
     iMVs: &[i16; 2],
 ) {
     let kiMV = *iMVs;
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
 
-    for i in (0..16).step_by(4) {
-        let kuiScan4Idx = g_kuiScan4[i] as usize;
-        let kuiScan4IdxPlus4 = 4 + kuiScan4Idx;
-
-        if let Some(pic) = pDec.as_deref_mut() {
-            let mv_ptr = pic.pMv[listIdx as usize].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        } else {
-            let mv_ptr = pCurDqLayer.grid.mv[listIdx as usize].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        }
+    if let Some(pic) = pDec {
+        *pic.pMv[listIdx as usize].get_mut(iMbXy) = [kiMV; 16];
+    } else {
+        *pCurDqLayer.grid.mv[listIdx as usize].get_mut(iMbXy) = [kiMV; 16];
     }
 }
 
 /// Updates reference index and motion vector caches for a 16x8 macroblock partition.
+#[inline(always)]
 pub fn UpdateP16x8MotionInfo(
     pCurDqLayer: &mut DqLayerState,
-    mut pDec: Option<&mut SPicture>,
+    pDec: Option<&mut SPicture>,
     iMotionVector: &mut [[[i16; 2]; 30]; LIST_A],
     iRefIndex: &mut [[i8; 30]; LIST_A],
     listIdx: usize,
@@ -1274,6 +1234,19 @@ pub fn UpdateP16x8MotionInfo(
 ) {
     let kiMV = *iMVs;
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
+    let (ref_ptr, mv_ptr) = if let Some(pic) = pDec {
+        (
+            pic.pRefIndex[listIdx].get_mut(iMbXy),
+            pic.pMv[listIdx].get_mut(iMbXy),
+        )
+    } else {
+        (
+            pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy),
+            pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy),
+        )
+    };
+    let ref_cache_ptr = &mut iRefIndex[listIdx];
+    let mv_cache_ptr = &mut iMotionVector[listIdx];
 
     for _ in 0..2 {
         let kuiScan4Idx = g_kuiScan4[iPartIdx] as usize;
@@ -1281,56 +1254,35 @@ pub fn UpdateP16x8MotionInfo(
         let kuiCacheIdx = g_kuiCache30ScanIdx[iPartIdx] as usize;
         let kuiCacheIdxPlus6 = 6 + kuiCacheIdx;
 
-        if let Some(pic) = pDec.as_deref_mut() {
-            let ref_ptr = pic.pRefIndex[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
+        ref_ptr[kuiScan4Idx] = iRef;
+        ref_ptr[kuiScan4Idx + 1] = iRef;
+        ref_ptr[kuiScan4IdxPlus4] = iRef;
+        ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
 
-            let mv_ptr = pic.pMv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        } else {
-            let ref_ptr = pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
+        mv_ptr[kuiScan4Idx] = kiMV;
+        mv_ptr[1 + kuiScan4Idx] = kiMV;
+        mv_ptr[kuiScan4IdxPlus4] = kiMV;
+        mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
 
-            let mv_ptr = pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        }
+        ref_cache_ptr[kuiCacheIdx] = iRef;
+        ref_cache_ptr[kuiCacheIdx + 1] = iRef;
+        ref_cache_ptr[kuiCacheIdxPlus6] = iRef;
+        ref_cache_ptr[kuiCacheIdxPlus6 + 1] = iRef;
 
-        {
-            let ref_cache_ptr = &mut iRefIndex[listIdx];
-            ref_cache_ptr[kuiCacheIdx] = iRef;
-            ref_cache_ptr[kuiCacheIdx + 1] = iRef;
-            ref_cache_ptr[kuiCacheIdxPlus6] = iRef;
-            ref_cache_ptr[kuiCacheIdxPlus6 + 1] = iRef;
-        }
-
-        {
-            let mv_cache_ptr = &mut iMotionVector[listIdx];
-            mv_cache_ptr[kuiCacheIdx] = kiMV;
-            mv_cache_ptr[1 + kuiCacheIdx] = kiMV;
-            mv_cache_ptr[kuiCacheIdxPlus6] = kiMV;
-            mv_cache_ptr[1 + kuiCacheIdxPlus6] = kiMV;
-        }
+        mv_cache_ptr[kuiCacheIdx] = kiMV;
+        mv_cache_ptr[1 + kuiCacheIdx] = kiMV;
+        mv_cache_ptr[kuiCacheIdxPlus6] = kiMV;
+        mv_cache_ptr[1 + kuiCacheIdxPlus6] = kiMV;
 
         iPartIdx += 4;
     }
 }
 
 /// Updates reference index and motion vector caches for an 8x16 macroblock partition.
+#[inline(always)]
 pub fn UpdateP8x16MotionInfo(
     pCurDqLayer: &mut DqLayerState,
-    mut pDec: Option<&mut SPicture>,
+    pDec: Option<&mut SPicture>,
     iMotionVector: &mut [[[i16; 2]; 30]; LIST_A],
     iRefIndex: &mut [[i8; 30]; LIST_A],
     listIdx: usize,
@@ -1340,6 +1292,19 @@ pub fn UpdateP8x16MotionInfo(
 ) {
     let kiMV = *iMVs;
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
+    let (ref_ptr, mv_ptr) = if let Some(pic) = pDec {
+        (
+            pic.pRefIndex[listIdx].get_mut(iMbXy),
+            pic.pMv[listIdx].get_mut(iMbXy),
+        )
+    } else {
+        (
+            pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy),
+            pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy),
+        )
+    };
+    let ref_cache_ptr = &mut iRefIndex[listIdx];
+    let mv_cache_ptr = &mut iMotionVector[listIdx];
 
     for _ in 0..2 {
         let kuiScan4Idx = g_kuiScan4[iPartIdx] as usize;
@@ -1347,53 +1312,32 @@ pub fn UpdateP8x16MotionInfo(
         let kuiScan4IdxPlus4 = 4 + kuiScan4Idx;
         let kuiCacheIdxPlus6 = 6 + kuiCacheIdx;
 
-        if let Some(pic) = pDec.as_deref_mut() {
-            let ref_ptr = pic.pRefIndex[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
+        ref_ptr[kuiScan4Idx] = iRef;
+        ref_ptr[kuiScan4Idx + 1] = iRef;
+        ref_ptr[kuiScan4IdxPlus4] = iRef;
+        ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
 
-            let mv_ptr = pic.pMv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        } else {
-            let ref_ptr = pCurDqLayer.grid.ref_index[listIdx].get_mut(iMbXy);
-            ref_ptr[kuiScan4Idx] = iRef;
-            ref_ptr[kuiScan4Idx + 1] = iRef;
-            ref_ptr[kuiScan4IdxPlus4] = iRef;
-            ref_ptr[kuiScan4IdxPlus4 + 1] = iRef;
+        mv_ptr[kuiScan4Idx] = kiMV;
+        mv_ptr[1 + kuiScan4Idx] = kiMV;
+        mv_ptr[kuiScan4IdxPlus4] = kiMV;
+        mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
 
-            let mv_ptr = pCurDqLayer.grid.mv[listIdx].get_mut(iMbXy);
-            mv_ptr[kuiScan4Idx] = kiMV;
-            mv_ptr[1 + kuiScan4Idx] = kiMV;
-            mv_ptr[kuiScan4IdxPlus4] = kiMV;
-            mv_ptr[1 + kuiScan4IdxPlus4] = kiMV;
-        }
+        ref_cache_ptr[kuiCacheIdx] = iRef;
+        ref_cache_ptr[kuiCacheIdx + 1] = iRef;
+        ref_cache_ptr[kuiCacheIdxPlus6] = iRef;
+        ref_cache_ptr[kuiCacheIdxPlus6 + 1] = iRef;
 
-        {
-            let ref_cache_ptr = &mut iRefIndex[listIdx];
-            ref_cache_ptr[kuiCacheIdx] = iRef;
-            ref_cache_ptr[kuiCacheIdx + 1] = iRef;
-            ref_cache_ptr[kuiCacheIdxPlus6] = iRef;
-            ref_cache_ptr[kuiCacheIdxPlus6 + 1] = iRef;
-        }
-
-        {
-            let mv_cache_ptr = &mut iMotionVector[listIdx];
-            mv_cache_ptr[kuiCacheIdx] = kiMV;
-            mv_cache_ptr[1 + kuiCacheIdx] = kiMV;
-            mv_cache_ptr[kuiCacheIdxPlus6] = kiMV;
-            mv_cache_ptr[1 + kuiCacheIdxPlus6] = kiMV;
-        }
+        mv_cache_ptr[kuiCacheIdx] = kiMV;
+        mv_cache_ptr[1 + kuiCacheIdx] = kiMV;
+        mv_cache_ptr[kuiCacheIdxPlus6] = kiMV;
+        mv_cache_ptr[1 + kuiCacheIdxPlus6] = kiMV;
 
         iPartIdx += 8;
     }
 }
 
 /// Updates reference index cache for an 8x8 macroblock partition.
+#[inline(always)]
 pub fn Update8x8RefIdx(
     pCurDqLayer: &mut DqLayerState,
     pDec: &mut SPicture,
@@ -1432,27 +1376,14 @@ pub fn UpdateP8x8DirectCabac(pCurDqLayer: &mut DqLayerState, iPartIdx: i32) {
 #[inline(always)]
 pub fn UpdateP16x16DirectCabac(pCurDqLayer: &mut DqLayerState) {
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
-    {
-        let direct_ptr = pCurDqLayer.grid.direct.get_mut(iMbXy);
-        for i in (0..16).step_by(4) {
-            let kuiScan4Idx = g_kuiScan4[i] as usize;
-            let kuiScan4IdxPlus4 = 4 + kuiScan4Idx;
-            direct_ptr[kuiScan4Idx] = 1;
-            direct_ptr[kuiScan4Idx + 1] = 1;
-            direct_ptr[kuiScan4IdxPlus4] = 1;
-            direct_ptr[kuiScan4IdxPlus4 + 1] = 1;
-        }
-    }
+    *pCurDqLayer.grid.direct.get_mut(iMbXy) = [1; 16];
 }
 
 #[inline(always)]
 pub fn UpdateP16x16MvdCabac(pCurDqLayer: &mut DqLayerState, pMvd: &[i16; 2], iListIdx: i32) {
     let kMvd = *pMvd;
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
-    let mvd = pCurDqLayer.grid.mvd[iListIdx as usize].get_mut(iMbXy);
-    for i in 0..16 {
-        mvd[i] = kMvd;
-    }
+    *pCurDqLayer.grid.mvd[iListIdx as usize].get_mut(iMbXy) = [kMvd; 16];
 }
 
 // ============================================================================
@@ -1474,23 +1405,54 @@ pub fn FillSpatialDirect8x8Mv(
     mut pMvdCache: Option<&mut [[[i16; 2]; 30]; LIST_A]>,
 ) {
     let iMbXy = pCurDqLayer.iMbXyIndex as usize;
+    let check_col_zero = pMvDirect[LIST_0] != [0, 0] || pMvDirect[LIST_1] != [0, 0];
 
     for j in 0..iPartCount as i32 {
         let iPartIdx = (iIdx8 as i32 + j * iPartW as i32) as usize;
         let iScan4Idx = g_kuiScan4[iPartIdx] as usize;
-        let iColocIdx = g_kuiScan4[iPartIdx] as usize;
+        let iColocIdx = iScan4Idx;
         let iCacheIdx = g_kuiCache30ScanIdx[iPartIdx] as usize;
 
-        let mut pMV = [[0i16; 2]; 2];
+        let mut mv_l0 = pMvDirect[LIST_0];
+        let mut mv_l1 = pMvDirect[LIST_1];
+
+        if check_col_zero {
+            let uiColZeroFlag = (0 == pCurDqLayer.iColocIntra[iColocIdx])
+                && !bIsLongRef
+                && (pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] == 0
+                    || (pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] < 0
+                        && pCurDqLayer.iColocRefIndex[LIST_1][iColocIdx] == 0));
+            if uiColZeroFlag {
+                let colocList = if 0 == pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] {
+                    LIST_0
+                } else {
+                    LIST_1
+                };
+                let mv = pCurDqLayer.iColocMv[colocList][iColocIdx];
+                if (mv[0] as i32 + 1) as u32 <= 2 && (mv[1] as i32 + 1) as u32 <= 2 {
+                    if iRef[LIST_0] == 0 {
+                        mv_l0 = [0, 0];
+                    }
+                    if iRef[LIST_1] == 0 {
+                        mv_l1 = [0, 0];
+                    }
+                }
+            }
+        }
+
         if IS_SUB_8x8(subMbType) {
-            pMV[0] = pMvDirect[LIST_0];
-            pMV[1] = pMV[0];
             if let Some(pic) = pDec.as_deref_mut() {
                 let dec_mv_l0 = pic.pMv[LIST_0].get_mut(iMbXy);
-                dec_mv_l0[iScan4Idx] = pMV[0];
-                dec_mv_l0[iScan4Idx + 1] = pMV[1];
-                dec_mv_l0[iScan4Idx + 4] = pMV[0];
-                dec_mv_l0[iScan4Idx + 4 + 1] = pMV[1];
+                dec_mv_l0[iScan4Idx] = mv_l0;
+                dec_mv_l0[iScan4Idx + 1] = mv_l0;
+                dec_mv_l0[iScan4Idx + 4] = mv_l0;
+                dec_mv_l0[iScan4Idx + 4 + 1] = mv_l0;
+
+                let dec_mv_l1 = pic.pMv[LIST_1].get_mut(iMbXy);
+                dec_mv_l1[iScan4Idx] = mv_l1;
+                dec_mv_l1[iScan4Idx + 1] = mv_l1;
+                dec_mv_l1[iScan4Idx + 4] = mv_l1;
+                dec_mv_l1[iScan4Idx + 4 + 1] = mv_l1;
             }
             {
                 let mvd_l0 = pCurDqLayer.grid.mvd[LIST_0].get_mut(iMbXy);
@@ -1498,32 +1460,7 @@ pub fn FillSpatialDirect8x8Mv(
                 mvd_l0[iScan4Idx + 1] = [0, 0];
                 mvd_l0[iScan4Idx + 4] = [0, 0];
                 mvd_l0[iScan4Idx + 4 + 1] = [0, 0];
-            }
-            if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                let mv_cache_l0 = &mut pMotionVector[LIST_0];
-                mv_cache_l0[iCacheIdx] = pMV[0];
-                mv_cache_l0[iCacheIdx + 1] = pMV[1];
-                mv_cache_l0[iCacheIdx + 6] = pMV[0];
-                mv_cache_l0[iCacheIdx + 6 + 1] = pMV[1];
-            }
-            if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                let mvd_cache_l0 = &mut pMvdCache[LIST_0];
-                mvd_cache_l0[iCacheIdx] = [0, 0];
-                mvd_cache_l0[iCacheIdx + 1] = [0, 0];
-                mvd_cache_l0[iCacheIdx + 6] = [0, 0];
-                mvd_cache_l0[iCacheIdx + 6 + 1] = [0, 0];
-            }
 
-            pMV[0] = pMvDirect[LIST_1];
-            pMV[1] = pMV[0];
-            if let Some(pic) = pDec.as_deref_mut() {
-                let dec_mv_l1 = pic.pMv[LIST_1].get_mut(iMbXy);
-                dec_mv_l1[iScan4Idx] = pMV[0];
-                dec_mv_l1[iScan4Idx + 1] = pMV[1];
-                dec_mv_l1[iScan4Idx + 4] = pMV[0];
-                dec_mv_l1[iScan4Idx + 4 + 1] = pMV[1];
-            }
-            {
                 let mvd_l1 = pCurDqLayer.grid.mvd[LIST_1].get_mut(iMbXy);
                 mvd_l1[iScan4Idx] = [0, 0];
                 mvd_l1[iScan4Idx + 1] = [0, 0];
@@ -1531,13 +1468,25 @@ pub fn FillSpatialDirect8x8Mv(
                 mvd_l1[iScan4Idx + 4 + 1] = [0, 0];
             }
             if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
+                let mv_cache_l0 = &mut pMotionVector[LIST_0];
+                mv_cache_l0[iCacheIdx] = mv_l0;
+                mv_cache_l0[iCacheIdx + 1] = mv_l0;
+                mv_cache_l0[iCacheIdx + 6] = mv_l0;
+                mv_cache_l0[iCacheIdx + 6 + 1] = mv_l0;
+
                 let mv_cache_l1 = &mut pMotionVector[LIST_1];
-                mv_cache_l1[iCacheIdx] = pMV[0];
-                mv_cache_l1[iCacheIdx + 1] = pMV[1];
-                mv_cache_l1[iCacheIdx + 6] = pMV[0];
-                mv_cache_l1[iCacheIdx + 6 + 1] = pMV[1];
+                mv_cache_l1[iCacheIdx] = mv_l1;
+                mv_cache_l1[iCacheIdx + 1] = mv_l1;
+                mv_cache_l1[iCacheIdx + 6] = mv_l1;
+                mv_cache_l1[iCacheIdx + 6 + 1] = mv_l1;
             }
             if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
+                let mvd_cache_l0 = &mut pMvdCache[LIST_0];
+                mvd_cache_l0[iCacheIdx] = [0, 0];
+                mvd_cache_l0[iCacheIdx + 1] = [0, 0];
+                mvd_cache_l0[iCacheIdx + 6] = [0, 0];
+                mvd_cache_l0[iCacheIdx + 6 + 1] = [0, 0];
+
                 let mvd_cache_l1 = &mut pMvdCache[LIST_1];
                 mvd_cache_l1[iCacheIdx] = [0, 0];
                 mvd_cache_l1[iCacheIdx + 1] = [0, 0];
@@ -1545,164 +1494,21 @@ pub fn FillSpatialDirect8x8Mv(
                 mvd_cache_l1[iCacheIdx + 6 + 1] = [0, 0];
             }
         } else {
-            pMV[0] = pMvDirect[LIST_0];
             if let Some(pic) = pDec.as_deref_mut() {
-                let dec_mv_l0 = pic.pMv[LIST_0].get_mut(iMbXy);
-                dec_mv_l0[iScan4Idx] = pMV[0];
+                pic.pMv[LIST_0].get_mut(iMbXy)[iScan4Idx] = mv_l0;
+                pic.pMv[LIST_1].get_mut(iMbXy)[iScan4Idx] = mv_l1;
             }
             {
-                let mvd_l0 = pCurDqLayer.grid.mvd[LIST_0].get_mut(iMbXy);
-                mvd_l0[iScan4Idx] = [0, 0];
+                pCurDqLayer.grid.mvd[LIST_0].get_mut(iMbXy)[iScan4Idx] = [0, 0];
+                pCurDqLayer.grid.mvd[LIST_1].get_mut(iMbXy)[iScan4Idx] = [0, 0];
             }
             if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                let mv_cache_l0 = &mut pMotionVector[LIST_0];
-                mv_cache_l0[iCacheIdx] = pMV[0];
+                pMotionVector[LIST_0][iCacheIdx] = mv_l0;
+                pMotionVector[LIST_1][iCacheIdx] = mv_l1;
             }
             if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                let mvd_cache_l0 = &mut pMvdCache[LIST_0];
-                mvd_cache_l0[iCacheIdx] = [0, 0];
-            }
-
-            pMV[0] = pMvDirect[LIST_1];
-            if let Some(pic) = pDec.as_deref_mut() {
-                let dec_mv_l1 = pic.pMv[LIST_1].get_mut(iMbXy);
-                dec_mv_l1[iScan4Idx] = pMV[0];
-            }
-            {
-                let mvd_l1 = pCurDqLayer.grid.mvd[LIST_1].get_mut(iMbXy);
-                mvd_l1[iScan4Idx] = [0, 0];
-            }
-            if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                let mv_cache_l1 = &mut pMotionVector[LIST_1];
-                mv_cache_l1[iCacheIdx] = pMV[0];
-            }
-            if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                let mvd_cache_l1 = &mut pMvdCache[LIST_1];
-                mvd_cache_l1[iCacheIdx] = [0, 0];
-            }
-        }
-
-        if pMvDirect[LIST_0] != [0, 0] || pMvDirect[LIST_1] != [0, 0] {
-            let uiColZeroFlag = (0 == pCurDqLayer.iColocIntra[iColocIdx])
-                && !bIsLongRef
-                && (pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] == 0
-                    || (pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] < 0
-                        && pCurDqLayer.iColocRefIndex[LIST_1][iColocIdx] == 0));
-
-            let colocList = if 0 == pCurDqLayer.iColocRefIndex[LIST_0][iColocIdx] {
-                LIST_0
-            } else {
-                LIST_1
-            };
-            let mv = pCurDqLayer.iColocMv[colocList][iColocIdx];
-
-            if IS_SUB_8x8(subMbType) {
-                if uiColZeroFlag
-                    && ((mv[0] as i32 + 1) as u32 <= 2 && (mv[1] as i32 + 1) as u32 <= 2)
-                {
-                    if iRef[LIST_0] == 0 {
-                        if let Some(pic) = pDec.as_deref_mut() {
-                            let dec_mv_l0 = pic.pMv[LIST_0].get_mut(iMbXy);
-                            dec_mv_l0[iScan4Idx] = [0, 0];
-                            dec_mv_l0[iScan4Idx + 1] = [0, 0];
-                            dec_mv_l0[iScan4Idx + 4] = [0, 0];
-                            dec_mv_l0[iScan4Idx + 4 + 1] = [0, 0];
-                        }
-                        {
-                            let mvd_l0 = pCurDqLayer.grid.mvd[LIST_0].get_mut(iMbXy);
-                            mvd_l0[iScan4Idx] = [0, 0];
-                            mvd_l0[iScan4Idx + 1] = [0, 0];
-                            mvd_l0[iScan4Idx + 4] = [0, 0];
-                            mvd_l0[iScan4Idx + 4 + 1] = [0, 0];
-                        }
-                        if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                            let mv_cache_l0 = &mut pMotionVector[LIST_0];
-                            mv_cache_l0[iCacheIdx] = [0, 0];
-                            mv_cache_l0[iCacheIdx + 1] = [0, 0];
-                            mv_cache_l0[iCacheIdx + 6] = [0, 0];
-                            mv_cache_l0[iCacheIdx + 6 + 1] = [0, 0];
-                        }
-                        if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                            let mvd_cache_l0 = &mut pMvdCache[LIST_0];
-                            mvd_cache_l0[iCacheIdx] = [0, 0];
-                            mvd_cache_l0[iCacheIdx + 1] = [0, 0];
-                            mvd_cache_l0[iCacheIdx + 6] = [0, 0];
-                            mvd_cache_l0[iCacheIdx + 6 + 1] = [0, 0];
-                        }
-                    }
-
-                    if iRef[LIST_1] == 0 {
-                        if let Some(pic) = pDec.as_deref_mut() {
-                            let dec_mv_l1 = pic.pMv[LIST_1].get_mut(iMbXy);
-                            dec_mv_l1[iScan4Idx] = [0, 0];
-                            dec_mv_l1[iScan4Idx + 1] = [0, 0];
-                            dec_mv_l1[iScan4Idx + 4] = [0, 0];
-                            dec_mv_l1[iScan4Idx + 4 + 1] = [0, 0];
-                        }
-                        {
-                            let mvd_l1 = pCurDqLayer.grid.mvd[LIST_1].get_mut(iMbXy);
-                            mvd_l1[iScan4Idx] = [0, 0];
-                            mvd_l1[iScan4Idx + 1] = [0, 0];
-                            mvd_l1[iScan4Idx + 4] = [0, 0];
-                            mvd_l1[iScan4Idx + 4 + 1] = [0, 0];
-                        }
-                        if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                            let mv_cache_l1 = &mut pMotionVector[LIST_1];
-                            mv_cache_l1[iCacheIdx] = [0, 0];
-                            mv_cache_l1[iCacheIdx + 1] = [0, 0];
-                            mv_cache_l1[iCacheIdx + 6] = [0, 0];
-                            mv_cache_l1[iCacheIdx + 6 + 1] = [0, 0];
-                        }
-                        if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                            let mvd_cache_l1 = &mut pMvdCache[LIST_1];
-                            mvd_cache_l1[iCacheIdx] = [0, 0];
-                            mvd_cache_l1[iCacheIdx + 1] = [0, 0];
-                            mvd_cache_l1[iCacheIdx + 6] = [0, 0];
-                            mvd_cache_l1[iCacheIdx + 6 + 1] = [0, 0];
-                        }
-                    }
-                }
-            } else {
-                if uiColZeroFlag
-                    && ((mv[0] as i32 + 1) as u32 <= 2 && (mv[1] as i32 + 1) as u32 <= 2)
-                {
-                    if iRef[LIST_0] == 0 {
-                        if let Some(pic) = pDec.as_deref_mut() {
-                            let dec_mv_l0 = pic.pMv[LIST_0].get_mut(iMbXy);
-                            dec_mv_l0[iScan4Idx] = [0, 0];
-                        }
-                        {
-                            let mvd_l0 = pCurDqLayer.grid.mvd[LIST_0].get_mut(iMbXy);
-                            mvd_l0[iScan4Idx] = [0, 0];
-                        }
-                        if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                            let mv_cache_l0 = &mut pMotionVector[LIST_0];
-                            mv_cache_l0[iCacheIdx] = [0, 0];
-                        }
-                        if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                            let mvd_cache_l0 = &mut pMvdCache[LIST_0];
-                            mvd_cache_l0[iCacheIdx] = [0, 0];
-                        }
-                    }
-                    if iRef[LIST_1] == 0 {
-                        if let Some(pic) = pDec.as_deref_mut() {
-                            let dec_mv_l1 = pic.pMv[LIST_1].get_mut(iMbXy);
-                            dec_mv_l1[iScan4Idx] = [0, 0];
-                        }
-                        {
-                            let mvd_l1 = pCurDqLayer.grid.mvd[LIST_1].get_mut(iMbXy);
-                            mvd_l1[iScan4Idx] = [0, 0];
-                        }
-                        if let Some(pMotionVector) = pMotionVector.as_deref_mut() {
-                            let mv_cache_l1 = &mut pMotionVector[LIST_1];
-                            mv_cache_l1[iCacheIdx] = [0, 0];
-                        }
-                        if let Some(pMvdCache) = pMvdCache.as_deref_mut() {
-                            let mvd_cache_l1 = &mut pMvdCache[LIST_1];
-                            mvd_cache_l1[iCacheIdx] = [0, 0];
-                        }
-                    }
-                }
+                pMvdCache[LIST_0][iCacheIdx] = [0, 0];
+                pMvdCache[LIST_1][iCacheIdx] = [0, 0];
             }
         }
     }

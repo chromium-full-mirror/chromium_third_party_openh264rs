@@ -954,13 +954,13 @@ pub struct SliceCtx<'a> {
 
 impl<'a> SliceCtx<'a> {
     /// [`sps_of`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn sps_of(&self, r: Option<SpsRef>) -> Option<&SSps> {
         let r = r?;
-        if r.id < 0 || r.id as usize >= MAX_SPS_COUNT + 1 {
+        let i = r.id as usize;
+        if i >= MAX_SPS_COUNT + 1 {
             return None;
         }
-        let i = r.id as usize;
         Some(if r.subset {
             &self.sSpsPpsCtx.sSubsetSpsBuffer[i].sSps
         } else {
@@ -969,39 +969,39 @@ impl<'a> SliceCtx<'a> {
     }
 
     /// [`pps_of`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn pps_of(&self, id: Option<i32>) -> Option<&SPps> {
-        let id = id?;
-        if id < 0 || id as usize >= MAX_PPS_COUNT + 1 {
+        let i = id? as usize;
+        if i >= MAX_PPS_COUNT + 1 {
             return None;
         }
-        Some(&self.sSpsPpsCtx.sPpsBuffer[id as usize])
+        Some(&self.sSpsPpsCtx.sPpsBuffer[i])
     }
 
     /// [`active_sps`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn active_sps(&self) -> Option<&SSps> {
         self.sps_of(self.active_sps)
     }
 
     /// [`active_pps`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn active_pps(&self) -> Option<&SPps> {
         self.pps_of(self.active_pps)
     }
 
     /// [`active_fmo`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn active_fmo(&self) -> Option<&SFmo> {
-        let id = self.fmo_id?;
-        if id < 0 || id as usize >= MAX_PPS_COUNT {
+        let i = self.fmo_id? as usize;
+        if i >= MAX_PPS_COUNT {
             return None;
         }
-        Some(&self.sFmoList[id as usize])
+        Some(&self.sFmoList[i])
     }
 
     /// [`ref_id`] against the view.
-    #[inline]
+    #[inline(always)]
     pub fn ref_id(&self, list: usize, i: usize) -> Option<PicId> {
         self.sRefPic.pRefList[list][i]
     }
@@ -1009,13 +1009,13 @@ impl<'a> SliceCtx<'a> {
     /// The active SPS's `uiChromaFormatIdc`. 0 (monochrome) with no active SPS, a
     /// state the slice tree cannot reach: a slice header that activates no SPS never
     /// gets here.
-    #[inline]
+    #[inline(always)]
     pub fn uiChromaFormatIdc(&self) -> u8 {
         self.active_sps().map_or(0, |sps| sps.uiChromaFormatIdc)
     }
 
     /// The active PPS's `bTransform8x8ModeFlag`. `false` with no active PPS.
-    #[inline]
+    #[inline(always)]
     pub fn bTransform8x8ModeFlag(&self) -> bool {
         self.active_pps()
             .is_some_and(|pps| pps.bTransform8x8ModeFlag)

@@ -96,16 +96,11 @@ fn neg_num(x: i32) -> i32 {
 /// Mirrors `BsGetTrailingBits` (`codec/decoder/core/inc/dec_golomb.h`).
 #[inline]
 pub fn trailing_bits(byte: u8) -> i32 {
-    let mut value = byte as u32;
-    let mut n = 0;
-    while n < 9 {
-        if value & 1 != 0 {
-            return n;
-        }
-        value >>= 1;
-        n += 1;
+    if byte == 0 {
+        0
+    } else {
+        byte.trailing_zeros() as i32
     }
-    0
 }
 
 impl BsCursor {
@@ -151,13 +146,19 @@ impl BsCursor {
         if buf.len() < self.pos + kiSeedBytes {
             return Err(ErrInfo::READ_OVERFLOW);
         }
-        let mut cur_bits = 0u32;
-        for i in 0..4 {
-            cur_bits <<= 8;
-            if i < kiSeedBytes {
-                cur_bits |= buf[self.pos + i] as u32;
+        let cur_bits = if kiSeedBytes == 4 {
+            let chunk: &[u8; 4] = buf[self.pos..self.pos + 4].try_into().unwrap();
+            u32::from_be_bytes(*chunk)
+        } else {
+            let mut cur_bits = 0u32;
+            for i in 0..4 {
+                cur_bits <<= 8;
+                if i < kiSeedBytes {
+                    cur_bits |= buf[self.pos + i] as u32;
+                }
             }
-        }
+            cur_bits
+        };
         self.cur_bits = cur_bits;
         self.pos += 4;
         self.left_bits = -16;
@@ -224,23 +225,34 @@ impl BsCursor {
     ///
     /// Mirrors `DUMP_BITS_AUX` (`codec/decoder/core/inc/dec_golomb.h`), the refill under every read
     /// below — see [`get_bits`](Self::get_bits) for the slack contract.
+    #[inline]
     fn dump_bits(&mut self, buf: &[u8], n: i32) -> Result<(), ErrInfo> {
         self.cur_bits = self.cur_bits.wrapping_shl(n as u32);
         self.left_bits += n;
         if self.left_bits > 0 {
-            // The refill may sit one byte past the logical end, no further.
-            if self.pos > self.len + 1 {
-                return Err(ErrInfo::READ_OVERFLOW);
-            }
-            let mut word = 0u32;
-            if self.pos < self.len {
-                let b0 = *buf.get(self.pos).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
-                word = b0 << 8;
-            }
-            if self.pos + 1 < self.len {
-                let b1 = *buf.get(self.pos + 1).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
-                word |= b1;
-            }
+            let word = if self.pos + 2 <= self.len {
+                let &[b0, b1] = buf
+                    .get(self.pos..self.pos + 2)
+                    .ok_or(ErrInfo::READ_OVERFLOW)?
+                    .first_chunk::<2>()
+                    .unwrap();
+                u16::from_be_bytes([b0, b1]) as u32
+            } else {
+                // The refill may sit one byte past the logical end, no further.
+                if self.pos > self.len + 1 {
+                    return Err(ErrInfo::READ_OVERFLOW);
+                }
+                let mut w = 0u32;
+                if self.pos < self.len {
+                    let b0 = *buf.get(self.pos).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
+                    w = b0 << 8;
+                }
+                if self.pos + 1 < self.len {
+                    let b1 = *buf.get(self.pos + 1).ok_or(ErrInfo::READ_OVERFLOW)? as u32;
+                    w |= b1;
+                }
+                w
+            };
             let shift = self.left_bits as u32;
             if shift < 32 {
                 self.cur_bits |= word.wrapping_shl(shift);
@@ -266,6 +278,7 @@ impl BsCursor {
     /// RBSP. **Pass `buf` with at least 3 bytes of slack past `size_bits`**; with
     /// fewer, those loads return [`ErrInfo::READ_OVERFLOW`] instead of reading past
     /// the allocation.
+    #[inline]
     pub fn get_bits(&mut self, buf: &[u8], n: i32) -> Result<u32, ErrInfo> {
         self.debug_assert_out_of_cavlc("get_bits");
         let value = ubits(self.cur_bits, n);
@@ -283,13 +296,20 @@ impl BsCursor {
     ///
     /// Mirrors `BsGetUe`, including its split refill for
     /// prefixes longer than 16 bits and its wrapping reconstruction of the value.
+    #[inline]
     pub fn get_ue(&mut self, buf: &[u8]) -> Result<u32, ErrInfo> {
         // `get_se`, `get_te0` and `get_one_bit` reach the accumulator only through this
         // and `get_bits`, so these two guards cover the whole read family.
         self.debug_assert_out_of_cavlc("get_ue");
-        let mut value: u32 = 0;
         let mut lz = leading_zero_bits(self.cur_bits);
+        if (0..=7).contains(&lz) {
+            let total_bits = 2 * lz + 1;
+            let val = (self.cur_bits >> (32 - total_bits)) - 1;
+            self.dump_bits(buf, total_bits)?;
+            return Ok(val);
+        }
 
+        let mut value: u32 = 0;
         if lz == -1 {
             if self.left_bits > -16 {
                 let saved = *self;
@@ -334,6 +354,7 @@ impl BsCursor {
     /// Reads a signed Exp-Golomb code, `se(v)`.
     ///
     /// Mirrors `BsGetSe`.
+    #[inline]
     pub fn get_se(&mut self, buf: &[u8]) -> Result<i32, ErrInfo> {
         let code_num = self.get_ue(buf)?;
         Ok(if code_num & 0x01 != 0 {
@@ -346,6 +367,7 @@ impl BsCursor {
     /// Reads a truncated Exp-Golomb code, `te(v)`, over `range` values.
     ///
     /// Mirrors `BsGetTe0`.
+    #[inline]
     pub fn get_te0(&mut self, buf: &[u8], range: i32) -> Result<u32, ErrInfo> {
         if range == 1 {
             Ok(0)
@@ -359,6 +381,7 @@ impl BsCursor {
     /// Whether more RBSP data precedes `rbsp_trailing_bits()`.
     ///
     /// Mirrors `CheckMoreRBSPData`.
+    #[inline]
     pub fn check_more_rbsp_data(&self) -> bool {
         self.debug_assert_out_of_cavlc("check_more_rbsp_data");
         let offset_bytes = self.pos as isize - 2;
@@ -441,11 +464,15 @@ impl BsCursor {
     pub fn end_cavlc(&mut self, buf: &[u8]) {
         let idx = self.cavlc_bit_pos;
         self.pos = (idx >> 3).max(0) as usize;
-        let b0 = buf.get(self.pos).copied().unwrap_or(0);
-        let b1 = buf.get(self.pos + 1).copied().unwrap_or(0);
-        let b2 = buf.get(self.pos + 2).copied().unwrap_or(0);
-        let b3 = buf.get(self.pos + 3).copied().unwrap_or(0);
-        let cache = u32::from_be_bytes([b0, b1, b2, b3]);
+        let cache = if let Some(&chunk) = buf.get(self.pos..).and_then(|s| s.first_chunk::<4>()) {
+            u32::from_be_bytes(chunk)
+        } else {
+            let b0 = buf.get(self.pos).copied().unwrap_or(0);
+            let b1 = buf.get(self.pos + 1).copied().unwrap_or(0);
+            let b2 = buf.get(self.pos + 2).copied().unwrap_or(0);
+            let b3 = buf.get(self.pos + 3).copied().unwrap_or(0);
+            u32::from_be_bytes([b0, b1, b2, b3])
+        };
         self.cur_bits = cache << ((idx & 0x07) as u32);
         self.pos += 4;
         self.left_bits = -16 + ((idx & 0x07) as i32);

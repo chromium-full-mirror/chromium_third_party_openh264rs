@@ -181,14 +181,13 @@ pub fn ON_MB_BS_MV_DIFF(
 
 #[inline(always)]
 pub fn IN_MB_BS_MV_DIFF(
-    iMV_A: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
-    iMV_B: &MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>,
-    iMbXy: usize,
+    iMV_A: &[[i16; MV_A]; MB_BLOCK4x4_NUM],
+    iMV_B: &[[i16; MV_A]; MB_BLOCK4x4_NUM],
     iIndex: usize,
     iNeighIndex: usize,
 ) -> bool {
-    let mv_a = iMV_A.get(iMbXy)[iIndex];
-    let mv_b = iMV_B.get(iMbXy)[iNeighIndex];
+    let mv_a = iMV_A[iIndex];
+    let mv_b = iMV_B[iNeighIndex];
     (mv_a[0] as i32 - mv_b[0] as i32).abs() >= 4 || (mv_a[1] as i32 - mv_b[1] as i32).abs() >= 4
 }
 
@@ -253,15 +252,16 @@ pub fn BS_EDGE(
     iIndex: usize,
     iNeighIndex: usize,
 ) -> u8 {
-    let smb = SMB_EDGE_MV(pRefIds, iMotionVector, iIndex, iNeighIndex);
-    (bsx1 | smb) << (if bsx1 != 0 { 1 } else { 0 })
+    if bsx1 != 0 {
+        return 2;
+    }
+    SMB_EDGE_MV(pRefIds, iMotionVector, iIndex, iNeighIndex)
 }
 
 #[inline(always)]
 pub fn IN_SMB_EDGE_MV(
     refs: &[[Option<PicId>; MB_BLOCK4x4_NUM]; LIST_A],
-    mv: &[&MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>; LIST_A],
-    iMbXy: usize,
+    mv: &[&[[i16; MV_A]; MB_BLOCK4x4_NUM]; LIST_A],
     iIndex: usize,
     iNeighborIndex: usize,
 ) -> u8 {
@@ -273,16 +273,16 @@ pub fn IN_SMB_EDGE_MV(
     if cond1 || cond2 {
         if refs[LIST_0][iIndex] != refs[LIST_1][iIndex] {
             if refs[LIST_0][iIndex] == refs[LIST_0][iNeighborIndex] {
-                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
-                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
+                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iIndex, iNeighborIndex)
+                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iIndex, iNeighborIndex)
                 {
                     1
                 } else {
                     0
                 }
             } else {
-                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
-                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
+                if IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iIndex, iNeighborIndex)
+                    || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iIndex, iNeighborIndex)
                 {
                     1
                 } else {
@@ -290,10 +290,10 @@ pub fn IN_SMB_EDGE_MV(
                 }
             }
         } else {
-            let a = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iMbXy, iIndex, iNeighborIndex)
-                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iMbXy, iIndex, iNeighborIndex);
-            let b = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iMbXy, iIndex, iNeighborIndex)
-                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iMbXy, iIndex, iNeighborIndex);
+            let a = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_0], iIndex, iNeighborIndex)
+                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_1], iIndex, iNeighborIndex);
+            let b = IN_MB_BS_MV_DIFF(mv[LIST_0], mv[LIST_1], iIndex, iNeighborIndex)
+                || IN_MB_BS_MV_DIFF(mv[LIST_1], mv[LIST_0], iIndex, iNeighborIndex);
             if a && b { 1 } else { 0 }
         }
     } else {
@@ -305,13 +305,14 @@ pub fn IN_SMB_EDGE_MV(
 pub fn IN_BS_EDGE(
     bsx1: u8,
     refs: &[[Option<PicId>; MB_BLOCK4x4_NUM]; LIST_A],
-    mv: &[&MbArray<[[i16; MV_A]; MB_BLOCK4x4_NUM]>; LIST_A],
-    iMbXy: usize,
+    mv: &[&[[i16; MV_A]; MB_BLOCK4x4_NUM]; LIST_A],
     iIndex: usize,
     iNeighborIndex: usize,
 ) -> u8 {
-    let smb = IN_SMB_EDGE_MV(refs, mv, iMbXy, iIndex, iNeighborIndex);
-    (bsx1 | smb) << (if bsx1 != 0 { 1 } else { 0 })
+    if bsx1 != 0 {
+        return 2;
+    }
+    IN_SMB_EDGE_MV(refs, mv, iIndex, iNeighborIndex)
 }
 
 /// The macroblock's non-zero-count row.
@@ -548,7 +549,10 @@ pub fn DeblockingBSliceBSInsideMBNormal(
         }
     }
 
-    let pMv = [&pDec.pMv[LIST_0], &pDec.pMv[LIST_1]];
+    let pMv = [
+        pDec.pMv[LIST_0].get(iMbXy as usize),
+        pDec.pMv[LIST_1].get(iMbXy as usize),
+    ];
     let is_8x8 = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
 
     if is_8x8 {
@@ -567,7 +571,6 @@ pub fn DeblockingBSliceBSInsideMBNormal(
             i8x8NnzTab[0] | i8x8NnzTab[1],
             &iRefs,
             &pMv,
-            iMbXy as usize,
             iIndex_v0,
             iNeigborIndex_v0,
         );
@@ -580,7 +583,6 @@ pub fn DeblockingBSliceBSInsideMBNormal(
             i8x8NnzTab[2] | i8x8NnzTab[3],
             &iRefs,
             &pMv,
-            iMbXy as usize,
             iIndex_v1,
             iNeigborIndex_v1,
         );
@@ -593,7 +595,6 @@ pub fn DeblockingBSliceBSInsideMBNormal(
             i8x8NnzTab[0] | i8x8NnzTab[2],
             &iRefs,
             &pMv,
-            iMbXy as usize,
             iIndex_h0,
             iNeigborIndex_h0,
         );
@@ -606,7 +607,6 @@ pub fn DeblockingBSliceBSInsideMBNormal(
             i8x8NnzTab[1] | i8x8NnzTab[3],
             &iRefs,
             &pMv,
-            iMbXy as usize,
             iIndex_h1,
             iNeigborIndex_h1,
         );
@@ -618,55 +618,55 @@ pub fn DeblockingBSliceBSInsideMBNormal(
         for i in 0..3 {
             uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[i + 1] as u8);
         }
-        nBS[0][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 1, 0);
-        nBS[0][2][0] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 2, 1);
-        nBS[0][3][0] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 3, 2);
+        nBS[0][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 1, 0);
+        nBS[0][2][0] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 2, 1);
+        nBS[0][3][0] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 3, 2);
 
         for i in 0..3 {
             uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[4 + i + 1] as u8);
         }
-        nBS[0][1][1] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 5, 4);
-        nBS[0][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 6, 5);
-        nBS[0][3][1] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 7, 6);
+        nBS[0][1][1] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 5, 4);
+        nBS[0][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 6, 5);
+        nBS[0][3][1] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 7, 6);
 
         for i in 0..3 {
             uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[8 + i + 1] as u8);
         }
-        nBS[0][1][2] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 9, 8);
-        nBS[0][2][2] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 10, 9);
-        nBS[0][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 11, 10);
+        nBS[0][1][2] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 9, 8);
+        nBS[0][2][2] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 10, 9);
+        nBS[0][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 11, 10);
 
         for i in 0..3 {
             uiBsx4[i] = (pNnzTab[12 + i] as u8) | (pNnzTab[12 + i + 1] as u8);
         }
-        nBS[0][1][3] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 13, 12);
-        nBS[0][2][3] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 14, 13);
-        nBS[0][3][3] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 15, 14);
+        nBS[0][1][3] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 13, 12);
+        nBS[0][2][3] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 14, 13);
+        nBS[0][3][3] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 15, 14);
 
         // horizontal
         for i in 0..4 {
             uiBsx4[i] = (pNnzTab[i] as u8) | (pNnzTab[4 + i] as u8);
         }
-        nBS[1][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 4, 0);
-        nBS[1][1][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 5, 1);
-        nBS[1][1][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 6, 2);
-        nBS[1][1][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 7, 3);
+        nBS[1][1][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 4, 0);
+        nBS[1][1][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 5, 1);
+        nBS[1][1][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 6, 2);
+        nBS[1][1][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, 7, 3);
 
         for i in 0..4 {
             uiBsx4[i] = (pNnzTab[4 + i] as u8) | (pNnzTab[8 + i] as u8);
         }
-        nBS[1][2][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 8, 4);
-        nBS[1][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 9, 5);
-        nBS[1][2][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 10, 6);
-        nBS[1][2][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 11, 7);
+        nBS[1][2][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 8, 4);
+        nBS[1][2][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 9, 5);
+        nBS[1][2][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 10, 6);
+        nBS[1][2][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, 11, 7);
 
         for i in 0..4 {
             uiBsx4[i] = (pNnzTab[8 + i] as u8) | (pNnzTab[12 + i] as u8);
         }
-        nBS[1][3][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, iMbXy as usize, 12, 8);
-        nBS[1][3][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, iMbXy as usize, 13, 9);
-        nBS[1][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, iMbXy as usize, 14, 10);
-        nBS[1][3][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, iMbXy as usize, 15, 11);
+        nBS[1][3][0] = IN_BS_EDGE(uiBsx4[0], &iRefs, &pMv, 12, 8);
+        nBS[1][3][1] = IN_BS_EDGE(uiBsx4[1], &iRefs, &pMv, 13, 9);
+        nBS[1][3][2] = IN_BS_EDGE(uiBsx4[2], &iRefs, &pMv, 14, 10);
+        nBS[1][3][3] = IN_BS_EDGE(uiBsx4[3], &iRefs, &pMv, 15, 11);
     }
 }
 
@@ -700,6 +700,8 @@ pub fn DeblockingBsMarginalMBAvcbase(
     // blocks use, without regard to which list an index came from or its position in that list.
     // Both sides come from the record `WelsRecordRefPicturesSlice` wrote for each slice.
     let pRefPicture = &pDec.pRefPicture[LIST_0];
+    let ref_curr = pRefPicture.get(iMbXy as usize);
+    let ref_neigh = pRefPicture.get(iNeighMb as usize);
 
     let is_8x8_curr = *pCurDqLayer.grid.transform_size8x8_flag.get(iMbXy as usize);
     let is_8x8_neigh = *pCurDqLayer
@@ -727,8 +729,8 @@ pub fn DeblockingBsMarginalMBAvcbase(
             } else {
                 let idx_curr = pB8x8Idx[i * 4] as usize;
                 let idx_neigh = pBn8x8Idx[i * 4] as usize;
-                let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(idx_curr)];
-                let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(idx_neigh)];
+                let ref0 = ref_curr[MB_BLOCK8x8_IDX(idx_curr)];
+                let ref1 = ref_neigh[MB_BLOCK8x8_IDX(idx_neigh)];
 
                 let val = MB_BS_MV(
                     ref0,
@@ -756,8 +758,8 @@ pub fn DeblockingBsMarginalMBAvcbase(
                     pBS[j + (i << 1)] = 2;
                 } else {
                     let b_idx = pB8x8Idx[i * 4] as usize;
-                    let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref0 = ref_curr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref1 = ref_neigh[MB_BLOCK8x8_IDX(bn_idx)];
 
                     pBS[j + (i << 1)] = MB_BS_MV(
                         ref0,
@@ -785,8 +787,8 @@ pub fn DeblockingBsMarginalMBAvcbase(
                     pBS[j + (i << 1)] = 2;
                 } else {
                     let bn_idx = pBn8x8Idx[i * 4] as usize;
-                    let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref0 = ref_curr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref1 = ref_neigh[MB_BLOCK8x8_IDX(bn_idx)];
 
                     pBS[j + (i << 1)] = MB_BS_MV(
                         ref0,
@@ -809,8 +811,8 @@ pub fn DeblockingBsMarginalMBAvcbase(
             if ((pNzcCurr[b_idx] as u8) | (pNzcNeigh[bn_idx] as u8)) != 0 {
                 pBS[i] = 2;
             } else {
-                let ref0 = pRefPicture.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                let ref1 = pRefPicture.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref0 = ref_curr[MB_BLOCK8x8_IDX(b_idx)];
+                let ref1 = ref_neigh[MB_BLOCK8x8_IDX(bn_idx)];
 
                 pBS[i] = MB_BS_MV(
                     ref0,
@@ -845,8 +847,10 @@ pub fn DeblockingBSliceBsMarginalMBAvcbase(
     // As in `DeblockingBsMarginalMBAvcbase` above, both macroblocks' reference pictures come from
     // the per-slice record rather than from resolving their indices through the current slice's
     // two lists (8.7.2.1).
-    let pRefPicture0 = &pDec.pRefPicture[LIST_0];
-    let pRefPicture1 = &pDec.pRefPicture[LIST_1];
+    let ref_p0_arr = pDec.pRefPicture[LIST_0].get(iMbXy as usize);
+    let ref_q0_arr = pDec.pRefPicture[LIST_0].get(iNeighMb as usize);
+    let ref_p1_arr = pDec.pRefPicture[LIST_1].get(iMbXy as usize);
+    let ref_q1_arr = pDec.pRefPicture[LIST_1].get(iNeighMb as usize);
 
     let pNzcCurr = GetPNzc(pCurDqLayer, iMbXy);
     let pNzcNeigh = GetPNzc(pCurDqLayer, iNeighMb);
@@ -876,10 +880,10 @@ pub fn DeblockingBSliceBsMarginalMBAvcbase(
                 let b_idx = pB8x8Idx[i * 4] as usize;
                 let bn_idx = pBn8x8Idx[i * 4] as usize;
 
-                let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
-                let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p0 = ref_p0_arr[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q0 = ref_q0_arr[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p1 = ref_p1_arr[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q1 = ref_q1_arr[MB_BLOCK8x8_IDX(bn_idx)];
 
                 if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
                     || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
@@ -918,10 +922,10 @@ pub fn DeblockingBSliceBsMarginalMBAvcbase(
                     pBS[j + (i << 1)] = 1;
                     let b_idx = pB8x8Idx[i * 4] as usize;
 
-                    let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
-                    let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p0 = ref_p0_arr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q0 = ref_q0_arr[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p1 = ref_p1_arr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q1 = ref_q1_arr[MB_BLOCK8x8_IDX(bn_idx)];
 
                     if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
                         || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
@@ -960,10 +964,10 @@ pub fn DeblockingBSliceBsMarginalMBAvcbase(
                     pBS[j + (i << 1)] = 1;
                     let bn_idx = pBn8x8Idx[i * 4] as usize;
 
-                    let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
-                    let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                    let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p0 = ref_p0_arr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q0 = ref_q0_arr[MB_BLOCK8x8_IDX(bn_idx)];
+                    let ref_p1 = ref_p1_arr[MB_BLOCK8x8_IDX(b_idx)];
+                    let ref_q1 = ref_q1_arr[MB_BLOCK8x8_IDX(bn_idx)];
 
                     if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
                         || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
@@ -997,10 +1001,10 @@ pub fn DeblockingBSliceBsMarginalMBAvcbase(
             } else {
                 pBS[i] = 1;
 
-                let ref_p0 = pRefPicture0.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                let ref_q0 = pRefPicture0.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
-                let ref_p1 = pRefPicture1.get(iMbXy as usize)[MB_BLOCK8x8_IDX(b_idx)];
-                let ref_q1 = pRefPicture1.get(iNeighMb as usize)[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p0 = ref_p0_arr[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q0 = ref_q0_arr[MB_BLOCK8x8_IDX(bn_idx)];
+                let ref_p1 = ref_p1_arr[MB_BLOCK8x8_IDX(b_idx)];
+                let ref_q1 = ref_q1_arr[MB_BLOCK8x8_IDX(bn_idx)];
 
                 if ((ref_p0 == ref_q0) && (ref_p1 == ref_q1))
                     || ((ref_p0 == ref_q1) && (ref_p1 == ref_q0))
@@ -1961,10 +1965,14 @@ pub fn WelsRecordRefPicturesMb(
             && ((eSliceType == EWelsSliceType::B_SLICE as u8)
                 || (eSliceType == EWelsSliceType::P_SLICE as u8 && listIdx == LIST_0));
         let mut recorded = [None; 4];
-        for (i, &scan4) in BLOCK8x8_SCAN4_IDX.iter().enumerate() {
-            let iRefIdx = pDec.pRefIndex[listIdx].get(iMbXy)[scan4];
-            if bListUsed && iRefIdx > REF_NOT_IN_LIST {
-                recorded[i] = pCtx.sRefPic.pRefList[listIdx][iRefIdx as usize];
+        if bListUsed {
+            let ref_idx_mb = pDec.pRefIndex[listIdx].get(iMbXy);
+            let ref_list = &pCtx.sRefPic.pRefList[listIdx];
+            for (i, &scan4) in BLOCK8x8_SCAN4_IDX.iter().enumerate() {
+                let iRefIdx = ref_idx_mb[scan4];
+                if iRefIdx > REF_NOT_IN_LIST {
+                    recorded[i] = ref_list[iRefIdx as usize];
+                }
             }
         }
         *pDec.pRefPicture[listIdx].get_mut(iMbXy) = recorded;
@@ -1996,6 +2004,10 @@ pub fn WelsRecordRefPicturesSlice(
         return;
     }
 
+    let use_fmo = pCtx
+        .pps_of(pps_id)
+        .is_some_and(|pps| pps.uiNumSliceGroups > 1);
+
     loop {
         WelsRecordRefPicturesMb(pCtx, pCurDqLayer, pDec, iNextMbXyIndex);
 
@@ -2004,10 +2016,7 @@ pub fn WelsRecordRefPicturesSlice(
             break;
         }
 
-        if pCtx
-            .pps_of(pps_id)
-            .is_some_and(|pps| pps.uiNumSliceGroups > 1)
-        {
+        if use_fmo {
             // Flexible Macroblock Ordering slice group transition
             iNextMbXyIndex = FmoNextMb(active_fmo(pCtx.sFmoList, fmo_id), iNextMbXyIndex);
         } else {
@@ -2047,6 +2056,9 @@ pub fn WelsDeblockingFilterSlice(
     pFilter.ref_ids = snapshot_ref_ids(pCtx.sRefPic);
 
     let pps_id = pSliceHeaderExt.sSliceHeader.pps_id;
+    let use_fmo = pCtx
+        .pps_of(pps_id)
+        .is_some_and(|pps| pps.uiNumSliceGroups > 1);
 
     if iFilterIdc == 0 || iFilterIdc == 2 {
         iNextMbXyIndex = pSliceHeaderExt.sSliceHeader.iFirstMbInSlice;
@@ -2066,22 +2078,25 @@ pub fn WelsDeblockingFilterSlice(
                 break;
             }
 
-            if pCtx
-                .pps_of(pps_id)
-                .is_some_and(|pps| pps.uiNumSliceGroups > 1)
-            {
+            if use_fmo {
                 // Flexible Macroblock Ordering slice group transition
                 iNextMbXyIndex = FmoNextMb(active_fmo(pCtx.sFmoList, fmo_id), iNextMbXyIndex);
+                if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbCount {
+                    break;
+                }
+                pCurDqLayer.iMbX = iNextMbXyIndex % iMbWidth;
+                pCurDqLayer.iMbY = iNextMbXyIndex / iMbWidth;
             } else {
                 iNextMbXyIndex += 1;
+                if iNextMbXyIndex >= iTotalMbCount {
+                    break;
+                }
+                pCurDqLayer.iMbX += 1;
+                if pCurDqLayer.iMbX >= iMbWidth {
+                    pCurDqLayer.iMbX = 0;
+                    pCurDqLayer.iMbY += 1;
+                }
             }
-
-            if iNextMbXyIndex == -1 || iNextMbXyIndex >= iTotalMbCount {
-                break;
-            }
-
-            pCurDqLayer.iMbX = iNextMbXyIndex % iMbWidth;
-            pCurDqLayer.iMbY = iNextMbXyIndex / iMbWidth;
             pCurDqLayer.iMbXyIndex = iNextMbXyIndex;
         }
     }

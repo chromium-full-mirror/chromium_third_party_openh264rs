@@ -175,6 +175,19 @@ impl<T: Clone> MbArray<T> {
     }
 }
 
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn check_failed(mb_xy: usize, len: usize, dims: MbDims) -> ! {
+    panic!(
+        "mb_xy {} >= {} (grid {}x{})",
+        mb_xy,
+        len,
+        dims.mb_width(),
+        dims.mb_height()
+    );
+}
+
 impl<T> MbArray<T> {
     /// The array of a picture that covers no macroblocks — see [`MbDims::none`].
     pub const fn empty() -> Self {
@@ -232,44 +245,34 @@ impl<T> MbArray<T> {
         &mut self.data
     }
 
-    /// Bounds check whose message names the index, the length and both grid dimensions;
-    /// `#[track_caller]` puts the reported location at the reader.
-    #[inline]
-    #[track_caller]
-    fn check(&self, mb_xy: usize) {
-        assert!(
-            mb_xy < self.data.len(),
-            "mb_xy {} >= {} (grid {}x{})",
-            mb_xy,
-            self.data.len(),
-            self.dims.mb_width(),
-            self.dims.mb_height()
-        );
-    }
-
     /// The entry at raster address `mb_xy`.
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub fn get(&self, mb_xy: usize) -> &T {
-        self.check(mb_xy);
-        &self.data[mb_xy]
+        match self.data.get(mb_xy) {
+            Some(v) => v,
+            None => check_failed(mb_xy, self.data.len(), self.dims),
+        }
     }
 
     /// Mutable form of [`get`](Self::get).
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub fn get_mut(&mut self, mb_xy: usize) -> &mut T {
-        self.check(mb_xy);
-        &mut self.data[mb_xy]
+        let len = self.data.len();
+        let dims = self.dims;
+        match self.data.get_mut(mb_xy) {
+            Some(v) => v,
+            None => check_failed(mb_xy, len, dims),
+        }
     }
 
     /// The entry at grid coordinates `(x, y)`.
-    #[inline]
+    #[inline(always)]
     #[track_caller]
     pub fn at(&self, x: usize, y: usize) -> &T {
         let mb_xy = self.dims.mb_xy(x, y);
-        self.check(mb_xy);
-        &self.data[mb_xy]
+        self.get(mb_xy)
     }
 
     /// The left neighbour's entry, if the grid has one.

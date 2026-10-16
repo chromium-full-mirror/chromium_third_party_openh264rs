@@ -4458,6 +4458,18 @@ pub fn CheckRefPicturesComplete(
         if pDec.pMbType.as_slice().is_empty() {
             return true;
         }
+        let use_fmo = active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps)
+            .is_some_and(|pps| pps.uiNumSliceGroups > 1);
+        if !use_fmo {
+            let all_list0_complete = (0..MAX_REF_PIC_COUNT).all(|refIdx| {
+                pRefs
+                    .resolve(ref_id(&pCtx.sRefPic, LIST_0, refIdx), Some(pDec))
+                    .is_none_or(|pRef| pRef.bIsComplete)
+            });
+            if all_list0_complete {
+                return true;
+            }
+        }
         let mut bAllRefComplete = true;
         let mut iRealMbIdx = pCurDqLayer
             .sLayerInfo
@@ -4540,9 +4552,7 @@ pub fn CheckRefPicturesComplete(
             if !bAllRefComplete {
                 break;
             }
-            iRealMbIdx = if active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps)
-                .is_some_and(|pps| pps.uiNumSliceGroups > 1)
-            {
+            iRealMbIdx = if use_fmo {
                 FmoNextMb(active_fmo(&pCtx.sFmoList, pCtx.fmo_id), iRealMbIdx)
             } else {
                 pCurDqLayer

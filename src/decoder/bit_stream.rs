@@ -157,11 +157,45 @@ impl RawDataBuffer {
     ///
     /// The caller must ensure `remaining() >= payload.len() + RESERVED_NAL_BYTES`.
     pub fn append_ebsp_stripped(&mut self, payload: &[u8]) -> (usize, usize) {
+        const BROADCAST_03: u64 = 0x0303_0303_0303_0303;
+        const LO_BITS: u64 = 0x0101_0101_0101_0101;
+        const HI_BITS: u64 = 0x8080_8080_8080_8080;
+
         let start = self.cur;
         let dst = &mut self.buf[start..start + payload.len()];
         let mut dst_len = 0usize;
         let mut zero_run = 0u32;
-        for &b in payload {
+        let mut chunks = payload.chunks_exact(8);
+        for chunk in &mut chunks {
+            let chunk: &[u8; 8] = chunk.try_into().unwrap();
+            let x = u64::from_ne_bytes(*chunk) ^ BROADCAST_03;
+            if (x.wrapping_sub(LO_BITS) & !x & HI_BITS) == 0 {
+                dst[dst_len..dst_len + 8].copy_from_slice(chunk);
+                dst_len += 8;
+                zero_run = if chunk[7] != 0 {
+                    0
+                } else if chunk[6] != 0 {
+                    1
+                } else {
+                    2
+                };
+            } else {
+                for &b in chunk {
+                    if zero_run >= 2 && b == 0x03 {
+                        zero_run = 0;
+                        continue;
+                    }
+                    if b == 0 {
+                        zero_run += 1;
+                    } else {
+                        zero_run = 0;
+                    }
+                    dst[dst_len] = b;
+                    dst_len += 1;
+                }
+            }
+        }
+        for &b in chunks.remainder() {
             if zero_run >= 2 && b == 0x03 {
                 zero_run = 0;
                 continue;
