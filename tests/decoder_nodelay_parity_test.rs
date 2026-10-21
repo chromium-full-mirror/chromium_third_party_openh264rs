@@ -98,119 +98,81 @@ const ROWS: &[Row] = &[
 ];
 
 /// Drives one asset through `DecodeFrameNoDelay`.
-///
-/// # Safety
-/// Uses the C ABI as a consumer does; every pointer is valid for its call.
-unsafe fn nodelay_row(data: &[u8]) -> (usize, (i32, i32), String, Vec<i32>, Vec<i32>) {
-    unsafe {
-        let mut dec: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut dec), CM_RESULT_SUCCESS as i64);
-        let mut param = SDecodingParam::default();
-        param.uiTargetDqLayer = u8::MAX;
-        param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        assert_eq!(
-            ISVCDecoder::Initialize(dec, &param as *const SDecodingParam),
-            CM_RESULT_SUCCESS as i64
-        );
+fn nodelay_row(data: &[u8]) -> (usize, (i32, i32), String, Vec<i32>, Vec<i32>) {
+    let mut dec = Decoder::new();
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    assert_eq!(
+        dec.initialize(&param),
+        CM_RESULT_SUCCESS as std::ffi::c_long
+    );
 
-        let mut hasher = Sha1Hasher::new();
-        let mut frames = 0usize;
-        let mut first = (0i32, 0i32);
-        let mut codes = Vec::new();
-        let mut bufs = Vec::new();
+    let mut hasher = Sha1Hasher::new();
+    let mut frames = 0usize;
+    let mut first = (0i32, 0i32);
+    let mut codes = Vec::new();
+    let mut bufs = Vec::new();
 
-        let take = |info: &SBufferInfo,
-                    dst: [*mut u8; 3],
-                    hasher: &mut Sha1Hasher,
-                    frames: &mut usize,
-                    first: &mut (i32, i32)| {
-            if info.iBufferStatus != 1 {
-                return;
-            }
-            let sys = *info.UsrData.sys();
-            let (w, h) = (sys.iWidth as usize, sys.iHeight as usize);
-            let (sy, suv) = (sys.iStride[0] as usize, sys.iStride[1] as usize);
-            let mut plane = |p: *mut u8, w: usize, h: usize, stride: usize| {
-                if p.is_null() || w == 0 || h == 0 || stride == 0 {
-                    return;
-                }
-                for row in 0..h {
-                    hasher.update(std::slice::from_raw_parts(p.add(row * stride), w));
-                }
-            };
-            plane(dst[0], w, h, sy);
-            plane(dst[1], w / 2, h / 2, suv);
-            plane(dst[2], w / 2, h / 2, suv);
-            *frames += 1;
-            if first.0 == 0 {
-                *first = (sys.iWidth, sys.iHeight);
-            }
-        };
-
-        for unit in split_annexb_units(data) {
-            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut info = SBufferInfo::default();
-            let st = ISVCDecoder::DecodeFrameNoDelay(
-                dec,
-                unit.as_ptr(),
-                unit.len() as i32,
-                dst.as_mut_ptr(),
-                &mut info,
-            );
-            codes.push(st.0);
-            bufs.push(info.iBufferStatus);
-            take(&info, dst, &mut hasher, &mut frames, &mut first);
+    let take = |dec: &Decoder,
+                info: &SBufferInfo,
+                hasher: &mut Sha1Hasher,
+                frames: &mut usize,
+                first: &mut (i32, i32)| {
+        if info.iBufferStatus != 1 {
+            return;
         }
-
-        let mut eos = 1i32;
-        ISVCDecoder::SetOption(
-            dec,
-            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
-            &mut eos as *mut i32 as *mut std::ffi::c_void,
-        );
+        let sys = *info.UsrData.sys();
+        for row in info
+            .y_rows(dec)
+            .chain(info.u_rows(dec))
+            .chain(info.v_rows(dec))
         {
-            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut info = SBufferInfo::default();
-            let st = ISVCDecoder::DecodeFrameNoDelay(
-                dec,
-                std::ptr::null(),
-                0,
-                dst.as_mut_ptr(),
-                &mut info,
-            );
-            codes.push(st.0);
-            bufs.push(info.iBufferStatus);
-            take(&info, dst, &mut hasher, &mut frames, &mut first);
+            hasher.update(row);
         }
-
-        let mut remaining = 0i32;
-        ISVCDecoder::GetOption(
-            dec,
-            DECODER_OPTION::DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER,
-            &mut remaining as *mut i32 as *mut std::ffi::c_void,
-        );
-        for _ in 0..remaining.clamp(0, 24) {
-            let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut info = SBufferInfo::default();
-            let st = ISVCDecoder::FlushFrame(dec, dst.as_mut_ptr(), &mut info);
-            codes.push(st.0);
-            bufs.push(info.iBufferStatus);
-            take(&info, dst, &mut hasher, &mut frames, &mut first);
+        *frames += 1;
+        if first.0 == 0 {
+            *first = (sys.iWidth, sys.iHeight);
         }
+    };
 
-        ISVCDecoder::Uninitialize(dec);
-        WelsDestroyDecoder(dec);
-        (frames, first, hasher.digest(), codes, bufs)
+    for unit in split_annexb_units(data) {
+        let mut info = SBufferInfo::default();
+        let st = dec.decode_no_delay(Some(unit), &mut info);
+        codes.push(st.0);
+        bufs.push(info.iBufferStatus);
+        take(&dec, &info, &mut hasher, &mut frames, &mut first);
     }
+
+    dec.set_end_of_stream(true);
+    {
+        let mut info = SBufferInfo::default();
+        let st = dec.decode_no_delay(None, &mut info);
+        codes.push(st.0);
+        bufs.push(info.iBufferStatus);
+        take(&dec, &info, &mut hasher, &mut frames, &mut first);
+    }
+
+    let remaining = dec.frames_remaining();
+    for _ in 0..remaining.clamp(0, 24) {
+        let mut info = SBufferInfo::default();
+        let st = dec.flush(&mut info);
+        codes.push(st.0);
+        bufs.push(info.iBufferStatus);
+        take(&dec, &info, &mut hasher, &mut frames, &mut first);
+    }
+
+    dec.uninitialize();
+    (frames, first, hasher.digest(), codes, bufs)
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn decode_frame_no_delay_matches_the_reference_on_every_axis() {
+pub(crate) fn decode_frame_no_delay_matches_the_reference_on_every_axis() {
     for row in ROWS {
         let data = common::read_stream(row.asset);
-        let (frames, dims, sha1, codes, bufs) = unsafe { nodelay_row(&data) };
+        let (frames, dims, sha1, codes, bufs) = nodelay_row(&data);
         // Counts before hashes: a mismatch whose count also moved is a different
         // defect from one whose count held.
         assert_eq!(frames, row.frames, "{}: emitted frame count", row.asset);

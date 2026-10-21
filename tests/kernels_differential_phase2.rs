@@ -4,6 +4,7 @@
 
 //! Differential tests for the kernel conversions.
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::prng::Prng;
@@ -38,7 +39,7 @@ fn surface(rng: &mut Prng, stride: usize, bw: usize, bh: usize) -> (Vec<u8>, usi
 /// second half of that disjunction is what makes 16x16 intra macroblocks decode
 /// correctly.
 #[test]
-fn idct_four_res_add_pred_transforms_a_dc_only_block_with_zero_nzc() {
+pub(crate) fn idct_four_res_add_pred_transforms_a_dc_only_block_with_zero_nzc() {
     let mut rng = Prng::new(0x2DC7_0004);
 
     for &stride in &[8usize, 21, 240] {
@@ -148,7 +149,7 @@ fn safe_sad_four(
 /// against the same content in a padded surface. The four-point arms must also score
 /// four *distinct* points inside their own block bound.
 #[test]
-fn sad_kernels_stay_inside_the_spans_they_declare() {
+pub(crate) fn sad_kernels_stay_inside_the_spans_they_declare() {
     let mut rng = Prng::new(0x5AD0_0501);
 
     const SAD_SHAPES: &[(usize, usize)] =
@@ -315,7 +316,7 @@ fn noise_quads_u8(rng: &mut Prng, len: usize) -> Vec<[u8; 4]> {
 /// All five walkers run: they compute the same span from the same helper, but each
 /// writes a different set of output arrays.
 #[test]
-fn vaa_shims_stay_inside_the_spans_they_declare() {
+pub(crate) fn vaa_shims_stay_inside_the_spans_they_declare() {
     let mut rng = Prng::new(0x7A08_5AA5);
     for &(w, h, stride) in &pictures() {
         let span = vaa::vaa_span(w, h, stride);
@@ -438,7 +439,7 @@ fn vaa_shims_stay_inside_the_spans_they_declare() {
 /// row or column off, one that mixed up two quadrants, or one that dropped the step
 /// quirk names the quadrant it went wrong on.
 #[test]
-fn vaa_shim_reads_each_quadrant_where_its_contract_says_it_does() {
+pub(crate) fn vaa_shim_reads_each_quadrant_where_its_contract_says_it_does() {
     for &(w, h, stride) in &pictures() {
         let span = vaa::vaa_span(w, h, stride);
         let mbs = ((w >> 4) * (h >> 4)) as usize;
@@ -487,7 +488,7 @@ fn vaa_shim_reads_each_quadrant_where_its_contract_says_it_does() {
 /// **65280** and the `uint32_t` squares at **16 646 400** — both short of wrapping, so
 /// the `wrapping_add`s cannot wrap.
 #[test]
-fn sample_variance_16x16_accumulators_cannot_wrap() {
+pub(crate) fn sample_variance_16x16_accumulators_cannot_wrap() {
     for (refv, srcv) in [(255u8, 0u8), (0, 255), (255, 255), (0, 0)] {
         let refy = vec![refv; aq::mb_span(16)];
         let srcy = vec![srcv; aq::mb_span(16)];
@@ -523,7 +524,7 @@ use openh264rs::common::deblocking_common as deb;
 use openh264rs::common::expand_pic as exp;
 
 #[test]
-fn expand_picture_writes_every_padding_byte_and_reads_none() {
+pub(crate) fn expand_picture_writes_every_padding_byte_and_reads_none() {
     let mut rng = Prng::new(0xE8_9A2D_0016);
     // The two border widths both codecs allocate: `PADDING_LENGTH` for luma and
     // `PADDING_LENGTH >> 1` for chroma.
@@ -596,7 +597,7 @@ fn coeffs<const N: usize>(rng: &mut Prng) -> [i16; N] {
 }
 
 #[test]
-fn encode_mb_aux_shims_stay_inside_the_spans_they_declare() {
+pub(crate) fn encode_mb_aux_shims_stay_inside_the_spans_they_declare() {
     let mut rng = Prng::new(0xE4C0_59A9);
 
     // --- The two DCTs: exact pixel spans (3*stride + 4 / 7*stride + 8, the
@@ -847,7 +848,7 @@ fn bounded_coeffs<const N: usize>(rng: &mut Prng, bound: i32) -> [i16; N] {
 }
 
 #[test]
-fn encoder_recon_shims_stay_inside_the_spans_they_declare() {
+pub(crate) fn encoder_recon_shims_stay_inside_the_spans_they_declare() {
     let mut rng = Prng::new(0xEDA0_59A9);
 
     // Fixed-array shims: exact allocations, golden direct run.
@@ -1002,7 +1003,7 @@ const SATD_SHAPES: &[(&str, usize, usize, SafeSatd)] = &[
 /// a padded copy of the same content proves the values do not depend on
 /// anything outside the span.
 #[test]
-fn satd_kernels_stay_inside_the_spans_they_declare() {
+pub(crate) fn satd_kernels_stay_inside_the_spans_they_declare() {
     let mut rng = Prng::new(0x5A7D_59A9);
 
     for &(name, w, h, safe) in SATD_SHAPES {
@@ -1042,7 +1043,7 @@ use openh264rs::encoder::deblocking as encdeb;
 /// `encoder/deblocking.rs`'s `WelsNonZeroCount_c` against the safe kernel it
 /// duplicates.
 #[test]
-fn nonzero_count_duplicates_agree() {
+pub(crate) fn nonzero_count_duplicates_agree() {
     let mut rng = Prng::new(0x0E0F_0003);
     for _ in 0..scale(50) {
         let seed: Vec<i8> = (0..24).map(|_| rng.range_i32(-128, 127) as i8).collect();

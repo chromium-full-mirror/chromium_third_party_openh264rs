@@ -9,6 +9,7 @@
 //! NAL headers, verifying that the decoder does not panic/abort and returns the
 //! expected `DECODING_STATE` error codes.
 
+#[path = "common/mod.rs"]
 mod common;
 
 use openh264rs::api::codec_api::*;
@@ -311,27 +312,14 @@ struct Run {
 /// Hard cap on the flush loop.
 const MAX_DRAIN: i32 = 24;
 
-unsafe fn feed(decoder: *mut ISVCDecoder, unit: &[u8], run: &mut Run) {
-    unsafe {
-        let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-        let mut buf_info = SBufferInfo::default();
-        let src = if unit.is_empty() {
-            std::ptr::null()
-        } else {
-            unit.as_ptr()
-        };
-        let ret = ISVCDecoder::DecodeFrame2(
-            decoder,
-            src,
-            unit.len() as i32,
-            p_dst.as_mut_ptr(),
-            &mut buf_info,
-        );
-        record(ret.0, &buf_info, p_dst, run);
-    }
+fn feed(decoder: &mut Decoder, unit: &[u8], run: &mut Run) {
+    let mut buf_info = SBufferInfo::default();
+    let src = (!unit.is_empty()).then_some(unit);
+    let ret = decoder.decode(src, &mut buf_info);
+    record(decoder, ret.0, &buf_info, run);
 }
 
-unsafe fn record(ret: i32, buf_info: &SBufferInfo, dst: [*mut u8; 3], run: &mut Run) {
+fn record(decoder: &Decoder, ret: i32, buf_info: &SBufferInfo, run: &mut Run) {
     assert_eq!(
         ret & !ALLOWED_ERROR_BITS,
         0,
@@ -348,94 +336,76 @@ unsafe fn record(ret: i32, buf_info: &SBufferInfo, dst: [*mut u8; 3], run: &mut 
     if buf_info.iBufferStatus != 1 {
         return;
     }
-    unsafe {
-        let width = buf_info.UsrData.sSystemBuffer.iWidth;
-        let height = buf_info.UsrData.sSystemBuffer.iHeight;
-        let stride_y = buf_info.UsrData.sSystemBuffer.iStride[0] as usize;
-        let stride_uv = buf_info.UsrData.sSystemBuffer.iStride[1] as usize;
-        assert!(
-            width > 0 && height > 0,
-            "invalid dimensions {width}x{height}"
-        );
-        let (w, h) = (width as usize, height as usize);
-        assert!(stride_y >= w, "stride_y {stride_y} < width {w}");
-        assert!(
-            stride_uv >= w / 2,
-            "stride_uv {stride_uv} < chroma width {}",
-            w / 2
-        );
-        verify_plane(dst[0], w, h, stride_y);
-        verify_plane(dst[1], w / 2, h / 2, stride_uv);
-        verify_plane(dst[2], w / 2, h / 2, stride_uv);
-        run.frames += 1;
+    let width = buf_info.UsrData.sSystemBuffer.iWidth;
+    let height = buf_info.UsrData.sSystemBuffer.iHeight;
+    let stride_y = buf_info.UsrData.sSystemBuffer.iStride[0] as usize;
+    let stride_uv = buf_info.UsrData.sSystemBuffer.iStride[1] as usize;
+    assert!(
+        width > 0 && height > 0,
+        "invalid dimensions {width}x{height}"
+    );
+    let w = width as usize;
+    assert!(stride_y >= w, "stride_y {stride_y} < width {w}");
+    assert!(
+        stride_uv >= w / 2,
+        "stride_uv {stride_uv} < chroma width {}",
+        w / 2
+    );
+    assert!(
+        buf_info.yuv_planes(decoder).is_some(),
+        "emitted frame has null plane pointer"
+    );
+    for row in buf_info
+        .y_rows(decoder)
+        .chain(buf_info.u_rows(decoder))
+        .chain(buf_info.v_rows(decoder))
+    {
+        std::hint::black_box(row);
     }
+    run.frames += 1;
 }
 
-unsafe fn verify_plane(plane: *const u8, width: usize, height: usize, stride: usize) {
-    assert!(!plane.is_null(), "emitted frame has null plane pointer");
-    unsafe {
-        for y in 0..height {
-            let row = std::slice::from_raw_parts(plane.add(y * stride), width);
-            std::hint::black_box(row);
-        }
-    }
-}
-
-/// Drives one corpus entry through the C-API flow:
-/// create → `Initialize` with `ERROR_CON_SLICE_COPY` → per-NAL `DecodeFrame2` →
-/// EOS → drain → destroy.
+/// Drives one corpus entry through the decoder:
+/// create → `initialize` with `ERROR_CON_SLICE_COPY` → per-NAL `decode` →
+/// EOS → drain → uninitialize.
 fn decode_case(case: &Case) -> Run {
-    unsafe {
-        let mut decoder: *mut ISVCDecoder = std::ptr::null_mut();
-        let ret = WelsCreateDecoder(&mut decoder);
-        assert_eq!(ret, CM_RESULT_SUCCESS as i64, "WelsCreateDecoder");
-        assert!(!decoder.is_null());
+    let mut decoder = Decoder::new();
 
-        let mut dec_param = SDecodingParam::default();
-        dec_param.uiTargetDqLayer = u8::MAX;
-        dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        let init_ret = ISVCDecoder::Initialize(decoder, &dec_param as *const SDecodingParam);
-        assert_eq!(init_ret, CM_RESULT_SUCCESS as i64, "Initialize");
+    let mut dec_param = SDecodingParam::default();
+    dec_param.uiTargetDqLayer = u8::MAX;
+    dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    let init_ret = decoder.initialize(&dec_param);
+    assert_eq!(
+        init_ret, CM_RESULT_SUCCESS as std::ffi::c_long,
+        "Initialize"
+    );
 
-        let mut run = Run::default();
+    let mut run = Run::default();
 
-        match case.feed {
-            Feed::AnnexB => {
-                for unit in split_annexb_units(&case.data) {
-                    feed(decoder, unit, &mut run);
-                }
+    match case.feed {
+        Feed::AnnexB => {
+            for unit in split_annexb_units(&case.data) {
+                feed(&mut decoder, unit, &mut run);
             }
-            Feed::Raw => feed(decoder, &case.data, &mut run),
         }
-
-        // End of stream, then the null/zero-length call that flushes it.
-        let mut eos_flag = 1i32;
-        ISVCDecoder::SetOption(
-            decoder,
-            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
-            &mut eos_flag as *mut i32 as *mut std::ffi::c_void,
-        );
-        feed(decoder, &[], &mut run);
-
-        let mut remaining = 0i32;
-        ISVCDecoder::GetOption(
-            decoder,
-            DECODER_OPTION::DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER,
-            &mut remaining as *mut i32 as *mut std::ffi::c_void,
-        );
-        for _ in 0..remaining.clamp(0, MAX_DRAIN) {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let flush_ret = ISVCDecoder::FlushFrame(decoder, p_dst.as_mut_ptr(), &mut buf_info);
-            record(flush_ret.0, &buf_info, p_dst, &mut run);
-        }
-
-        ISVCDecoder::Uninitialize(decoder);
-        WelsDestroyDecoder(decoder);
-
-        run
+        Feed::Raw => feed(&mut decoder, &case.data, &mut run),
     }
+
+    // End of stream, then the null/zero-length call that flushes it.
+    decoder.set_end_of_stream(true);
+    feed(&mut decoder, &[], &mut run);
+
+    let remaining = decoder.frames_remaining();
+    for _ in 0..remaining.clamp(0, MAX_DRAIN) {
+        let mut buf_info = SBufferInfo::default();
+        let flush_ret = decoder.flush(&mut buf_info);
+        record(&decoder, flush_ret.0, &buf_info, &mut run);
+    }
+
+    decoder.uninitialize();
+
+    run
 }
 
 fn check_stream(name: &str) {
@@ -487,7 +457,7 @@ fn check_stream(name: &str) {
 /// against [`split_annexb_units`].
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn start_code_scan_agrees_with_split_annexb_units() {
+pub(crate) fn start_code_scan_agrees_with_split_annexb_units() {
     for &name in BASE_STREAMS {
         let data = common::read_stream(name);
         let offsets = scan_start_codes(&data);
@@ -502,85 +472,85 @@ fn start_code_scan_agrees_with_split_annexb_units() {
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_sarvui() {
+pub(crate) fn malformed_sarvui() {
     check_stream("SarVui.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_static() {
+pub(crate) fn malformed_static() {
     check_stream("Static.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_sps_subsetsps_bothvui() {
+pub(crate) fn malformed_sps_subsetsps_bothvui() {
     check_stream("sps_subsetsps_bothVUI.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_caba2_sva_b() {
+pub(crate) fn malformed_caba2_sva_b() {
     check_stream("CABA2_SVA_B.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_caba3_sva_b() {
+pub(crate) fn malformed_caba3_sva_b() {
     check_stream("CABA3_SVA_B.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_cisco_men_whisper_cabac_bframe() {
+pub(crate) fn malformed_cisco_men_whisper_cabac_bframe() {
     check_stream("Cisco_Men_whisper_640x320_CABAC_Bframe_9.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_sva_nl1_b() {
+pub(crate) fn malformed_sva_nl1_b() {
     check_stream("SVA_NL1_B.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_qcif_2p_i_allipcm() {
+pub(crate) fn malformed_qcif_2p_i_allipcm() {
     check_stream("QCIF_2P_I_allIPCM.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_ba_mw_d() {
+pub(crate) fn malformed_ba_mw_d() {
     check_stream("BA_MW_D.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_ba_mw_d_idr_lost() {
+pub(crate) fn malformed_ba_mw_d_idr_lost() {
     check_stream("BA_MW_D_IDR_LOST.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_ba_mw_d_p_lost() {
+pub(crate) fn malformed_ba_mw_d_p_lost() {
     check_stream("BA_MW_D_P_LOST.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_error_i_p() {
+pub(crate) fn malformed_error_i_p() {
     check_stream("Error_I_P.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_narrow_16x16() {
+pub(crate) fn malformed_narrow_16x16() {
     check_stream("narrow_16x16.264");
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_narrow_16x16_idr_lost() {
+pub(crate) fn malformed_narrow_16x16_idr_lost() {
     check_stream("narrow_16x16_idr_lost.264");
 }
 
@@ -600,7 +570,7 @@ fn check_degenerate_case(name: &str, feed: Feed, data: Vec<u8>, expected_rets: &
 }
 
 #[test]
-fn malformed_degenerate_nals() {
+pub(crate) fn malformed_degenerate_nals() {
     let ok = DECODING_STATE::dsErrorFree.0;
     let bs_err = DECODING_STATE::dsBitstreamError.0;
     let no_ps = DECODING_STATE::dsNoParamSets.0;
@@ -678,7 +648,7 @@ fn malformed_degenerate_nals() {
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn malformed_sarvui_parameter_sets() {
+pub(crate) fn malformed_sarvui_parameter_sets() {
     let ok = DECODING_STATE::dsErrorFree.0;
     let bs_err = DECODING_STATE::dsBitstreamError.0;
     let no_ps = DECODING_STATE::dsNoParamSets.0;
@@ -775,7 +745,7 @@ fn malformed_sarvui_parameter_sets() {
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn mid_au_sps_dimension_increase_before_need_error_con_does_not_panic() {
+pub(crate) fn mid_au_sps_dimension_increase_before_need_error_con_does_not_panic() {
     let small_data = common::read_stream("narrow_16x16.264");
     let large_data = common::read_stream("SarVui.264");
 
@@ -821,37 +791,20 @@ fn mid_au_sps_dimension_increase_before_need_error_con_does_not_panic() {
         ERROR_CON_IDC::ERROR_CON_SLICE_MV_COPY_CROSS_IDR,
         ERROR_CON_IDC::ERROR_CON_SLICE_MV_COPY_CROSS_IDR_FREEZE_RES_CHANGE,
     ] {
-        unsafe {
-            let mut decoder: *mut ISVCDecoder = std::ptr::null_mut();
-            assert_eq!(WelsCreateDecoder(&mut decoder), CM_RESULT_SUCCESS as i64);
-            let mut dec_param = SDecodingParam::default();
-            dec_param.uiTargetDqLayer = u8::MAX;
-            dec_param.eEcActiveIdc = ec;
-            dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-            assert_eq!(
-                ISVCDecoder::Initialize(decoder, &dec_param as *const SDecodingParam),
-                CM_RESULT_SUCCESS as i64
-            );
+        let mut decoder = Decoder::new();
+        let mut dec_param = SDecodingParam::default();
+        dec_param.uiTargetDqLayer = u8::MAX;
+        dec_param.eEcActiveIdc = ec;
+        dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+        assert_eq!(
+            decoder.initialize(&dec_param),
+            CM_RESULT_SUCCESS as std::ffi::c_long
+        );
 
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let _ = ISVCDecoder::DecodeFrameNoDelay(
-                decoder,
-                au1.as_ptr(),
-                au1.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
-            let _ = ISVCDecoder::DecodeFrameNoDelay(
-                decoder,
-                au2.as_ptr(),
-                au2.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
+        let mut buf_info = SBufferInfo::default();
+        let _ = decoder.decode_no_delay(Some(&au1), &mut buf_info);
+        let _ = decoder.decode_no_delay(Some(&au2), &mut buf_info);
 
-            ISVCDecoder::Uninitialize(decoder);
-            WelsDestroyDecoder(decoder);
-        }
+        decoder.uninitialize();
     }
 }

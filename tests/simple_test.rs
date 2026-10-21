@@ -7,31 +7,23 @@
 use openh264rs::api::codec_api::*;
 
 #[test]
-fn test_simple_encode_init_and_encode_param_sets() {
-    unsafe {
-        let mut p_encoder: *mut ISVCEncoder = std::ptr::null_mut();
-        let ret = WelsCreateSVCEncoder(&mut p_encoder);
-        assert_eq!(ret, CM_RESULT_SUCCESS);
-        assert!(!p_encoder.is_null());
+pub(crate) fn test_simple_encode_init_and_encode_param_sets() {
+    let mut enc = Encoder::new();
 
-        let mut param = SEncParamBase::default();
-        param.iPicWidth = 160;
-        param.iPicHeight = 120;
-        param.fMaxFrameRate = 30.0;
-        param.iTargetBitrate = 250000;
-        param.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME;
+    let mut param = SEncParamBase::default();
+    param.iPicWidth = 160;
+    param.iPicHeight = 120;
+    param.fMaxFrameRate = 30.0;
+    param.iTargetBitrate = 250000;
+    param.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME;
 
-        let init_ret = ISVCEncoder::Initialize(p_encoder, &param as *const SEncParamBase);
-        assert_eq!(init_ret, CM_RESULT_SUCCESS);
+    let init_ret = enc.initialize(&param);
+    assert_eq!(init_ret, CM_RESULT_SUCCESS);
 
-        let mut bs_info = SFrameBSInfo::default();
-        let enc_param_ret =
-            ISVCEncoder::EncodeParameterSets(p_encoder, &mut bs_info as *mut SFrameBSInfo);
-        assert_eq!(enc_param_ret, CM_RESULT_SUCCESS);
+    let mut bs_info = SFrameBSInfo::default();
+    let enc_param_ret = enc.encode_parameter_sets(&mut bs_info);
+    assert_eq!(enc_param_ret, CM_RESULT_SUCCESS);
 
-        let uninit_ret = ISVCEncoder::Uninitialize(p_encoder);
-        assert_eq!(uninit_ret, CM_RESULT_SUCCESS);
-
-        WelsDestroySVCEncoder(p_encoder);
-    }
+    let uninit_ret = enc.uninitialize();
+    assert_eq!(uninit_ret, CM_RESULT_SUCCESS);
 }

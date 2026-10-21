@@ -80,7 +80,7 @@ pub fn fill_camera_frame(buf: &mut [u8], w: usize, h: usize, frame_idx: usize) {
                 } else {
                     40u32
                 };
-                let edge = ((rx * 11 ^ ry * 7) & 31) as u32;
+                let edge = (((rx * 11) ^ (ry * 7)) & 31) as u32;
                 (stripe + edge) as u8
             } else if x >= box2_x && x < box2_x + box_w && y >= box2_y && y < box2_y + box_h {
                 let rx = (x - box2_x) as u32;

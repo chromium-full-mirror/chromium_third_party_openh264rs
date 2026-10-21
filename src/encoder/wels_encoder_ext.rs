@@ -49,6 +49,8 @@ use crate::encoder::svc_enc_slice_segment::{
     SliceArgumentValidationFixedSliceMode,
 };
 
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+use crate::RCMode;
 use crate::api::codec_api::ELevelIdc::LEVEL_UNKNOWN;
 use crate::api::codec_api::EParameterSetStrategy::*;
 use crate::api::codec_api::EProfileIdc::*;
@@ -58,8 +60,8 @@ use crate::api::codec_api::RC_MODES::*;
 use crate::api::codec_api::SliceModeEnum::*;
 use crate::api::codec_api::{ELevelIdc, EProfileIdc};
 use crate::{
-    EVideoFrameType, MAX_LAYER_NUM_OF_FRAME, MAX_SPATIAL_LAYER_NUM, RCMode, SEncParamBase,
-    SEncParamExt, SFrameBSInfo, SourcePicture, VideoFormat,
+    EVideoFrameType, MAX_LAYER_NUM_OF_FRAME, MAX_SPATIAL_LAYER_NUM, SEncParamBase, SEncParamExt,
+    SFrameBSInfo, SourcePicture, VideoFormat,
 };
 // g_ksLevelLimits/LEVEL_NUMBER come from codec/common/inc/wels_common_defs.h and are
 // shared by both codecs; the decoder's copy is reused.
@@ -171,6 +173,7 @@ pub use crate::common::macros::{WELS_CLIP3, WELS_MAX, WELS_MIN};
 ///
 /// An unrecognised mode maps to `RC_QUALITY_MODE` (`RC_MODES`' `#[default]`, value 0),
 /// since the enum cannot hold a value outside its variants.
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
 #[inline]
 pub(crate) fn rc_mode_from_raw(iValue: i32) -> RCMode {
     match iValue {
@@ -1514,6 +1517,10 @@ pub struct CWelsH264SVCEncoder {
     pub m_iMaxPicHeight: i32,
     pub m_iCspInternal: i32,
     pub m_bInitialFlag: bool,
+    /// Active `(pNalLengthInByte, iNalCount, pBsBuf)` layer spans from the most
+    /// recent `EncodeFrame` or `EncodeParameterSets` call.
+    pub(crate) m_lastBsLayers: [(usize, usize, usize); MAX_LAYER_NUM_OF_FRAME],
+    pub(crate) m_lastBsLayerNum: usize,
 }
 
 impl Default for CWelsH264SVCEncoder {
@@ -1560,6 +1567,20 @@ impl CWelsH264SVCEncoder {
             m_iMaxPicHeight: 0,
             m_iCspInternal: 0,
             m_bInitialFlag: false,
+            m_lastBsLayers: [(0, 0, 0); MAX_LAYER_NUM_OF_FRAME],
+            m_lastBsLayerNum: 0,
+        }
+    }
+
+    fn record_bs_info(&mut self, pBsInfo: &SFrameBSInfo) {
+        let layers = pBsInfo.layers();
+        self.m_lastBsLayerNum = layers.len();
+        for (slot, lay) in self.m_lastBsLayers[..layers.len()].iter_mut().zip(layers) {
+            *slot = (
+                lay.pNalLengthInByte as usize,
+                usize::try_from(lay.iNalCount).unwrap_or(0),
+                lay.pBsBuf as usize,
+            );
         }
     }
 
@@ -1570,7 +1591,7 @@ impl CWelsH264SVCEncoder {
         self.m_pWelsTrace.SetCodecInstance(instance);
     }
 
-    pub fn GetDefaultParams(&mut self, argv: &mut SEncParamExt) -> i32 {
+    pub fn GetDefaultParams(&self, argv: &mut SEncParamExt) -> i32 {
         SWelsSvcCodingParam::FillDefaultExt(argv);
         cmResultSuccess
     }
@@ -1750,10 +1771,13 @@ impl CWelsH264SVCEncoder {
         );
         WelsUninitEncoderExt(self.m_pEncContext.take());
         self.m_bInitialFlag = false;
+        self.m_lastBsLayerNum = 0;
         0
     }
 
     pub fn EncodeFrame(&mut self, kpSrcPic: &SourcePicture<'_>, pBsInfo: &mut SFrameBSInfo) -> i32 {
+        *pBsInfo = SFrameBSInfo::default();
+        self.m_lastBsLayerNum = 0;
         if !self.m_bInitialFlag {
             return cmInitParaError;
         }
@@ -1764,6 +1788,7 @@ impl CWelsH264SVCEncoder {
         if kiEncoderReturn != cmResultSuccess {
             return kiEncoderReturn;
         }
+        self.record_bs_info(pBsInfo);
         kiEncoderReturn
     }
 
@@ -1788,11 +1813,14 @@ impl CWelsH264SVCEncoder {
             || kiEncoderReturn == ENC_RETURN_MEMOVERFLOWFOUND
             || kiEncoderReturn == ENC_RETURN_VLCOVERFLOWFOUND
         {
+            *pBsInfo = SFrameBSInfo::default();
             WelsUninitEncoderExt(self.m_pEncContext.take());
             return cmMallocMemeError;
         } else if kiEncoderReturn == ENC_RETURN_INVALIDINPUT {
+            *pBsInfo = SFrameBSInfo::default();
             return cmUnsupportedData;
         } else if kiEncoderReturn != ENC_RETURN_SUCCESS && kiEncoderReturn == ENC_RETURN_CORRECTED {
+            *pBsInfo = SFrameBSInfo::default();
             return cmUnknownReason;
         }
 
@@ -1802,13 +1830,19 @@ impl CWelsH264SVCEncoder {
     }
 
     pub fn EncodeParameterSets(&mut self, pBsInfo: &mut SFrameBSInfo) -> i32 {
+        *pBsInfo = SFrameBSInfo::default();
+        self.m_lastBsLayerNum = 0;
         if !self.m_bInitialFlag {
             return cmInitParaError;
         }
         let Some(ctx) = self.m_pEncContext.as_deref_mut() else {
             return cmInitParaError;
         };
-        WelsEncoderEncodeParameterSetsRust(ctx, pBsInfo)
+        let rc = WelsEncoderEncodeParameterSetsRust(ctx, pBsInfo);
+        if rc == cmResultSuccess {
+            self.record_bs_info(pBsInfo);
+        }
+        rc
     }
 
     pub fn ForceIntraFrame(&mut self, bIDR: bool, iLayerId: i32) -> i32 {

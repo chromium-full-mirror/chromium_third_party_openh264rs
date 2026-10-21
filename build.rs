@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=tests/data");
     println!("cargo:rerun-if-env-changed=OPENH264_TEST_DATA_DIR");
     println!("cargo:rustc-check-cfg=cfg(has_test_data)");
+    println!("cargo:rustc-check-cfg=cfg(is_gtest_unittests)");
 
     let data_dir = std::env::var_os("OPENH264_TEST_DATA_DIR")
         .map(std::path::PathBuf::from)

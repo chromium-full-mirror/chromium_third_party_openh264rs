@@ -14,6 +14,7 @@
 //! ./tools/update_encoder_sha1.sh
 //! ```
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::Sha1Hasher;
@@ -23,25 +24,20 @@ use openh264rs::api::codec_api::{
     RC_MODES::*, SliceModeEnum::*, *,
 };
 use std::collections::HashMap;
+#[cfg(feature = "c-api")]
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[cfg(feature = "c-api")]
 type CreateEncoderFn = unsafe extern "C" fn(pp_encoder: *mut *mut ISVCEncoder) -> i32;
+#[cfg(feature = "c-api")]
 type DestroyEncoderFn = unsafe extern "C" fn(p_encoder: *mut ISVCEncoder);
 
+#[cfg(feature = "c-api")]
 struct EncoderFactory {
     create: CreateEncoderFn,
     destroy: DestroyEncoderFn,
-}
-
-impl EncoderFactory {
-    fn rust() -> Self {
-        Self {
-            create: WelsCreateSVCEncoder,
-            destroy: WelsDestroySVCEncoder,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +120,7 @@ impl EncodeCase {
 
 macro_rules! encoder_sha1_cases {
     ($( $name:ident => $case:expr ),* $(,)?) => {
+        #[cfg(feature = "c-api")]
         fn test_cases() -> Vec<EncodeCase> {
             vec![
                 $(
@@ -138,7 +135,7 @@ macro_rules! encoder_sha1_cases {
 
         $(
             #[test]
-            fn $name() {
+            pub(crate) fn $name() {
                 let mut c = $case;
                 c.name = stringify!($name);
                 run_single_case(&c);
@@ -285,7 +282,7 @@ encoder_sha1_cases! {
 }
 
 fn sha1_file_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/encoder_output_sha1.txt")
+    common::manifest_dir().join("tests/encoder_output_sha1.txt")
 }
 
 fn load_expected_sha1s(path: &Path) -> HashMap<String, String> {
@@ -327,74 +324,48 @@ fn expected_sha1_map() -> &'static HashMap<String, String> {
     MAP.get_or_init(|| load_expected_sha1s(&sha1_file_path()))
 }
 
-unsafe fn init_encoder_for_case(enc: *mut ISVCEncoder, c: &EncodeCase) -> i32 {
+fn build_ext_param_for_case(mut param: SEncParamExt, c: &EncodeCase) -> SEncParamExt {
     match c.init_style {
         InitStyle::Upstream => {
-            let base_flag = c.slice_mode == SM_SINGLE_SLICE
-                && !c.denoise
-                && c.spatial_layers == 1
-                && !c.lossless
-                && !c.ltr
-                && !c.cabac;
-            if base_flag {
-                let mut param = SEncParamBase::default();
-                param.iUsageType = c.usage;
-                param.fMaxFrameRate = c.fps;
-                param.iPicWidth = c.w;
-                param.iPicHeight = c.h;
-                param.iTargetBitrate = c.bitrate;
-                unsafe { ISVCEncoder::Initialize(enc, &param) }
-            } else {
-                let mut param = SEncParamExt::default();
-                assert_eq!(
-                    unsafe { ISVCEncoder::GetDefaultParams(enc, &mut param) },
-                    CM_RESULT_SUCCESS
-                );
-                param.iUsageType = c.usage;
-                param.fMaxFrameRate = c.fps;
-                param.iPicWidth = c.w;
-                param.iPicHeight = c.h;
-                param.iTargetBitrate = c.bitrate;
-                param.bEnableDenoise = c.denoise;
-                param.iSpatialLayerNum = c.spatial_layers;
-                param.bIsLosslessLink = c.lossless;
-                param.bEnableLongTermReference = c.ltr;
-                param.iEntropyCodingModeFlag = if c.cabac { 1 } else { 0 };
-                if c.slice_mode != SM_SINGLE_SLICE && c.slice_mode != SM_SIZELIMITED_SLICE {
-                    param.iMultipleThreadIdc = 2;
-                }
-                for i in 0..c.spatial_layers as usize {
-                    let shift = (c.spatial_layers - 1 - i as i32) as u32;
-                    param.sSpatialLayers[i].iVideoWidth = c.w >> shift;
-                    param.sSpatialLayers[i].iVideoHeight = c.h >> shift;
-                    param.sSpatialLayers[i].fFrameRate = c.fps;
-                    param.sSpatialLayers[i].iSpatialBitrate = param.iTargetBitrate;
-                    param.sSpatialLayers[i].sSliceArgument.uiSliceMode = c.slice_mode;
-                    if c.slice_mode == SM_SIZELIMITED_SLICE {
-                        param.sSpatialLayers[i].sSliceArgument.uiSliceSizeConstraint = 600;
-                        param.uiMaxNalSize = 1500;
-                        param.iMultipleThreadIdc = 4;
-                        param.bUseLoadBalancing = false;
-                    }
-                    if c.slice_mode == SM_FIXEDSLCNUM_SLICE {
-                        param.sSpatialLayers[i].sSliceArgument.uiSliceNum = 4;
-                        param.iMultipleThreadIdc = 4;
-                        param.bUseLoadBalancing = false;
-                    }
-                    if param.iEntropyCodingModeFlag != 0 {
-                        param.sSpatialLayers[i].uiProfileIdc = PRO_MAIN;
-                    }
-                }
-                param.iTargetBitrate *= c.spatial_layers;
-                unsafe { ISVCEncoder::InitializeExt(enc, &param) }
+            param.iUsageType = c.usage;
+            param.fMaxFrameRate = c.fps;
+            param.iPicWidth = c.w;
+            param.iPicHeight = c.h;
+            param.iTargetBitrate = c.bitrate;
+            param.bEnableDenoise = c.denoise;
+            param.iSpatialLayerNum = c.spatial_layers;
+            param.bIsLosslessLink = c.lossless;
+            param.bEnableLongTermReference = c.ltr;
+            param.iEntropyCodingModeFlag = if c.cabac { 1 } else { 0 };
+            if c.slice_mode != SM_SINGLE_SLICE && c.slice_mode != SM_SIZELIMITED_SLICE {
+                param.iMultipleThreadIdc = 2;
             }
+            for i in 0..c.spatial_layers as usize {
+                let shift = (c.spatial_layers - 1 - i as i32) as u32;
+                param.sSpatialLayers[i].iVideoWidth = c.w >> shift;
+                param.sSpatialLayers[i].iVideoHeight = c.h >> shift;
+                param.sSpatialLayers[i].fFrameRate = c.fps;
+                param.sSpatialLayers[i].iSpatialBitrate = param.iTargetBitrate;
+                param.sSpatialLayers[i].sSliceArgument.uiSliceMode = c.slice_mode;
+                if c.slice_mode == SM_SIZELIMITED_SLICE {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceSizeConstraint = 600;
+                    param.uiMaxNalSize = 1500;
+                    param.iMultipleThreadIdc = 4;
+                    param.bUseLoadBalancing = false;
+                }
+                if c.slice_mode == SM_FIXEDSLCNUM_SLICE {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum = 4;
+                    param.iMultipleThreadIdc = 4;
+                    param.bUseLoadBalancing = false;
+                }
+                if param.iEntropyCodingModeFlag != 0 {
+                    param.sSpatialLayers[i].uiProfileIdc = PRO_MAIN;
+                }
+            }
+            param.iTargetBitrate *= c.spatial_layers;
+            param
         }
         InitStyle::Ext => {
-            let mut param = SEncParamExt::default();
-            assert_eq!(
-                unsafe { ISVCEncoder::GetDefaultParams(enc, &mut param) },
-                CM_RESULT_SUCCESS
-            );
             param.iUsageType = c.usage;
             param.fMaxFrameRate = c.fps;
             param.iPicWidth = c.w;
@@ -427,11 +398,120 @@ unsafe fn init_encoder_for_case(enc: *mut ISVCEncoder, c: &EncodeCase) -> i32 {
                     param.sSpatialLayers[i].uiProfileIdc = PRO_MAIN;
                 }
             }
-            unsafe { ISVCEncoder::InitializeExt(enc, &param) }
+            param
         }
     }
 }
 
+fn is_base_init_case(c: &EncodeCase) -> bool {
+    c.init_style == InitStyle::Upstream
+        && c.slice_mode == SM_SINGLE_SLICE
+        && !c.denoise
+        && c.spatial_layers == 1
+        && !c.lossless
+        && !c.ltr
+        && !c.cabac
+}
+
+fn init_rust_encoder_for_case(enc: &mut Encoder, c: &EncodeCase) -> i32 {
+    if is_base_init_case(c) {
+        let mut param = SEncParamBase::default();
+        param.iUsageType = c.usage;
+        param.fMaxFrameRate = c.fps;
+        param.iPicWidth = c.w;
+        param.iPicHeight = c.h;
+        param.iTargetBitrate = c.bitrate;
+        enc.initialize(&param)
+    } else {
+        let mut param = SEncParamExt::default();
+        assert_eq!(enc.default_params(&mut param), CM_RESULT_SUCCESS);
+        let param = build_ext_param_for_case(param, c);
+        enc.initialize_ext(&param)
+    }
+}
+
+fn compute_rust_case_sha1(c: &EncodeCase) -> String {
+    let mut enc = Encoder::new();
+    enc.set_trace_level(1); // WELS_LOG_ERROR
+
+    assert_eq!(
+        init_rust_encoder_for_case(&mut enc, c),
+        CM_RESULT_SUCCESS,
+        "Initialize failed for {}",
+        c.name
+    );
+
+    let (w, h) = (c.w as usize, c.h as usize);
+    let luma = w * h;
+    let mut buf = vec![0u8; luma * 3 / 2];
+
+    let mut hasher = Sha1Hasher::new();
+    for f in 0..c.frames {
+        if c.use_screen_gen {
+            fill_screen_frame(&mut buf, w, h, f);
+        } else {
+            fill_camera_frame(&mut buf, w, h, f);
+        }
+        let mut pic = SourcePicture::from_i420(&buf, c.w, c.h);
+        if c.init_style == InitStyle::Ext {
+            pic.uiTimeStamp = (f as f32 * 1000.0 / c.fps) as i64;
+        }
+
+        let mut info = SFrameBSInfo::default();
+        let rv = enc.encode_frame(&pic, &mut info);
+        assert_eq!(rv, CM_RESULT_SUCCESS, "EncodeFrame failed for {}", c.name);
+        if info.eFrameType != videoFrameTypeSkip {
+            for layer in info.layers() {
+                hasher.update(layer.bs_buf(&enc));
+            }
+        }
+    }
+
+    enc.uninitialize();
+    hasher.digest()
+}
+
+fn run_single_case(c: &EncodeCase) {
+    let path = sha1_file_path();
+    let expected_sha1 = expected_sha1_map().get(c.name).unwrap_or_else(|| {
+        panic!(
+            "missing expected SHA-1 for `{}` in {}; run ./tools/update_encoder_sha1.sh",
+            c.name,
+            path.display()
+        )
+    });
+    let actual_sha1 = compute_rust_case_sha1(c);
+    assert_eq!(
+        &actual_sha1,
+        expected_sha1,
+        "SHA-1 mismatch for case `{}` in {}",
+        c.name,
+        path.display()
+    );
+}
+
+#[cfg(feature = "c-api")]
+unsafe fn init_encoder_for_case(enc: *mut ISVCEncoder, c: &EncodeCase) -> i32 {
+    if is_base_init_case(c) {
+        let mut param = SEncParamBase::default();
+        param.iUsageType = c.usage;
+        param.fMaxFrameRate = c.fps;
+        param.iPicWidth = c.w;
+        param.iPicHeight = c.h;
+        param.iTargetBitrate = c.bitrate;
+        unsafe { ISVCEncoder::Initialize(enc, &param) }
+    } else {
+        let mut param = SEncParamExt::default();
+        assert_eq!(
+            unsafe { ISVCEncoder::GetDefaultParams(enc, &mut param) },
+            CM_RESULT_SUCCESS
+        );
+        let param = build_ext_param_for_case(param, c);
+        unsafe { ISVCEncoder::InitializeExt(enc, &param) }
+    }
+}
+
+#[cfg(feature = "c-api")]
 fn compute_case_sha1(factory: &EncoderFactory, c: &EncodeCase) -> String {
     unsafe {
         let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
@@ -482,15 +562,19 @@ fn compute_case_sha1(factory: &EncoderFactory, c: &EncodeCase) -> String {
             let rv = ISVCEncoder::EncodeFrame(enc, &pic, &mut info);
             assert_eq!(rv, CM_RESULT_SUCCESS, "EncodeFrame failed for {}", c.name);
             if info.eFrameType != videoFrameTypeSkip {
-                for i in 0..info.iLayerNum as usize {
-                    let layer = &info.sLayerInfo[i];
-                    let nals = std::slice::from_raw_parts(
-                        layer.pNalLengthInByte,
-                        layer.iNalCount as usize,
-                    );
-                    let sz: usize = nals.iter().map(|&n| n as usize).sum();
-                    let bytes = std::slice::from_raw_parts(layer.pBsBuf, sz);
-                    hasher.update(bytes);
+                for layer in info.layers() {
+                    if layer.iNalCount > 0
+                        && !layer.nal_lengths_ptr().is_null()
+                        && !layer.bs_buf_ptr().is_null()
+                    {
+                        let nal_lens = std::slice::from_raw_parts(
+                            layer.nal_lengths_ptr(),
+                            layer.iNalCount as usize,
+                        );
+                        let len: usize = nal_lens.iter().map(|&n| n.max(0) as usize).sum();
+                        let bs = std::slice::from_raw_parts(layer.bs_buf_ptr(), len);
+                        hasher.update(bs);
+                    }
                 }
             }
         }
@@ -501,34 +585,19 @@ fn compute_case_sha1(factory: &EncoderFactory, c: &EncodeCase) -> String {
     }
 }
 
-fn run_single_case(c: &EncodeCase) {
-    let path = sha1_file_path();
-    let expected_sha1 = expected_sha1_map().get(c.name).unwrap_or_else(|| {
-        panic!(
-            "missing expected SHA-1 for `{}` in {}; run ./tools/update_encoder_sha1.sh",
-            c.name,
-            path.display()
-        )
-    });
-    let actual_sha1 = compute_case_sha1(&EncoderFactory::rust(), c);
-    assert_eq!(
-        &actual_sha1,
-        expected_sha1,
-        "SHA-1 mismatch for case `{}` in {}",
-        c.name,
-        path.display()
-    );
-}
-
+#[cfg(feature = "c-api")]
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
 }
 
+#[cfg(feature = "c-api")]
 const RTLD_NOW: c_int = 2;
+#[cfg(feature = "c-api")]
 const RTLD_DEEPBIND: c_int = 8;
 
+#[cfg(feature = "c-api")]
 fn locate_cpp_openh264_so() -> PathBuf {
     if let Some(p) = std::env::var_os("OPENH264_CPP_LIB") {
         return PathBuf::from(p);
@@ -537,6 +606,7 @@ fn locate_cpp_openh264_so() -> PathBuf {
     manifest_dir.join("../openh264/libopenh264.so")
 }
 
+#[cfg(feature = "c-api")]
 fn update_sha1_file(path: &Path, new_hashes: &HashMap<String, String>) {
     let original = std::fs::read_to_string(path).expect("read SHA-1 file");
     let mut updated = String::with_capacity(original.len());
@@ -581,6 +651,7 @@ fn update_sha1_file(path: &Path, new_hashes: &HashMap<String, String>) {
 /// Invoked by `./tools/update_encoder_sha1.sh`: loads C++ `libopenh264.so` via `dlopen`
 /// (`RTLD_NOW | RTLD_DEEPBIND`), computes SHA-1 digests for all cases in [`test_cases`]
 /// using ONLY the C++ encoder, and writes them to `tests/encoder_output_sha1.txt`.
+#[cfg(feature = "c-api")]
 #[test]
 #[ignore = "invoked by ./tools/update_encoder_sha1.sh to update tests/encoder_output_sha1.txt"]
 fn regenerate_sha1_from_cpp_openh264() {

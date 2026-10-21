@@ -831,7 +831,7 @@ impl ISVCDecoder {
                 else {
                     return DECODING_STATE::dsInitialOptExpected.0;
                 };
-                self.core.decode(src_slice, dst_planes, dst_info_mut).0
+                self.core.decode_raw(src_slice, dst_planes, dst_info_mut).0
             }
         )
     }
@@ -847,13 +847,14 @@ impl ISVCDecoder {
             log,
             DECODING_STATE::dsBitstreamError.0,
             {
-                let (Some(dst_planes), Some(dst_info_mut)) = (
-                    unsafe { dst.cast::<[*mut u8; 3]>().as_mut() },
-                    unsafe { dst_info.cast::<rust_types::SBufferInfo>().as_mut() },
-                ) else {
+                let (Some(dst_planes), Some(dst_info_mut)) =
+                    (unsafe { dst.cast::<[*mut u8; 3]>().as_mut() }, unsafe {
+                        dst_info.cast::<rust_types::SBufferInfo>().as_mut()
+                    })
+                else {
                     return DECODING_STATE::dsErrorFree.0;
                 };
-                self.core.flush(dst_planes, dst_info_mut).0
+                self.core.flush_raw(dst_planes, dst_info_mut).0
             }
         )
     }

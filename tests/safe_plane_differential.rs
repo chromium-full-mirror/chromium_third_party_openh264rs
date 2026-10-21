@@ -9,6 +9,7 @@
 //! builds. Every `unsafe` block here drives the raw side of a comparison; under Miri
 //! those raw accesses are additionally checked for UB.
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::prng::Prng;
@@ -41,7 +42,7 @@ fn alloc_picture_chroma_geometry(w: usize, h: usize) -> (usize, usize, usize) {
 }
 
 #[test]
-fn plane_samples_match_raw_mid_pointer_arithmetic() {
+pub(crate) fn plane_samples_match_raw_mid_pointer_arithmetic() {
     let mut rng = Prng::new(0x9A5D_0001);
 
     let sizes: &[(usize, usize)] = if cfg!(miri) {
@@ -114,7 +115,7 @@ fn plane_samples_match_raw_mid_pointer_arithmetic() {
 }
 
 #[test]
-fn plane_cursors_match_the_roving_macroblock_pointer() {
+pub(crate) fn plane_cursors_match_the_roving_macroblock_pointer() {
     // The access pattern of macroblock reconstruction:
     // anchor at an MB origin, then read and write at small signed offsets.
     let mut rng = Prng::new(0x9A5D_0002);
@@ -154,7 +155,7 @@ fn plane_cursors_match_the_roving_macroblock_pointer() {
 }
 
 #[test]
-fn plane_writes_land_where_the_raw_pointer_would_have_put_them() {
+pub(crate) fn plane_writes_land_where_the_raw_pointer_would_have_put_them() {
     let (w, h) = (64usize, 48usize);
     let (stride, rows, origin) = alloc_picture_luma_geometry(w, h);
     let mut rng = Prng::new(0x9A5D_0003);

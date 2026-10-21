@@ -63,78 +63,73 @@ const EXPECTED_PARSEONLY: &[(&str, usize, usize, &str)] = &[
 
 /// Drives one asset through `DecodeParser`, one NAL per call, returning
 /// `(total_calls, emitted_aus, cumulative_sha1)`.
-unsafe fn run_parseonly(asset: &str, data: &[u8]) -> (usize, usize, String) {
-    unsafe {
-        let mut dec: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut dec), CM_RESULT_SUCCESS as i64);
-        let mut param = SDecodingParam::default();
-        param.uiTargetDqLayer = u8::MAX;
-        param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        param.bParseOnly = true;
-        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        assert_eq!(
-            ISVCDecoder::Initialize(dec, &param as *const SDecodingParam),
-            CM_RESULT_SUCCESS as i64
-        );
+fn run_parseonly(asset: &str, data: &[u8]) -> (usize, usize, String) {
+    let mut dec = Decoder::new();
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    param.bParseOnly = true;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    assert_eq!(
+        dec.initialize(&param),
+        CM_RESULT_SUCCESS as std::ffi::c_long
+    );
 
-        let mut info = SParserBsInfo::default();
-        let mut all = Sha1Hasher::new();
-        let mut call = 0usize;
-        let mut emitted = 0usize;
+    let mut info = SParserBsInfo::default();
+    let mut all = Sha1Hasher::new();
+    let mut call = 0usize;
+    let mut emitted = 0usize;
 
-        let mut step = |buf: *const u8, len: i32| {
-            info.uiInBsTimeStamp = call as u64 + 1;
-            let _rv = ISVCDecoder::DecodeParser(dec, buf, len, &mut info).0;
-            if info.iNalNum > 0 {
-                assert!(!info.pDstBuff.is_null(), "{asset}: null pDstBuff on emit");
-                assert!(
-                    !info.pNalLenInByte.is_null(),
-                    "{asset}: null pNalLenInByte on emit"
-                );
-                assert!(
-                    info.iSpsWidthInPixel > 0 && info.iSpsHeightInPixel > 0,
-                    "{asset}: invalid SPS dimensions {}x{}",
-                    info.iSpsWidthInPixel,
-                    info.iSpsHeightInPixel
-                );
-                assert_eq!(
-                    info.uiInBsTimeStamp, 0,
-                    "{asset}: emitting DecodeParser call zeroes uiInBsTimeStamp"
-                );
-                assert!(
-                    info.uiOutBsTimeStamp > 0,
-                    "{asset}: emitting DecodeParser call sets uiOutBsTimeStamp"
-                );
-                let mut total = 0usize;
-                for i in 0..info.iNalNum {
-                    let nal_len = *info.pNalLenInByte.add(i as usize);
-                    assert!(nal_len > 0, "{asset}: non-positive NAL length {nal_len}");
-                    total += nal_len as usize;
-                }
-                let bytes = std::slice::from_raw_parts(info.pDstBuff, total);
-                all.update(bytes);
-                emitted += 1;
+    let mut step = |dec: &mut Decoder, unit: Option<&[u8]>| {
+        info.uiInBsTimeStamp = call as u64 + 1;
+        let _rv = dec.decode_parser(unit, &mut info).0;
+        if info.iNalNum > 0 {
+            let nal_lens = info.nal_lengths(dec);
+            let bytes = info.dst_buf(dec);
+            assert!(!bytes.is_empty(), "{asset}: empty dst_buf on emit");
+            assert_eq!(
+                nal_lens.len(),
+                info.iNalNum as usize,
+                "{asset}: nal_lengths count mismatch on emit"
+            );
+            assert!(
+                info.iSpsWidthInPixel > 0 && info.iSpsHeightInPixel > 0,
+                "{asset}: invalid SPS dimensions {}x{}",
+                info.iSpsWidthInPixel,
+                info.iSpsHeightInPixel
+            );
+            assert_eq!(
+                info.uiInBsTimeStamp, 0,
+                "{asset}: emitting DecodeParser call zeroes uiInBsTimeStamp"
+            );
+            assert!(
+                info.uiOutBsTimeStamp > 0,
+                "{asset}: emitting DecodeParser call sets uiOutBsTimeStamp"
+            );
+            for &nal_len in nal_lens {
+                assert!(nal_len > 0, "{asset}: non-positive NAL length {nal_len}");
             }
-            call += 1;
-        };
-
-        for unit in split_annexb_units(data) {
-            step(unit.as_ptr(), unit.len() as i32);
+            all.update(bytes);
+            emitted += 1;
         }
-        step(std::ptr::null(), 0);
+        call += 1;
+    };
 
-        ISVCDecoder::Uninitialize(dec);
-        WelsDestroyDecoder(dec);
-        (call, emitted, all.digest())
+    for unit in split_annexb_units(data) {
+        step(&mut dec, Some(unit));
     }
+    step(&mut dec, None);
+
+    dec.uninitialize();
+    (call, emitted, all.digest())
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn decode_parser_matches_expected_output_on_every_asset() {
+pub(crate) fn decode_parser_matches_expected_output_on_every_asset() {
     for &(asset, want_calls, want_emitted, want_sha1) in EXPECTED_PARSEONLY {
         let data = common::read_stream(&format!("{asset}.264"));
-        let (calls, emitted, sha1) = unsafe { run_parseonly(asset, &data) };
+        let (calls, emitted, sha1) = run_parseonly(asset, &data);
         assert_eq!(calls, want_calls, "{asset}: call count");
         assert_eq!(emitted, want_emitted, "{asset}: emitted access unit count");
         assert_eq!(sha1, want_sha1, "{asset}: emitted bitstream SHA-1");

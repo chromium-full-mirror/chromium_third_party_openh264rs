@@ -32,6 +32,10 @@ cxx-api = ["dep:cxx", "dep:cxx-build"]
 # install the scalar directly.
 scalar = []
 
+[[bin]]
+name = "gen_sources_gni"
+path = "tools/gen_sources_gni.rs"
+
 [[bench]]
 name = "encode_bench"
 harness = false
@@ -48,99 +52,7 @@ harness = false
 required-features = ["c-api"]
 
 [[test]]
-name = "api_lifecycle_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "api_param_bounds_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_conformance_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_error_reporting_parity"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_nodelay_parity_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_numref_change_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_options_parity_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_parseonly_parity_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_reachability_sweep"
-required-features = ["c-api"]
-
-[[test]]
-name = "decoder_resolution_change_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "encode_options_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "encoder_ext_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "encoder_force_idr_ltr_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "encoder_output_sha1_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "encoder_preprocess_plugins_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "error_concealment_api_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "loopback_sha1_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "ltr_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "malformed_stream_parity"
-required-features = ["c-api"]
-
-[[test]]
-name = "multithread_decoder_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "multithread_encoder_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "simple_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "trace_callback_test"
-required-features = ["c-api"]
-
-[[test]]
-name = "trace_default_sink_test"
+name = "c_api_test"
 required-features = ["c-api"]
 
 # This is a DSP codec, and unoptimised it decodes like one: at Cargo's default

@@ -925,7 +925,7 @@ unsafe extern "C" fn decoder_decode_frame2_c(
             let Some(pDstInfo) = (unsafe { pDstInfo.as_mut() }) else {
                 return DECODING_STATE::dsInitialOptExpected;
             };
-            core.decode(src, ppDst, pDstInfo)
+            core.decode_raw(src, ppDst, pDstInfo)
         }
     )
 }
@@ -1051,7 +1051,7 @@ unsafe extern "C" fn decoder_flush_frame_c(
                 return DECODING_STATE::dsErrorFree;
             };
             let core = unsafe { &mut (*(this as *mut CWelsDecoderImpl)).core };
-            core.flush(ppDst, pDstInfo)
+            core.flush_raw(ppDst, pDstInfo)
         }
     )
 }
@@ -1864,21 +1864,8 @@ mod send_verdict {
             let rc = enc.encode_frame(&src, &mut info);
             assert_eq!(rc, CM_RESULT_SUCCESS);
             let mut out = Vec::new();
-            for l in 0..info.iLayerNum as usize {
-                let lay = &info.sLayerInfo[l];
-                if lay.pNalLengthInByte.is_null() || lay.pBsBuf.is_null() {
-                    continue;
-                }
-                let mut total = 0usize;
-                for n in 0..lay.iNalCount as usize {
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        total += *lay.pNalLengthInByte.add(n) as usize;
-                    }
-                }
-                #[allow(unsafe_code)]
-                let slice = unsafe { std::slice::from_raw_parts(lay.pBsBuf, total) };
-                out.extend_from_slice(slice);
+            for lay in info.layers() {
+                out.extend_from_slice(lay.bs_buf(&enc));
             }
             assert_eq!(enc.uninitialize(), CM_RESULT_SUCCESS);
             out
@@ -1887,12 +1874,11 @@ mod send_verdict {
         .expect("encoder thread panicked");
 
         let (w, h) = std::thread::spawn(move || {
-            let mut dst = [ptr::null_mut(); 3];
             let mut dst_info = SBufferInfo::default();
-            let state = dec.decode_no_delay(Some(&bitstream), &mut dst, &mut dst_info);
+            let state = dec.decode_no_delay(Some(&bitstream), &mut dst_info);
             assert_eq!(state, DECODING_STATE::dsErrorFree);
             assert_eq!(dst_info.iBufferStatus, 1);
-            assert!(!dst[0].is_null());
+            assert!(dst_info.yuv_planes(&dec).is_some());
             let sys = *dst_info.UsrData.sys();
             assert_eq!(dec.uninitialize(), CM_RESULT_SUCCESS as i64);
             (sys.iWidth, sys.iHeight)

@@ -8,6 +8,9 @@
 // `c_long` is i64 here and i32 on Windows; the widening is not dead there.
 #![allow(clippy::useless_conversion)]
 
+#[path = "common/mod.rs"]
+mod common;
+
 use openh264rs::api::codec_api::*;
 use openh264rs::split_annexb_units;
 
@@ -40,9 +43,7 @@ const EXPECTED_UNION: i32 = 0x36;
 const UNREACHED: [(i32, &str); 2] = [(0x4000, "dsOutOfMemory"), (0x0040, "dsRefListNullPtrs")];
 
 fn assets() -> Vec<std::path::PathBuf> {
-    let dir = std::env::var_os("OPENH264_TEST_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data"));
+    let dir = common::stream_dir();
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -56,65 +57,35 @@ fn assets() -> Vec<std::path::PathBuf> {
 
 /// One whole-stream decode; returns the OR of every state the decoder reported.
 ///
-/// # Safety
-/// Drives the C ABI: the decoder object is created, used and destroyed inside this
-/// call.
-unsafe fn sweep_one(data: &[u8], ec: ERROR_CON_IDC, bs: VIDEO_BITSTREAM_TYPE) -> i32 {
-    unsafe {
-        let mut decoder: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(
-            i64::from(WelsCreateDecoder(&mut decoder)),
-            CM_RESULT_SUCCESS as i64
-        );
-        let mut param = SDecodingParam::default();
-        param.uiTargetDqLayer = u8::MAX;
-        param.eEcActiveIdc = ec;
-        param.sVideoProperty.eVideoBsType = bs;
-        assert_eq!(
-            i64::from(ISVCDecoder::Initialize(
-                decoder,
-                &param as *const SDecodingParam
-            )),
-            CM_RESULT_SUCCESS as i64
-        );
+fn sweep_one(data: &[u8], ec: ERROR_CON_IDC, bs: VIDEO_BITSTREAM_TYPE) -> i32 {
+    let mut decoder = Decoder::new();
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = ec;
+    param.sVideoProperty.eVideoBsType = bs;
+    assert_eq!(
+        decoder.initialize(&param),
+        CM_RESULT_SUCCESS as std::ffi::c_long
+    );
 
-        let mut union_bits = 0i32;
-        let mut feed = |unit: &[u8]| {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut info = SBufferInfo::default();
-            let src = if unit.is_empty() {
-                std::ptr::null()
-            } else {
-                unit.as_ptr()
-            };
-            let st = ISVCDecoder::DecodeFrame2(
-                decoder,
-                src,
-                unit.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut info,
-            );
-            union_bits |= st.0;
-        };
-        for unit in split_annexb_units(data) {
-            feed(unit);
-        }
-        let mut eos = 1i32;
-        ISVCDecoder::SetOption(
-            decoder,
-            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
-            &mut eos as *mut i32 as *mut std::ffi::c_void,
-        );
-        feed(&[]);
-        ISVCDecoder::Uninitialize(decoder);
-        WelsDestroyDecoder(decoder);
-        union_bits
+    let mut union_bits = 0i32;
+    let mut feed = |decoder: &mut Decoder, unit: Option<&[u8]>| {
+        let mut info = SBufferInfo::default();
+        let st = decoder.decode(unit, &mut info);
+        union_bits |= st.0;
+    };
+    for unit in split_annexb_units(data) {
+        feed(&mut decoder, Some(unit));
     }
+    decoder.set_end_of_stream(true);
+    feed(&mut decoder, None);
+    decoder.uninitialize();
+    union_bits
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn every_res_stream_under_every_concealment_mode_reaches_a_known_set_of_states() {
+pub(crate) fn every_res_stream_under_every_concealment_mode_reaches_a_known_set_of_states() {
     let files = assets();
     assert!(
         files.len() >= 50,
@@ -145,7 +116,7 @@ fn every_res_stream_under_every_concealment_mode_reaches_a_known_set_of_states()
                             // The decode itself is the abort test: an `extern "C"`
                             // thunk that panics kills this process and no assertion
                             // below ever runs.
-                            let bits = unsafe { sweep_one(&data, ec, bs) };
+                            let bits = sweep_one(&data, ec, bs);
                             decodes += 1;
                             union_bits |= bits;
                             for (bit, label) in UNREACHED {

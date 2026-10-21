@@ -7,17 +7,15 @@
 //! multi-spatial-layer SVC, verifying bitstream determinism and decode roundtrip.
 
 use openh264rs::api::codec_api::{SliceModeEnum::*, *};
-use std::{ptr, slice};
 
 #[test]
-fn test_multithread_encoder() {
-    let run = |threads: u16, mode: SliceModeEnum, layers: usize, lb: bool| unsafe {
+pub(crate) fn test_multithread_encoder() {
+    let run = |threads: u16, mode: SliceModeEnum, layers: usize, lb: bool| {
         let (w, h) = (320i32, 192i32);
-        let mut enc: *mut ISVCEncoder = ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
+        let mut enc = Encoder::new();
 
         let mut p = SEncParamExt::default();
-        let rv = ISVCEncoder::GetDefaultParams(enc, &mut p);
+        let rv = enc.default_params(&mut p);
         assert_eq!(rv, CM_RESULT_SUCCESS);
         p.iPicWidth = w;
         p.iPicHeight = h;
@@ -39,67 +37,47 @@ fn test_multithread_encoder() {
             s.sSliceArgument.uiSliceMbNum[..slices as usize]
                 .fill(((lw / 16) * (lh / 16)) as u32 / slices);
         }
-        assert_eq!(ISVCEncoder::InitializeExt(enc, &p), CM_RESULT_SUCCESS);
+        assert_eq!(enc.initialize_ext(&p), CM_RESULT_SUCCESS);
 
-        let mut dec: *mut ISVCDecoder = ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut dec), CM_RESULT_SUCCESS as i64);
+        let mut dec = Decoder::new();
         let dp = SDecodingParam {
             uiTargetDqLayer: u8::MAX,
             ..Default::default()
         };
-        assert_eq!(ISVCDecoder::Initialize(dec, &dp), CM_RESULT_SUCCESS as i64);
+        assert_eq!(dec.initialize(&dp), CM_RESULT_SUCCESS as std::ffi::c_long);
 
         let luma = (w * h) as usize;
         let mut yuv = vec![0u8; luma * 3 / 2];
-        let mut pic = SSourcePicture {
-            iColorFormat: EVideoFormatType::videoFormatI420 as i32,
-            iStride: [w, w / 2, w / 2, 0],
-            pData: [
-                yuv.as_mut_ptr(),
-                yuv[luma..].as_mut_ptr(),
-                yuv[luma * 5 / 4..].as_mut_ptr(),
-                ptr::null_mut(),
-            ],
-            iPicWidth: w,
-            iPicHeight: h,
-            ..Default::default()
-        };
 
         let mut stream = Vec::new();
         for f in 0..8usize {
             for (i, b) in yuv.iter_mut().enumerate() {
                 *b = ((i * 3 + f * 17) & 0xff) as u8;
             }
-            pic.uiTimeStamp = (f as i64) * 33;
+            let pic = SourcePicture::from_i420(&yuv, w, h).with_timestamp((f as i64) * 33);
             let mut bs = SFrameBSInfo::default();
-            assert_eq!(ISVCEncoder::EncodeFrame(enc, &pic, &mut bs), 0);
+            assert_eq!(enc.encode_frame(&pic, &mut bs), 0);
             assert!(bs.iFrameSizeInBytes > 0);
 
             let mut au = Vec::new();
-            for l in &bs.sLayerInfo[..bs.iLayerNum as usize] {
-                let nals = slice::from_raw_parts(l.pNalLengthInByte, l.iNalCount as usize);
-                let len: usize = nals.iter().map(|&n| n as usize).sum();
-                let bytes = slice::from_raw_parts(l.pBsBuf, len);
+            for l in bs.layers() {
+                let bytes = l.bs_buf(&enc);
                 stream.extend_from_slice(bytes);
                 if l.uiSpatialId == 0 {
                     au.extend_from_slice(bytes);
                 }
             }
 
-            let mut dst = [ptr::null_mut(); 3];
             let mut info = SBufferInfo::default();
-            let (ptr, len) = (au.as_ptr(), au.len() as i32);
-            let st = ISVCDecoder::DecodeFrameNoDelay(dec, ptr, len, dst.as_mut_ptr(), &mut info);
+            let st = dec.decode_no_delay(Some(&au), &mut info);
             assert_eq!(st, DECODING_STATE::dsErrorFree);
             assert_eq!(info.iBufferStatus, 1);
             assert_eq!(info.UsrData.sSystemBuffer.iWidth, w >> (layers - 1));
             assert_eq!(info.UsrData.sSystemBuffer.iHeight, h >> (layers - 1));
         }
 
-        assert_eq!(ISVCDecoder::Uninitialize(dec), CM_RESULT_SUCCESS as i64);
-        WelsDestroyDecoder(dec);
-        assert_eq!(ISVCEncoder::Uninitialize(enc), CM_RESULT_SUCCESS);
-        WelsDestroySVCEncoder(enc);
+        assert_eq!(dec.uninitialize(), CM_RESULT_SUCCESS as std::ffi::c_long);
+        assert_eq!(enc.uninitialize(), CM_RESULT_SUCCESS);
         stream
     };
 

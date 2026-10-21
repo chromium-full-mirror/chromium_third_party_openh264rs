@@ -11,6 +11,7 @@
 
 #![allow(non_snake_case)]
 
+#[path = "common/mod.rs"]
 mod common;
 
 use common::prng::Prng;
@@ -38,7 +39,7 @@ fn rbsp_with_slack(payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn leading_zero_bits_matches_the_table() {
+pub(crate) fn leading_zero_bits_matches_the_table() {
     // `GetLeadingZeroBits` walks `g_kuiLeadingZeroTable`; the safe reader uses
     // `leading_zeros()`. Compared over every byte-boundary case plus a PRNG sample.
     let mut rng = Prng::new(0x8B17_0006);
@@ -55,7 +56,7 @@ fn leading_zero_bits_matches_the_table() {
 }
 
 #[test]
-fn trailing_bits_matches_for_every_byte() {
+pub(crate) fn trailing_bits_matches_for_every_byte() {
     for b in 0..=255u8 {
         let old = BsGetTrailingBits(&b);
         assert_eq!(old, trailing_bits(b), "byte {b:#04x}");
@@ -140,7 +141,7 @@ fn assert_cavlc_cycle_matches(
 }
 
 #[test]
-fn cavlc_mode_matches_the_raw_pair_from_prng_cursor_states() {
+pub(crate) fn cavlc_mode_matches_the_raw_pair_from_prng_cursor_states() {
     // The arithmetic is a function of (pos, left_bits), so cursor states are randomised
     // and not just buffers: reads of random widths walk `left_bits` through its whole
     // -16..=0 range and `pos` through every byte phase.
@@ -184,7 +185,7 @@ fn cavlc_mode_matches_the_raw_pair_from_prng_cursor_states() {
 }
 
 #[test]
-fn cavlc_mode_matches_at_every_bit_phase() {
+pub(crate) fn cavlc_mode_matches_at_every_bit_phase() {
     // Exhaustive over `idx & 7`, the axis the arithmetic turns on: every starting phase
     // crossed with every `iUsedBits` phase, so the `>> 3` reseat and the
     // `-16 + (idx & 7)` bias see all 64 combinations.
@@ -235,7 +236,7 @@ fn cavlc_mode_matches_at_every_bit_phase() {
 }
 
 #[test]
-fn cavlc_mode_matches_where_the_prime_leans_on_the_slop() {
+pub(crate) fn cavlc_mode_matches_where_the_prime_leans_on_the_slop() {
     // `BsEndCavlc` loads 4 bytes at `iIndex >> 3` with no bounds test of its own, the
     // same `READER_SLOP` regime as every other prime in the family. Here the mode
     // closes at and past the declared RBSP end, so the load reaches into the slack.
@@ -299,7 +300,7 @@ impl WriteOp {
 }
 
 #[test]
-fn exp_golomb_sizes_match_the_table_driven_versions() {
+pub(crate) fn exp_golomb_sizes_match_the_table_driven_versions() {
     for v in 0..if cfg!(miri) { 2000 } else { 70000u32 } {
         assert_eq!(BsSizeUE(v), size_ue(v), "BsSizeUE({v})");
     }
@@ -316,7 +317,7 @@ fn exp_golomb_sizes_match_the_table_driven_versions() {
 }
 
 #[test]
-fn written_streams_read_back_through_the_old_reader() {
+pub(crate) fn written_streams_read_back_through_the_old_reader() {
     // `BsWriter` output read back through the table-driven reader.
     let mut rng = Prng::new(0x77E1_0005);
     for round in 0..scale(100) {

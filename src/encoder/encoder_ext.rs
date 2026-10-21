@@ -3053,6 +3053,8 @@ pub fn WelsEncoderEncodeExt(
     for iNalIdx in 0..MAX_LAYER_NUM_OF_FRAME as usize {
         pFbi.sLayerInfo[iNalIdx].eFrameType = EVideoFrameType::videoFrameTypeSkip;
         pFbi.sLayerInfo[iNalIdx].iNalCount = 0;
+        pFbi.sLayerInfo[iNalIdx].pNalLengthInByte = std::ptr::null_mut();
+        pFbi.sLayerInfo[iNalIdx].pBsBuf = std::ptr::null_mut();
     }
 
     let mut iLbi: usize = 0;

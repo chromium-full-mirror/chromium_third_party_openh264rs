@@ -86,31 +86,22 @@ const CPP_BUFS: &[i32] = &[
 ];
 
 /// SHA-1 over the three planes at the strides `UsrData` reports.
-///
-/// # Safety
-/// `dst` must be the plane pointers `DecodeFrame2` just wrote with
-/// `iBufferStatus == 1`, valid for the dimensions and strides in `info`.
-unsafe fn hash_frame(info: &SBufferInfo, dst: [*mut u8; 3]) -> (i32, i32, String) {
-    unsafe {
-        let sys = info.UsrData.sys();
-        let (w, h) = (sys.iWidth as usize, sys.iHeight as usize);
-        let (sy, suv) = (sys.iStride[0] as usize, sys.iStride[1] as usize);
-        let mut hasher = Sha1Hasher::new();
-        let mut plane = |p: *mut u8, w: usize, h: usize, stride: usize| {
-            for row in 0..h {
-                hasher.update(std::slice::from_raw_parts(p.add(row * stride), w));
-            }
-        };
-        plane(dst[0], w, h, sy);
-        plane(dst[1], w / 2, h / 2, suv);
-        plane(dst[2], w / 2, h / 2, suv);
-        (sys.iWidth, sys.iHeight, hasher.digest())
+fn hash_frame(dec: &Decoder, info: &SBufferInfo) -> (i32, i32, String) {
+    let sys = info.UsrData.sys();
+    let mut hasher = Sha1Hasher::new();
+    for row in info
+        .y_rows(dec)
+        .chain(info.u_rows(dec))
+        .chain(info.v_rows(dec))
+    {
+        hasher.update(row);
     }
+    (sys.iWidth, sys.iHeight, hasher.digest())
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn num_ref_frame_change_resizes_the_pool_and_matches_the_reference() {
+pub(crate) fn num_ref_frame_change_resizes_the_pool_and_matches_the_reference() {
     let data = common::read_stream("num_ref_change_320x192.264");
 
     let mut codes = Vec::new();
@@ -119,53 +110,32 @@ fn num_ref_frame_change_resizes_the_pool_and_matches_the_reference() {
 
     // Annex-B split, `ERROR_CON_SLICE_COPY`, one NAL per call, then the
     // end-of-stream drain.
-    unsafe {
-        let mut decoder: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut decoder), CM_RESULT_SUCCESS as i64);
-        let mut param = SDecodingParam::default();
-        param.uiTargetDqLayer = u8::MAX;
-        param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        assert_eq!(
-            ISVCDecoder::Initialize(decoder, &param as *const SDecodingParam),
-            CM_RESULT_SUCCESS as i64
-        );
+    let mut decoder = Decoder::new();
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    assert_eq!(
+        decoder.initialize(&param),
+        CM_RESULT_SUCCESS as std::ffi::c_long
+    );
 
-        let mut feed = |unit: &[u8]| {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let src = if unit.is_empty() {
-                std::ptr::null()
-            } else {
-                unit.as_ptr()
-            };
-            let ret = ISVCDecoder::DecodeFrame2(
-                decoder,
-                src,
-                unit.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
-            codes.push(ret.0);
-            bufs.push(buf_info.iBufferStatus);
-            if buf_info.iBufferStatus == 1 {
-                frames.push(hash_frame(&buf_info, p_dst));
-            }
-        };
-        for unit in split_annexb_units(&data) {
-            feed(unit);
+    let mut feed = |decoder: &mut Decoder, unit: Option<&[u8]>| {
+        let mut buf_info = SBufferInfo::default();
+        let ret = decoder.decode(unit, &mut buf_info);
+        codes.push(ret.0);
+        bufs.push(buf_info.iBufferStatus);
+        if buf_info.iBufferStatus == 1 {
+            frames.push(hash_frame(decoder, &buf_info));
         }
-        let mut eos_flag = 1i32;
-        ISVCDecoder::SetOption(
-            decoder,
-            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
-            &mut eos_flag as *mut i32 as *mut std::ffi::c_void,
-        );
-        feed(&[]);
-
-        ISVCDecoder::Uninitialize(decoder);
-        WelsDestroyDecoder(decoder);
+    };
+    for unit in split_annexb_units(&data) {
+        feed(&mut decoder, Some(unit));
     }
+    decoder.set_end_of_stream(true);
+    feed(&mut decoder, None);
+
+    decoder.uninitialize();
 
     assert_eq!(
         frames.len(),

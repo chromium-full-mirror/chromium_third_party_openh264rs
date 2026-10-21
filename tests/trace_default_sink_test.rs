@@ -20,6 +20,7 @@
 //! environment variable selecting the case, and reads the child's stderr: one process
 //! per case, no fd games, no ordering assumptions.
 
+#[path = "common/mod.rs"]
 mod common;
 
 use openh264rs::api::codec_api::*;
@@ -31,8 +32,15 @@ const CHILD_ENV: &str = "OPENH264_TRACE_SINK_CASE";
 /// stderr.
 fn stderr_of(case: &str) -> String {
     let exe = std::env::current_exe().expect("current_exe");
+    #[cfg(is_gtest_unittests)]
+    let args = [
+        "--gtest_filter=OpenH264Rs*.the_child_case",
+        "--single-process-tests",
+    ];
+    #[cfg(not(is_gtest_unittests))]
+    let args = ["the_child_case", "--exact", "--nocapture"];
     let out = Command::new(exe)
-        .args(["the_child_case", "--exact", "--nocapture"])
+        .args(args)
         .env(CHILD_ENV, case)
         .output()
         .expect("re-exec the test binary");
@@ -47,89 +55,74 @@ fn stderr_of(case: &str) -> String {
 
 /// The child's body. A no-op in the parent, where `CHILD_ENV` is unset.
 #[test]
-fn the_child_case() {
+pub(crate) fn the_child_case() {
     let Ok(case) = std::env::var(CHILD_ENV) else {
         return;
     };
     unsafe {
         match case.as_str() {
-            // `welsDecoderExt.cpp:266-268` — the null-parameter arm logs at
-            // `WELS_LOG_ERROR` and returns `cmInitParaError`.
+            // `decode_parser` on an uninitialized decoder logs at `WELS_LOG_ERROR`
+            // and returns `dsInitialOptExpected`.
             "decoder_default" => {
-                let mut d: *mut ISVCDecoder = std::ptr::null_mut();
-                assert_eq!(WelsCreateDecoder(&mut d), CM_RESULT_SUCCESS as i64);
-                let rc = ISVCDecoder::Initialize(d, std::ptr::null());
-                assert_eq!(rc, CM_INIT_PARA_ERROR as i64);
-                WelsDestroyDecoder(d);
+                let mut d = Decoder::new();
+                let rc = d.decode_parser(None, &mut SParserBsInfo::default());
+                assert_eq!(rc, DECODING_STATE::dsInitialOptExpected);
             }
-            // `welsEncoderExt.cpp:192` — the same shape on the encoder.
+            // `WelsBitRateVerification` logs at `WELS_LOG_ERROR` when bitrate < fps.
             "encoder_default" => {
-                let mut e: *mut ISVCEncoder = std::ptr::null_mut();
-                assert_eq!(WelsCreateSVCEncoder(&mut e), CM_RESULT_SUCCESS);
-                let rc = ISVCEncoder::Initialize(e, std::ptr::null());
+                let mut e = Encoder::new();
+                let param = SEncParamBase {
+                    iPicWidth: 16,
+                    iPicHeight: 16,
+                    fMaxFrameRate: 30.0,
+                    iTargetBitrate: 10,
+                    ..Default::default()
+                };
+                let rc = e.initialize(&param);
                 assert_eq!(rc, CM_INIT_PARA_ERROR);
-                WelsDestroySVCEncoder(e);
             }
             // A consumer that wants silence installs a callback that drops the line.
             "decoder_quiet" => {
-                let mut d: *mut ISVCDecoder = std::ptr::null_mut();
-                WelsCreateDecoder(&mut d);
-                let mut cb: WelsTraceCallback = Some(quiet_sink);
-                ISVCDecoder::SetOption(
-                    d,
-                    DECODER_OPTION::DECODER_OPTION_TRACE_CALLBACK,
-                    &mut cb as *mut WelsTraceCallback as *mut std::ffi::c_void,
-                );
-                ISVCDecoder::Initialize(d, std::ptr::null());
-                WelsDestroyDecoder(d);
+                let mut d = Decoder::new();
+                d.set_trace_callback(Some(quiet_sink));
+                d.decode_parser(None, &mut SParserBsInfo::default());
             }
             "encoder_quiet" => {
-                let mut e: *mut ISVCEncoder = std::ptr::null_mut();
-                WelsCreateSVCEncoder(&mut e);
-                let mut cb: WelsTraceCallback = Some(quiet_sink);
-                ISVCEncoder::SetOption(
-                    e,
-                    ENCODER_OPTION::ENCODER_OPTION_TRACE_CALLBACK,
-                    &mut cb as *mut WelsTraceCallback as *mut std::ffi::c_void,
-                );
-                ISVCEncoder::Initialize(e, std::ptr::null());
-                WelsDestroySVCEncoder(e);
+                let mut e = Encoder::new();
+                e.set_trace_callback(Some(quiet_sink));
+                let param = SEncParamBase {
+                    iPicWidth: 16,
+                    iPicHeight: 16,
+                    fMaxFrameRate: 30.0,
+                    iTargetBitrate: 10,
+                    ..Default::default()
+                };
+                e.initialize(&param);
             }
             // The decoder's default level is `WELS_LOG_ERROR`, so a WARNING-level
             // message must not appear. `BA_MW_D_IDR_LOST.264` drives
             // `UpdateAccessUnit()`'s "Key frame lost" warning and
             // `WelsInitRefList`'s "referencing pictures lost due frame gaps exist",
-            // and the reference prints nothing for this stream at its default. Then a
-            // null `Initialize`, so the same run proves the sink is live rather than
-            // merely silent.
+            // and the reference prints nothing for this stream at its default. Then an
+            // uninitialized `decode_parser`, so the same run proves the sink is live
+            // rather than merely silent.
             "decoder_level" => {
                 let path = common::stream_path("BA_MW_D_IDR_LOST.264");
                 let data = std::fs::read(path).expect("asset");
-                let mut d: *mut ISVCDecoder = std::ptr::null_mut();
-                WelsCreateDecoder(&mut d);
+                let mut d = Decoder::new();
                 let mut param = SDecodingParam::default();
                 param.uiTargetDqLayer = u8::MAX;
                 param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
                 param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-                ISVCDecoder::Initialize(d, &param as *const SDecodingParam);
+                d.initialize(&param);
                 for unit in openh264rs::split_annexb_units(&data) {
-                    let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
                     let mut info = SBufferInfo::default();
-                    ISVCDecoder::DecodeFrame2(
-                        d,
-                        unit.as_ptr(),
-                        unit.len() as i32,
-                        dst.as_mut_ptr(),
-                        &mut info,
-                    );
+                    d.decode(Some(unit), &mut info);
                 }
-                ISVCDecoder::Uninitialize(d);
-                WelsDestroyDecoder(d);
+                d.uninitialize();
 
-                let mut d2: *mut ISVCDecoder = std::ptr::null_mut();
-                WelsCreateDecoder(&mut d2);
-                ISVCDecoder::Initialize(d2, std::ptr::null());
-                WelsDestroyDecoder(d2);
+                let mut d2 = Decoder::new();
+                d2.decode_parser(None, &mut SParserBsInfo::default());
             }
             other => panic!("unknown case {other}"),
         }
@@ -148,27 +141,29 @@ unsafe extern "C" fn quiet_sink(
 }
 
 #[test]
-fn a_fresh_decoder_writes_its_error_to_stderr_with_no_callback_installed() {
+pub(crate) fn a_fresh_decoder_writes_its_error_to_stderr_with_no_callback_installed() {
     let err = stderr_of("decoder_default");
     assert!(
         err.contains("[OpenH264rs]")
             && err.contains("Error:")
-            && err.contains("invalid input argument"),
+            && err.contains("Call DecodeParser without Initialize"),
         "the default sink must be upstream's stderr writer; got:\n{err}"
     );
 }
 
 #[test]
-fn a_fresh_encoder_writes_its_error_to_stderr_with_no_callback_installed() {
+pub(crate) fn a_fresh_encoder_writes_its_error_to_stderr_with_no_callback_installed() {
     let err = stderr_of("encoder_default");
     assert!(
-        err.contains("[OpenH264rs]") && err.contains("Error:") && err.contains("invalid argv"),
+        err.contains("[OpenH264rs]")
+            && err.contains("Error:")
+            && err.contains("Invalid bitrate settings"),
         "the default sink must be upstream's stderr writer; got:\n{err}"
     );
 }
 
 #[test]
-fn an_installed_callback_replaces_the_default_sink_on_both_codecs() {
+pub(crate) fn an_installed_callback_replaces_the_default_sink_on_both_codecs() {
     for case in ["decoder_quiet", "encoder_quiet"] {
         let err = stderr_of(case);
         assert!(
@@ -187,7 +182,7 @@ fn an_installed_callback_replaces_the_default_sink_on_both_codecs() {
 /// reach stderr.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn the_decoder_defaults_to_error_level_so_its_warnings_are_silent() {
+pub(crate) fn the_decoder_defaults_to_error_level_so_its_warnings_are_silent() {
     let path = common::stream_path("BA_MW_D_IDR_LOST.264");
     assert!(path.exists(), "test input {} not found", path.display());
     let err = stderr_of("decoder_level");
@@ -197,7 +192,7 @@ fn the_decoder_defaults_to_error_level_so_its_warnings_are_silent() {
          this stream; got:\n{err}"
     );
     assert!(
-        err.contains("Error:") && err.contains("invalid input argument"),
+        err.contains("Error:") && err.contains("Call DecodeParser without Initialize"),
         "...and the sink is live, not merely silent; got:\n{err}"
     );
 }

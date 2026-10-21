@@ -311,7 +311,7 @@ unsafe fn run_encoder(
         black_box(enc_ret);
 
         let out_len = bs_info.iFrameSizeInBytes as usize;
-        let p_buf = bs_info.sLayerInfo[0].pBsBuf;
+        let p_buf = bs_info.sLayerInfo[0].bs_buf_ptr();
         if !p_buf.is_null() && out_len > 0 {
             full_bitstream.extend_from_slice(unsafe { std::slice::from_raw_parts(p_buf, out_len) });
         }

@@ -1042,8 +1042,9 @@ impl SSourcePicture {
     /// and `iStride[i]` is at least that plane's pixel width, `pData[i]` must point to a
     /// readable allocation of at least `(plane_height - 1) * iStride[i] + plane_width`
     /// initialized bytes valid for the lifetime `'_'` of `&self`.
-    #[allow(unsafe_code)]
-    pub unsafe fn as_source_picture(&self) -> SourcePicture<'_> {
+    #[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+    #[allow(unsafe_code, dead_code)]
+    pub(crate) unsafe fn as_source_picture(&self) -> SourcePicture<'_> {
         #[allow(unsafe_code)]
         unsafe fn plane_slice<'a>(
             ptr: *mut u8,
@@ -1121,6 +1122,60 @@ impl Default for SourcePicture<'_> {
     }
 }
 
+impl<'a> SourcePicture<'a> {
+    /// Constructs a packed I420 [`SourcePicture`] from a contiguous `Y || U || V` byte slice.
+    pub fn from_i420(yuv: &'a [u8], width: i32, height: i32) -> Self {
+        let w = width.max(0) as usize;
+        let h = height.max(0) as usize;
+        let luma = w.saturating_mul(h);
+        let chroma = (w >> 1).saturating_mul(h >> 1);
+        let (y, uv) = yuv.split_at(luma.min(yuv.len()));
+        let (u, v) = uv.split_at(chroma.min(uv.len()));
+        Self::from_i420_planes(y, u, v, width, height)
+    }
+
+    /// Constructs a tightly packed I420 [`SourcePicture`] from separate `Y`, `U`, and `V` planes
+    /// with default strides `[width, width / 2, width / 2]`.
+    pub fn from_i420_planes(
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        width: i32,
+        height: i32,
+    ) -> Self {
+        Self::from_i420_strided(y, u, v, width, height, [width, width >> 1, width >> 1])
+    }
+
+    /// Constructs a strided I420 [`SourcePicture`] from separate `Y`, `U`, and `V` planes
+    /// and explicit plane row strides `[stride_y, stride_u, stride_v]`.
+    pub fn from_i420_strided(
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        width: i32,
+        height: i32,
+        strides: [i32; 3],
+    ) -> Self {
+        Self {
+            iColorFormat: EVideoFormatType::videoFormatI420 as i32,
+            iStride: [strides[0], strides[1], strides[2], 0],
+            pData: [Some(y), Some(u), Some(v), None],
+            iPicWidth: width,
+            iPicHeight: height,
+            uiTimeStamp: 0,
+            bPsnrY: false,
+            bPsnrU: false,
+            bPsnrV: false,
+        }
+    }
+
+    /// Sets the picture timestamp (`uiTimeStamp`) and returns the updated [`SourcePicture`].
+    pub fn with_timestamp(mut self, timestamp: i64) -> Self {
+        self.uiTimeStamp = timestamp;
+        self
+    }
+}
+
 /// Bitstream layer output descriptor (`SLayerBSInfo`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1132,8 +1187,8 @@ pub struct SLayerBSInfo {
     pub uiLayerType: u8,
     pub iSubSeqId: i32,
     pub iNalCount: i32,
-    pub pNalLengthInByte: *mut i32,
-    pub pBsBuf: *mut u8,
+    pub(crate) pNalLengthInByte: *mut i32,
+    pub(crate) pBsBuf: *mut u8,
     pub rPsnr: [f32; 3],
 }
 
@@ -1151,6 +1206,68 @@ impl Default for SLayerBSInfo {
             pBsBuf: ptr::null_mut(),
             rPsnr: [0.0; 3],
         }
+    }
+}
+
+impl SLayerBSInfo {
+    /// Raw pointer to the per-NAL byte length array (`pNalLengthInByte`).
+    #[inline]
+    pub const fn nal_lengths_ptr(&self) -> *const i32 {
+        self.pNalLengthInByte.cast_const()
+    }
+
+    /// Raw pointer to the layer bitstream buffer (`pBsBuf`).
+    #[inline]
+    pub const fn bs_buf_ptr(&self) -> *const u8 {
+        self.pBsBuf.cast_const()
+    }
+
+    /// Returns the per-NAL byte lengths (`pNalLengthInByte[..iNalCount]`) for this layer,
+    /// borrowing the owning [`Encoder`](crate::api::encoder::Encoder).
+    ///
+    /// Valid only for the [`SFrameBSInfo`] produced by the most recent
+    /// [`encode_frame`](crate::api::encoder::Encoder::encode_frame) or
+    /// [`encode_parameter_sets`](crate::api::encoder::Encoder::encode_parameter_sets)
+    /// call on `enc`. After a subsequent encode call, returns `&[]` if the layer/NAL
+    /// layout changed, or reads the newly overwritten lengths if the layout matches.
+    #[inline]
+    pub fn nal_lengths<'a>(&self, enc: &'a crate::api::encoder::Encoder) -> &'a [i32] {
+        let Ok(count) = usize::try_from(self.iNalCount) else {
+            return &[];
+        };
+        enc.slice_layer_nal_lengths(self.pNalLengthInByte.cast_const(), count)
+    }
+
+    /// Returns the concatenated Annex-B bitstream bytes (`pBsBuf`) for all NAL units in this layer,
+    /// borrowing the owning [`Encoder`](crate::api::encoder::Encoder).
+    ///
+    /// Subject to the same single-call validity window as [`Self::nal_lengths`].
+    #[inline]
+    pub fn bs_buf<'a>(&self, enc: &'a crate::api::encoder::Encoder) -> &'a [u8] {
+        let len: usize = self
+            .nal_lengths(enc)
+            .iter()
+            .map(|&n| n.max(0) as usize)
+            .sum();
+        enc.slice_layer_bs_buf(self.pBsBuf.cast_const(), len)
+    }
+
+    /// Iterates over each individual Annex-B NAL unit slice in this layer,
+    /// borrowing the owning [`Encoder`](crate::api::encoder::Encoder).
+    #[inline]
+    pub fn nals<'a>(
+        &self,
+        enc: &'a crate::api::encoder::Encoder,
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let bs = self.bs_buf(enc);
+        let mut offset = 0usize;
+        self.nal_lengths(enc).iter().filter_map(move |&len| {
+            let n = usize::try_from(len).ok()?;
+            let end = offset.checked_add(n)?;
+            let slice = bs.get(offset..end)?;
+            offset = end;
+            Some(slice)
+        })
     }
 }
 
@@ -1174,6 +1291,14 @@ impl Default for SFrameBSInfo {
             iFrameSizeInBytes: 0,
             uiTimeStamp: 0,
         }
+    }
+}
+
+impl SFrameBSInfo {
+    /// Returns the active [`SLayerBSInfo`] slice (`sLayerInfo[..iLayerNum]`) for this frame.
+    pub fn layers(&self) -> &[SLayerBSInfo] {
+        let count = self.iLayerNum.clamp(0, MAX_LAYER_NUM_OF_FRAME as i32) as usize;
+        &self.sLayerInfo[..count]
     }
 }
 
@@ -1245,7 +1370,7 @@ pub struct SBufferInfo {
     pub uiInBsTimeStamp: u64,
     pub uiOutYuvTimeStamp: u64,
     pub UsrData: SBufferInfoUsrData,
-    pub pDst: [*mut u8; 3],
+    pub(crate) pDst: [*mut u8; 3],
 }
 
 impl Default for SBufferInfo {
@@ -1262,13 +1387,139 @@ impl Default for SBufferInfo {
     }
 }
 
+impl SBufferInfo {
+    /// Returns a reference to the system buffer metadata (`UsrData.sSystemBuffer`).
+    #[inline]
+    pub fn system_buffer(&self) -> &SSysMEMBuffer {
+        &self.UsrData.sSystemBuffer
+    }
+
+    /// Returns a mutable reference to the system buffer metadata (`UsrData.sSystemBuffer`).
+    #[inline]
+    pub fn system_buffer_mut(&mut self) -> &mut SSysMEMBuffer {
+        &mut self.UsrData.sSystemBuffer
+    }
+
+    /// Returns the strided `(y, u, v)` plane byte slices when `iBufferStatus == 1`
+    /// and plane pointers and dimensions match the most recent frame emitted by `dec`,
+    /// or `None` otherwise, borrowing the owning [`Decoder`](crate::api::decoder::Decoder).
+    ///
+    /// Each slice spans from the first pixel of row 0 to the last active pixel of
+    /// the final row (`(height - 1) * stride + width`).
+    ///
+    /// Valid only until the next decode/flush/uninitialize call on `dec`; a stale
+    /// `SBufferInfo` from an earlier call returns `None` once `dec` advances to
+    /// another DPB slot or produces no output (`iBufferStatus == 0`).
+    #[inline]
+    pub fn yuv_planes<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> Option<(&'a [u8], &'a [u8], &'a [u8])> {
+        if self.iBufferStatus != 1 {
+            return None;
+        }
+        let sys = &self.UsrData.sSystemBuffer;
+        let w = usize::try_from(sys.iWidth).ok()?;
+        let h = usize::try_from(sys.iHeight).ok()?;
+        let sy = usize::try_from(sys.iStride[0]).ok()?;
+        let suv = usize::try_from(sys.iStride[1]).ok()?;
+        let uv_w = w / 2;
+        let uv_h = h / 2;
+        if w == 0
+            || h == 0
+            || uv_w == 0
+            || uv_h == 0
+            || sy < w
+            || suv < uv_w
+            || self.pDst[0].is_null()
+            || self.pDst[1].is_null()
+            || self.pDst[2].is_null()
+        {
+            return None;
+        }
+        let y_len = (h - 1).checked_mul(sy)?.checked_add(w)?;
+        let uv_len = (uv_h - 1).checked_mul(suv)?.checked_add(uv_w)?;
+        dec.slice_yuv_planes(&self.pDst, y_len, uv_len)
+    }
+
+    /// Iterates over the active pixel rows (`iWidth` bytes each) of the Y plane
+    /// when `iBufferStatus == 1` (empty iterator otherwise), borrowing the owning
+    /// [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn y_rows<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let sys = &self.UsrData.sSystemBuffer;
+        let w = usize::try_from(sys.iWidth).unwrap_or(0);
+        let h = usize::try_from(sys.iHeight).unwrap_or(0);
+        let sy = usize::try_from(sys.iStride[0]).unwrap_or(0);
+        let plane = self.yuv_planes(dec).map(|(y, _, _)| y).unwrap_or(&[]);
+        (0..if plane.is_empty() { 0 } else { h }).map(move |row| &plane[row * sy..row * sy + w])
+    }
+
+    /// Iterates over the active pixel rows (`iWidth / 2` bytes each) of the U plane
+    /// when `iBufferStatus == 1` (empty iterator otherwise), borrowing the owning
+    /// [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn u_rows<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let sys = &self.UsrData.sSystemBuffer;
+        let uv_w = usize::try_from(sys.iWidth).unwrap_or(0) / 2;
+        let uv_h = usize::try_from(sys.iHeight).unwrap_or(0) / 2;
+        let suv = usize::try_from(sys.iStride[1]).unwrap_or(0);
+        let plane = self.yuv_planes(dec).map(|(_, u, _)| u).unwrap_or(&[]);
+        (0..if plane.is_empty() { 0 } else { uv_h })
+            .map(move |row| &plane[row * suv..row * suv + uv_w])
+    }
+
+    /// Iterates over the active pixel rows (`iWidth / 2` bytes each) of the V plane
+    /// when `iBufferStatus == 1` (empty iterator otherwise), borrowing the owning
+    /// [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn v_rows<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let sys = &self.UsrData.sSystemBuffer;
+        let uv_w = usize::try_from(sys.iWidth).unwrap_or(0) / 2;
+        let uv_h = usize::try_from(sys.iHeight).unwrap_or(0) / 2;
+        let suv = usize::try_from(sys.iStride[1]).unwrap_or(0);
+        let plane = self.yuv_planes(dec).map(|(_, _, v)| v).unwrap_or(&[]);
+        (0..if plane.is_empty() { 0 } else { uv_h })
+            .map(move |row| &plane[row * suv..row * suv + uv_w])
+    }
+
+    /// Borrows this decoded frame as a [`SourcePicture`] suitable for passing to
+    /// [`crate::api::encoder::Encoder::encode_frame`], or returns `None` if
+    /// `iBufferStatus != 1`, borrowing the owning [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn as_source_picture<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> Option<SourcePicture<'a>> {
+        let (y, u, v) = self.yuv_planes(dec)?;
+        let sys = &self.UsrData.sSystemBuffer;
+        Some(SourcePicture::from_i420_strided(
+            y,
+            u,
+            v,
+            sys.iWidth,
+            sys.iHeight,
+            [sys.iStride[0], sys.iStride[1], sys.iStride[1]],
+        ))
+    }
+}
+
 /// Parsed bitstream output descriptor (`SParserBsInfo`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SParserBsInfo {
     pub iNalNum: i32,
-    pub pNalLenInByte: *mut i32,
-    pub pDstBuff: *mut u8,
+    pub(crate) pNalLenInByte: *mut i32,
+    pub(crate) pDstBuff: *mut u8,
     pub iSpsWidthInPixel: i32,
     pub iSpsHeightInPixel: i32,
     pub uiInBsTimeStamp: u64,
@@ -1289,11 +1540,58 @@ impl Default for SParserBsInfo {
     }
 }
 
+impl SParserBsInfo {
+    /// Returns the per-NAL byte lengths slice (`pNalLenInByte[..iNalNum]`),
+    /// borrowing the owning [`Decoder`](crate::api::decoder::Decoder).
+    ///
+    /// Valid only until the next [`decode_parser`](crate::api::decoder::Decoder::decode_parser)
+    /// or [`uninitialize`](crate::api::decoder::Decoder::uninitialize) call on `dec`;
+    /// after a subsequent call, returns `&[]` if `iNalNum` no longer matches the
+    /// latest completed frame, or reads the newly overwritten lengths if it matches.
+    #[inline]
+    pub fn nal_lengths<'a>(&self, dec: &'a crate::api::decoder::Decoder) -> &'a [i32] {
+        let Ok(count) = usize::try_from(self.iNalNum) else {
+            return &[];
+        };
+        dec.slice_parser_nal_lengths(self.pNalLenInByte.cast_const(), count)
+    }
+
+    /// Returns the concatenated parsed bitstream slice (`pDstBuff[..total_bytes]`),
+    /// borrowing the owning [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn dst_buf<'a>(&self, dec: &'a crate::api::decoder::Decoder) -> &'a [u8] {
+        let total: usize = self
+            .nal_lengths(dec)
+            .iter()
+            .map(|&n| n.max(0) as usize)
+            .sum();
+        dec.slice_parser_dst_buf(self.pDstBuff.cast_const(), total)
+    }
+
+    /// Iterates over the individual parsed NAL byte slices in this access unit,
+    /// borrowing the owning [`Decoder`](crate::api::decoder::Decoder).
+    #[inline]
+    pub fn nals<'a>(
+        &self,
+        dec: &'a crate::api::decoder::Decoder,
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let buf = self.dst_buf(dec);
+        let mut offset = 0usize;
+        self.nal_lengths(dec).iter().filter_map(move |&len| {
+            let n = usize::try_from(len).ok()?;
+            let end = offset.checked_add(n)?;
+            let slice = buf.get(offset..end)?;
+            offset = end;
+            Some(slice)
+        })
+    }
+}
+
 pub type PParserBsInfo = *mut SParserBsInfo;
 
 /// Decoder capability descriptor (`SDecoderCapability`).
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct SDecoderCapability {
     pub iProfileIdc: i32,
     pub iProfileIop: i32,
@@ -1380,6 +1678,9 @@ pub struct SBitrateInfo {
     pub iBitrate: i32,
 }
 
+pub use crate::encoder::ref_list_mgr_svc::{SLTRMarkingFeedback, SLTRRecoverRequest};
+pub use crate::encoder::wels_encoder_ext::{SDeliveryStatus, SLTRConfig, SLevelInfo, SProfileInfo};
+
 /// Logging trace callback prototype (`WelsTraceCallback`) — `codec_api.h:129`.
 pub type WelsTraceCallback =
     Option<unsafe extern "C" fn(ctx: *mut c_void, level: i32, string: *const c_char)>;
@@ -1430,14 +1731,16 @@ pub unsafe extern "C" fn welsStderrTrace(_ctx: *mut c_void, _level: i32, string:
 // Raw C-ABI struct sanitizers
 // ===========================================================================
 
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
 #[inline]
-#[allow(unsafe_code)]
+#[allow(unsafe_code, dead_code)]
 unsafe fn sanitize_bool_at(p: *mut bool) {
     let raw = unsafe { p.cast::<u8>().read() };
     unsafe { p.cast::<u8>().write(u8::from(raw != 0)) };
 }
 
-#[allow(unsafe_code)]
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+#[allow(unsafe_code, dead_code)]
 pub(crate) unsafe fn read_sanitized_enc_param_base(p: *const SEncParamBase) -> SEncParamBase {
     unsafe {
         let mut buf = std::mem::MaybeUninit::<SEncParamBase>::uninit();
@@ -1455,7 +1758,8 @@ pub(crate) unsafe fn read_sanitized_enc_param_base(p: *const SEncParamBase) -> S
     }
 }
 
-#[allow(unsafe_code)]
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+#[allow(unsafe_code, dead_code)]
 pub(crate) unsafe fn read_sanitized_enc_param_ext(p: *const SEncParamExt) -> SEncParamExt {
     unsafe {
         let mut buf = std::mem::MaybeUninit::<SEncParamExt>::uninit();

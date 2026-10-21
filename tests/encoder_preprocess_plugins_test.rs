@@ -9,14 +9,9 @@
 use openh264rs::api::codec_api::*;
 
 /// The baseline single-layer configuration, which must stay accepted.
-fn base_params(enc: *mut ISVCEncoder, w: i32, h: i32) -> SEncParamExt {
+fn base_params(enc: &Encoder, w: i32, h: i32) -> SEncParamExt {
     let mut p = SEncParamExt::default();
-    unsafe {
-        assert_eq!(
-            ISVCEncoder::GetDefaultParams(enc, &mut p as *mut SEncParamExt),
-            CM_RESULT_SUCCESS
-        );
-    }
+    assert_eq!(enc.default_params(&mut p), CM_RESULT_SUCCESS);
     p.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME;
     p.iPicWidth = w;
     p.iPicHeight = h;
@@ -33,18 +28,14 @@ fn base_params(enc: *mut ISVCEncoder, w: i32, h: i32) -> SEncParamExt {
 
 /// `InitializeExt`'s answer for one parameter block.
 fn init_code(mutate: impl FnOnce(&mut SEncParamExt)) -> i32 {
-    unsafe {
-        let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
-        let mut p = base_params(enc, 320, 192);
-        mutate(&mut p);
-        let rv = ISVCEncoder::InitializeExt(enc, &p as *const SEncParamExt);
-        if rv == CM_RESULT_SUCCESS {
-            ISVCEncoder::Uninitialize(enc);
-        }
-        WelsDestroySVCEncoder(enc);
-        rv
+    let mut enc = Encoder::new();
+    let mut p = base_params(&enc, 320, 192);
+    mutate(&mut p);
+    let rv = enc.initialize_ext(&p);
+    if rv == CM_RESULT_SUCCESS {
+        enc.uninitialize();
     }
+    rv
 }
 
 /// A source frame with structure at every scale: a coarse gradient the downsampler
@@ -74,51 +65,29 @@ fn textured_frame(w: i32, h: i32) -> Vec<u8> {
 /// Encode `frames` frames of [`textured_frame`] and return every coded byte, so two
 /// configurations can be compared as bitstreams rather than as return codes.
 fn encode_bytes(w: i32, h: i32, frames: usize, mutate: impl FnOnce(&mut SEncParamExt)) -> Vec<u8> {
-    unsafe {
-        let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
-        let mut p = base_params(enc, w, h);
-        mutate(&mut p);
+    let mut enc = Encoder::new();
+    let mut p = base_params(&enc, w, h);
+    mutate(&mut p);
+    assert_eq!(enc.initialize_ext(&p), CM_RESULT_SUCCESS, "InitializeExt");
+
+    let buf = textured_frame(w, h);
+    let pic = SourcePicture::from_i420(&buf, w, h);
+
+    let mut out = Vec::new();
+    for _ in 0..frames {
+        let mut info = SFrameBSInfo::default();
         assert_eq!(
-            ISVCEncoder::InitializeExt(enc, &p as *const SEncParamExt),
+            enc.encode_frame(&pic, &mut info),
             CM_RESULT_SUCCESS,
-            "InitializeExt"
+            "EncodeFrame"
         );
-
-        let luma = (w * h) as usize;
-        let mut buf = textured_frame(w, h);
-        let mut pic = SSourcePicture::default();
-        pic.iColorFormat = EVideoFormatType::videoFormatI420 as i32;
-        pic.iPicWidth = w;
-        pic.iPicHeight = h;
-        pic.iStride[0] = w;
-        pic.iStride[1] = w / 2;
-        pic.iStride[2] = w / 2;
-        pic.pData[0] = buf.as_mut_ptr();
-        pic.pData[1] = buf.as_mut_ptr().add(luma);
-        pic.pData[2] = buf.as_mut_ptr().add(luma + luma / 4);
-
-        let mut out = Vec::new();
-        for _ in 0..frames {
-            let mut info = SFrameBSInfo::default();
-            assert_eq!(
-                ISVCEncoder::EncodeFrame(enc, &pic as *const SSourcePicture, &mut info),
-                CM_RESULT_SUCCESS,
-                "EncodeFrame"
-            );
-            for li in 0..info.iLayerNum as usize {
-                let layer = &info.sLayerInfo[li];
-                let n: i32 = (0..layer.iNalCount as usize)
-                    .map(|i| *layer.pNalLengthInByte.add(i))
-                    .sum();
-                out.extend_from_slice(std::slice::from_raw_parts(layer.pBsBuf, n as usize));
-            }
+        for layer in info.layers() {
+            out.extend_from_slice(layer.bs_buf(&enc));
         }
-
-        ISVCEncoder::Uninitialize(enc);
-        WelsDestroySVCEncoder(enc);
-        out
     }
+
+    enc.uninitialize();
+    out
 }
 
 /// [`textured_frame`] with every plane rolled up by `rows` luma lines (chroma by
@@ -155,62 +124,40 @@ fn encode_scrolling(
     rows_per_frame: usize,
     mutate: impl FnOnce(&mut SEncParamExt),
 ) -> Vec<u8> {
-    unsafe {
-        let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
-        let mut p = base_params(enc, w, h);
-        p.iRCMode = RC_MODES::RC_OFF_MODE;
-        p.iMinQp = 0;
-        p.iMaxQp = 51;
-        p.sSpatialLayers[0].iDLayerQp = 26;
-        mutate(&mut p);
+    let mut enc = Encoder::new();
+    let mut p = base_params(&enc, w, h);
+    p.iRCMode = RC_MODES::RC_OFF_MODE;
+    p.iMinQp = 0;
+    p.iMaxQp = 51;
+    p.sSpatialLayers[0].iDLayerQp = 26;
+    mutate(&mut p);
+    assert_eq!(enc.initialize_ext(&p), CM_RESULT_SUCCESS, "InitializeExt");
+
+    let (uw, uh) = (w as usize, h as usize);
+    let base = textured_frame(w, h);
+    let mut out = Vec::new();
+    for f in 0..frames {
+        let buf = scrolled(&base, uw, uh, (f * rows_per_frame) % uh);
+        let pic = SourcePicture::from_i420(&buf, w, h);
+
+        let mut info = SFrameBSInfo::default();
         assert_eq!(
-            ISVCEncoder::InitializeExt(enc, &p as *const SEncParamExt),
+            enc.encode_frame(&pic, &mut info),
             CM_RESULT_SUCCESS,
-            "InitializeExt"
+            "EncodeFrame"
         );
-
-        let (uw, uh) = (w as usize, h as usize);
-        let luma = uw * uh;
-        let base = textured_frame(w, h);
-        let mut out = Vec::new();
-        for f in 0..frames {
-            let mut buf = scrolled(&base, uw, uh, (f * rows_per_frame) % uh);
-            let mut pic = SSourcePicture::default();
-            pic.iColorFormat = EVideoFormatType::videoFormatI420 as i32;
-            pic.iPicWidth = w;
-            pic.iPicHeight = h;
-            pic.iStride[0] = w;
-            pic.iStride[1] = w / 2;
-            pic.iStride[2] = w / 2;
-            pic.pData[0] = buf.as_mut_ptr();
-            pic.pData[1] = buf.as_mut_ptr().add(luma);
-            pic.pData[2] = buf.as_mut_ptr().add(luma + luma / 4);
-
-            let mut info = SFrameBSInfo::default();
-            assert_eq!(
-                ISVCEncoder::EncodeFrame(enc, &pic as *const SSourcePicture, &mut info),
-                CM_RESULT_SUCCESS,
-                "EncodeFrame"
-            );
-            for li in 0..info.iLayerNum as usize {
-                let layer = &info.sLayerInfo[li];
-                let n: i32 = (0..layer.iNalCount as usize)
-                    .map(|i| *layer.pNalLengthInByte.add(i))
-                    .sum();
-                out.extend_from_slice(std::slice::from_raw_parts(layer.pBsBuf, n as usize));
-            }
+        for layer in info.layers() {
+            out.extend_from_slice(layer.bs_buf(&enc));
         }
-
-        ISVCEncoder::Uninitialize(enc);
-        WelsDestroySVCEncoder(enc);
-        out
     }
+
+    enc.uninitialize();
+    out
 }
 
 /// `SCREEN_CONTENT_REAL_TIME` is accepted at init.
 #[test]
-fn screen_content_is_accepted_at_init() {
+pub(crate) fn screen_content_is_accepted_at_init() {
     assert_eq!(
         init_code(|p| p.iUsageType = EUsageType::SCREEN_CONTENT_REAL_TIME),
         CM_RESULT_SUCCESS
@@ -220,7 +167,7 @@ fn screen_content_is_accepted_at_init() {
 /// Long-term reference over a lossless link: the `CWelsReference_LosslessWithLtr`
 /// strategy and the scene-LTR marking family behind it.
 #[test]
-fn screen_content_with_lossless_ltr_is_accepted_at_init() {
+pub(crate) fn screen_content_with_lossless_ltr_is_accepted_at_init() {
     assert_eq!(
         init_code(|p| {
             p.iUsageType = EUsageType::SCREEN_CONTENT_REAL_TIME;
@@ -235,7 +182,7 @@ fn screen_content_with_lossless_ltr_is_accepted_at_init() {
 /// LTR asked for without a lossless link. `ParamValidationExt` turns LTR off with a
 /// warning (`encoder_ext.cpp:415-419`) and the init succeeds.
 #[test]
-fn screen_content_ltr_without_lossless_link_is_accepted_at_init() {
+pub(crate) fn screen_content_ltr_without_lossless_link_is_accepted_at_init() {
     assert_eq!(
         init_code(|p| {
             p.iUsageType = EUsageType::SCREEN_CONTENT_REAL_TIME;
@@ -249,7 +196,7 @@ fn screen_content_ltr_without_lossless_link_is_accepted_at_init() {
 /// A screen-content sequence encodes to completion; nothing is asserted about the
 /// bytes.
 #[test]
-fn screen_content_encodes_a_sequence() {
+pub(crate) fn screen_content_encodes_a_sequence() {
     let screen = encode_bytes(320, 192, 12, |p| {
         p.iUsageType = EUsageType::SCREEN_CONTENT_REAL_TIME
     });
@@ -261,14 +208,14 @@ fn screen_content_encodes_a_sequence() {
 
 /// Control row: the default single-layer configuration is still accepted.
 #[test]
-fn the_gates_own_single_layer_configuration_is_still_accepted() {
+pub(crate) fn the_gates_own_single_layer_configuration_is_still_accepted() {
     assert_eq!(init_code(|_| {}), CM_RESULT_SUCCESS);
 }
 
 /// `bEnableDenoise` is accepted, and the filter runs: the coded bytes differ from
 /// the same source encoded without it.
 #[test]
-fn denoise_is_accepted_and_changes_the_output() {
+pub(crate) fn denoise_is_accepted_and_changes_the_output() {
     assert_eq!(init_code(|p| p.bEnableDenoise = true), CM_RESULT_SUCCESS);
 
     let off = encode_bytes(320, 192, 3, |p| p.bEnableDenoise = false);
@@ -288,7 +235,7 @@ fn denoise_is_accepted_and_changes_the_output() {
 /// layer is really there: the stream is larger than the one-layer encode and differs
 /// from it.
 #[test]
-fn a_downsampled_spatial_layer_is_accepted_and_encoded() {
+pub(crate) fn a_downsampled_spatial_layer_is_accepted_and_encoded() {
     // `BaseEncoderTest`'s own layer rule (`test/api/BaseEncoderTest.cpp:34-64`):
     // layer i is the input halved `n - 1 - i` times, the target bitrate is
     // multiplied by the layer count, and every layer carries that bitrate.
@@ -349,7 +296,7 @@ fn a_downsampled_spatial_layer_is_accepted_and_encoded() {
 /// quarter/one-third kernels of `CDownsampling::Process`'s first arm — that arm is the
 /// out-of-memory fallback. Three halvings happen here.
 #[test]
-fn four_spatial_layers_at_720p_are_accepted_and_encoded() {
+pub(crate) fn four_spatial_layers_at_720p_are_accepted_and_encoded() {
     let four = |p: &mut SEncParamExt| {
         let template = p.sSpatialLayers[0];
         p.iSpatialLayerNum = 4;
@@ -376,17 +323,13 @@ fn four_spatial_layers_at_720p_are_accepted_and_encoded() {
 /// `ParamTranscode` rounds layer dimensions up to a multiple of 16 while leaving
 /// `iPicWidth` alone, so 140x96 legitimately becomes a 144x96 layer.
 #[test]
-fn a_layer_rounded_up_to_a_macroblock_multiple_is_not_a_downsample() {
-    unsafe {
-        let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
-        let mut p = base_params(enc, 140, 96);
-        p.sSpatialLayers[0].iVideoWidth = 144; // what ParamTranscode would produce
-        let rv = ISVCEncoder::InitializeExt(enc, &p as *const SEncParamExt);
-        assert_eq!(rv, CM_RESULT_SUCCESS, "140x96 must still initialize");
-        ISVCEncoder::Uninitialize(enc);
-        WelsDestroySVCEncoder(enc);
-    }
+pub(crate) fn a_layer_rounded_up_to_a_macroblock_multiple_is_not_a_downsample() {
+    let mut enc = Encoder::new();
+    let mut p = base_params(&enc, 140, 96);
+    p.sSpatialLayers[0].iVideoWidth = 144; // what ParamTranscode would produce
+    let rv = enc.initialize_ext(&p);
+    assert_eq!(rv, CM_RESULT_SUCCESS, "140x96 must still initialize");
+    enc.uninitialize();
 }
 
 /// The screen-content algorithms ran: a source that scrolls eight lines per frame codes
@@ -399,7 +342,7 @@ fn a_layer_rounded_up_to_a_macroblock_multiple_is_not_a_downsample() {
 /// `PreprocessSliceCoding` installs `SetScrollingMvToMd` and
 /// `WelsMotionEstimateSearchScrolled`, so the search starts at the right vector.
 #[test]
-fn screen_content_scrolling_source_codes_smaller_than_camera() {
+pub(crate) fn screen_content_scrolling_source_codes_smaller_than_camera() {
     let camera = encode_scrolling(320, 192, 12, 8, |p| {
         p.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME
     });
@@ -431,7 +374,7 @@ fn screen_content_scrolling_source_codes_smaller_than_camera() {
 /// capture into a smaller stream while leaving iPicWidth/iPicHeight at the
 /// capture size.
 #[test]
-fn source_larger_than_max_mbs_per_frame() {
+pub(crate) fn source_larger_than_max_mbs_per_frame() {
     let max_pixels_per_frame = 36864 * 256;
     let (src_w, src_h) = (4096, 2560);
     let (layer_w, layer_h) = (2048, 1280);
@@ -439,99 +382,67 @@ fn source_larger_than_max_mbs_per_frame() {
     assert!(src_w * src_h > max_pixels_per_frame);
     assert!(layer_w * layer_h <= max_pixels_per_frame);
 
-    unsafe {
-        let mut enc: *mut ISVCEncoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateSVCEncoder(&mut enc), CM_RESULT_SUCCESS);
-        let mut p = SEncParamExt::default();
-        assert_eq!(
-            ISVCEncoder::GetDefaultParams(enc, &mut p as *mut SEncParamExt),
-            CM_RESULT_SUCCESS
-        );
-        p.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME;
-        p.iPicWidth = src_w;
-        p.iPicHeight = src_h;
-        p.fMaxFrameRate = 30.0;
-        p.iSpatialLayerNum = 1;
-        p.iRCMode = RC_MODES::RC_OFF_MODE;
-        p.sSpatialLayers[0].iVideoWidth = layer_w;
-        p.sSpatialLayers[0].iVideoHeight = layer_h;
-        p.sSpatialLayers[0].fFrameRate = p.fMaxFrameRate;
-        p.sSpatialLayers[0].sSliceArgument.uiSliceMode = SliceModeEnum::SM_SINGLE_SLICE;
-        p.sSpatialLayers[0].iDLayerQp = 26;
+    let mut enc = Encoder::new();
+    let mut p = SEncParamExt::default();
+    assert_eq!(enc.default_params(&mut p), CM_RESULT_SUCCESS);
+    p.iUsageType = EUsageType::CAMERA_VIDEO_REAL_TIME;
+    p.iPicWidth = src_w;
+    p.iPicHeight = src_h;
+    p.fMaxFrameRate = 30.0;
+    p.iSpatialLayerNum = 1;
+    p.iRCMode = RC_MODES::RC_OFF_MODE;
+    p.sSpatialLayers[0].iVideoWidth = layer_w;
+    p.sSpatialLayers[0].iVideoHeight = layer_h;
+    p.sSpatialLayers[0].fFrameRate = p.fMaxFrameRate;
+    p.sSpatialLayers[0].sSliceArgument.uiSliceMode = SliceModeEnum::SM_SINGLE_SLICE;
+    p.sSpatialLayers[0].iDLayerQp = 26;
 
-        let rv = ISVCEncoder::InitializeExt(enc, &p as *const SEncParamExt);
-        assert_eq!(rv, CM_RESULT_SUCCESS);
+    let rv = enc.initialize_ext(&p);
+    assert_eq!(rv, CM_RESULT_SUCCESS);
 
-        let stride_y = src_w as usize;
-        let stride_uv = stride_y / 2;
-        let mut buf_y = vec![128u8; stride_y * src_h as usize];
-        let mut buf_u = vec![128u8; stride_uv * (src_h as usize / 2)];
-        let mut buf_v = vec![128u8; stride_uv * (src_h as usize / 2)];
+    let stride_y = src_w as usize;
+    let stride_uv = stride_y / 2;
+    let buf_y = vec![128u8; stride_y * src_h as usize];
+    let buf_u = vec![128u8; stride_uv * (src_h as usize / 2)];
+    let buf_v = vec![128u8; stride_uv * (src_h as usize / 2)];
 
-        let mut pic = SSourcePicture::default();
-        pic.iPicWidth = src_w;
-        pic.iPicHeight = src_h;
-        pic.iColorFormat = EVideoFormatType::videoFormatI420 as i32;
-        pic.iStride[0] = stride_y as i32;
-        pic.iStride[1] = stride_uv as i32;
-        pic.iStride[2] = stride_uv as i32;
-        pic.pData[0] = buf_y.as_mut_ptr();
-        pic.pData[1] = buf_u.as_mut_ptr();
-        pic.pData[2] = buf_v.as_mut_ptr();
+    let pic = SourcePicture::from_i420_planes(&buf_y, &buf_u, &buf_v, src_w, src_h);
 
-        let mut info = SFrameBSInfo::default();
-        let rv = ISVCEncoder::EncodeFrame(enc, &pic as *const SSourcePicture, &mut info);
-        assert_eq!(rv, CM_RESULT_SUCCESS);
-        assert_eq!(info.eFrameType, EVideoFrameType::videoFrameTypeIDR);
+    let mut info = SFrameBSInfo::default();
+    let rv = enc.encode_frame(&pic, &mut info);
+    assert_eq!(rv, CM_RESULT_SUCCESS);
+    assert_eq!(info.eFrameType, EVideoFrameType::videoFrameTypeIDR);
 
-        let mut len = 0;
-        for i in 0..info.iLayerNum as usize {
-            let layer = &info.sLayerInfo[i];
-            for j in 0..layer.iNalCount as usize {
-                len += *layer.pNalLengthInByte.add(j);
-            }
-        }
-        assert!(len > 0);
+    let bs: Vec<u8> = info
+        .layers()
+        .iter()
+        .flat_map(|l| l.bs_buf(&enc))
+        .copied()
+        .collect();
+    assert!(!bs.is_empty());
 
-        // The coded frame must carry the layer geometry, not the source geometry.
-        let mut dec: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut dec), CM_RESULT_SUCCESS as i64);
-        assert!(!dec.is_null());
+    // The coded frame must carry the layer geometry, not the source geometry.
+    let mut dec = Decoder::new();
 
-        let mut dec_param = SDecodingParam::default();
-        dec_param.uiTargetDqLayer = u8::MAX;
-        dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_TYPE::VIDEO_BITSTREAM_AVC;
-        let rv = ISVCDecoder::Initialize(dec, &dec_param as *const SDecodingParam);
-        assert_eq!(rv, CM_RESULT_SUCCESS as i64);
+    let mut dec_param = SDecodingParam::default();
+    dec_param.uiTargetDqLayer = u8::MAX;
+    dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_TYPE::VIDEO_BITSTREAM_AVC;
+    let rv = dec.initialize(&dec_param);
+    assert_eq!(rv, CM_RESULT_SUCCESS as std::ffi::c_long);
 
-        let mut dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-        let mut dst_buf_info = SBufferInfo::default();
-        let rv = ISVCDecoder::DecodeFrame2(
-            dec,
-            info.sLayerInfo[0].pBsBuf,
-            len,
-            dst.as_mut_ptr(),
-            &mut dst_buf_info,
-        );
+    let mut dst_buf_info = SBufferInfo::default();
+    let rv = dec.decode(Some(&bs), &mut dst_buf_info);
+    assert_eq!(rv, DECODING_STATE::dsErrorFree);
+    if dst_buf_info.iBufferStatus == 0 {
+        let rv = dec.decode(None, &mut dst_buf_info);
         assert_eq!(rv, DECODING_STATE::dsErrorFree);
-        if dst_buf_info.iBufferStatus == 0 {
-            let rv = ISVCDecoder::DecodeFrame2(
-                dec,
-                std::ptr::null(),
-                0,
-                dst.as_mut_ptr(),
-                &mut dst_buf_info,
-            );
-            assert_eq!(rv, DECODING_STATE::dsErrorFree);
-        }
-        assert_eq!(dst_buf_info.iBufferStatus, 1);
-        let sys_buf = dst_buf_info.UsrData.sSystemBuffer;
-        assert_eq!(sys_buf.iWidth, layer_w);
-        assert_eq!(sys_buf.iHeight, layer_h);
-
-        WelsDestroyDecoder(dec);
-        ISVCEncoder::Uninitialize(enc);
-        WelsDestroySVCEncoder(enc);
     }
+    assert_eq!(dst_buf_info.iBufferStatus, 1);
+    let sys_buf = dst_buf_info.UsrData.sSystemBuffer;
+    assert_eq!(sys_buf.iWidth, layer_w);
+    assert_eq!(sys_buf.iHeight, layer_h);
+
+    dec.uninitialize();
+    enc.uninitialize();
 }

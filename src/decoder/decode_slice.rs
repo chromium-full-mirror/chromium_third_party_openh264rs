@@ -1787,15 +1787,7 @@ pub fn GetInterBPred(
                         iMVs
                     );
                     iMVs = pMv(LIST_1, iIIdx + 4);
-                    mc1!(
-                        LIST_1,
-                        iRefIndex1,
-                        iXOffset,
-                        iYOffset + 4,
-                        8,
-                        4,
-                        iMVs
-                    );
+                    mc1!(LIST_1, iRefIndex1, iXOffset, iYOffset + 4, 8, 4, iMVs);
                     blend!(lower, iRefIndex0, iRefIndex1, 8, 4);
                 } else {
                     // B_L0_8x4 B_L1_8x4
@@ -1826,15 +1818,7 @@ pub fn GetInterBPred(
                         iMVs
                     );
                     if bWeightedBipredIdcIs1 {
-                        WeightPrediction(
-                            pwt,
-                            pDec,
-                            lower,
-                            listIdx,
-                            iRefIndex as i32,
-                            8,
-                            4,
-                        );
+                        WeightPrediction(pwt, pDec, lower, listIdx, iRefIndex as i32, 8, 4);
                     }
                 }
             } else if IS_SUB_4x8(iSubMBType) {
@@ -1859,15 +1843,7 @@ pub fn GetInterBPred(
                         iMVs
                     );
                     iMVs = pMv(LIST_1, iIIdx + 1);
-                    mc1!(
-                        LIST_1,
-                        iRefIndex1,
-                        iXOffset + 4,
-                        iYOffset,
-                        4,
-                        8,
-                        iMVs
-                    );
+                    mc1!(LIST_1, iRefIndex1, iXOffset + 4, iYOffset, 4, 8, iMVs);
                     blend!(right, iRefIndex0, iRefIndex1, 4, 8);
                 } else {
                     // B_L0_4x8 B_L1_4x8
@@ -1897,15 +1873,7 @@ pub fn GetInterBPred(
                         iMVs
                     );
                     if bWeightedBipredIdcIs1 {
-                        WeightPrediction(
-                            pwt,
-                            pDec,
-                            right,
-                            listIdx,
-                            iRefIndex as i32,
-                            4,
-                            8,
-                        );
+                        WeightPrediction(pwt, pDec, right, listIdx, iRefIndex as i32, 4, 8);
                     }
                 }
             } else if IS_SUB_4x4(iSubMBType) {
@@ -1964,15 +1932,7 @@ pub fn GetInterBPred(
                             iMVs
                         );
                         if bWeightedBipredIdcIs1 {
-                            WeightPrediction(
-                                pwt,
-                                pDec,
-                                at,
-                                listIdx,
-                                iRefIndex as i32,
-                                4,
-                                4,
-                            );
+                            WeightPrediction(pwt, pDec, at, listIdx, iRefIndex as i32, 4, 4);
                         }
                     }
                 }

@@ -36,10 +36,12 @@
 use std::ffi::{c_long, c_void};
 use std::ptr;
 
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+use super::types::{CM_INIT_EXPECTED, DECODER_OPTION};
 use super::types::{
-    CM_INIT_EXPECTED, CM_INIT_PARA_ERROR, CM_RESULT_SUCCESS, DECODER_OPTION, DECODING_STATE,
-    ERROR_CON_IDC, SBufferInfo, SDecoderCapability, SDecoderStatistics, SDecodingParam,
-    SParserBsInfo, SVuiSarInfo, TraceUserCtx, VIDEO_BITSTREAM_TYPE, WelsTraceCallback,
+    CM_INIT_PARA_ERROR, CM_RESULT_SUCCESS, DECODING_STATE, ERROR_CON_IDC, SBufferInfo,
+    SDecoderCapability, SDecoderStatistics, SDecodingParam, SParserBsInfo, SVuiSarInfo,
+    TraceUserCtx, VIDEO_BITSTREAM_TYPE, WelsTraceCallback,
 };
 use crate::decoder::decoder_context::{
     LIST_0, MAX_DPB_COUNT, PICT_INFO_LIST_SIZE, parser_bs, pic_pool_ptr, prev_dpb_id,
@@ -71,6 +73,9 @@ pub struct Decoder {
     /// This object's own record of `DECODER_OPTION_END_OF_STREAM`, which `GetOption`
     /// reads back.
     pub(crate) end_of_stream: bool,
+    /// Plane addresses (`pDst[0..3]`) from the most recent `decode` or `flush` call
+    /// that produced a picture (`iBufferStatus == 1`), or `[0; 3]` otherwise.
+    pub(crate) last_output_dst: [usize; 3],
 }
 
 impl Default for Decoder {
@@ -102,7 +107,8 @@ pub(crate) fn ec_idc_from_raw(raw: i32) -> ERROR_CON_IDC {
 
 /// Parses bitstream type; values other than SVC/AVC default to `VIDEO_BITSTREAM_DEFAULT`.
 /// Upstream: `decoder.cpp`.
-#[cfg(any(feature = "c-api", feature = "cxx-api"))]
+#[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+#[allow(dead_code)]
 pub(crate) fn video_bs_type_from_raw(raw: i32) -> VIDEO_BITSTREAM_TYPE {
     match raw {
         0 => VIDEO_BITSTREAM_TYPE::VIDEO_BITSTREAM_AVC,
@@ -114,10 +120,15 @@ pub(crate) fn video_bs_type_from_raw(raw: i32) -> VIDEO_BITSTREAM_TYPE {
 impl Decoder {
     /// Creates a new uninitialized [`Decoder`].
     pub fn new() -> Self {
+        let mut trace = Box::new(crate::common::wels_trace::welsCodecTrace::new());
+        // The trace object's constructor sets `WELS_LOG_WARNING`, the encoder's
+        // default; the decoder's own default is `WELS_LOG_ERROR` (`welsDecoderExt.cpp:164`).
+        trace.SetTraceLevel(crate::common::wels_trace::WELS_LOG_ERROR as u32);
         Self {
             ctx: None,
-            trace: Box::new(crate::common::wels_trace::welsCodecTrace::new()),
+            trace,
             end_of_stream: false,
+            last_output_dst: [0; 3],
         }
     }
 
@@ -127,6 +138,7 @@ impl Decoder {
     /// been sanitised by the time it gets here: the range clamp and the bitstream
     /// type's normalisation run on the wire values, at the thunk.
     pub fn initialize(&mut self, pParam: &SDecodingParam) -> c_long {
+        self.last_output_dst = [0; 3];
         // A second `Initialize` on a live decoder rebuilds: the previous session's
         // reordering buffer, statistics, last decoded-picture record and decode
         // timestamps do not survive the teardown.
@@ -185,6 +197,7 @@ impl Decoder {
 
     /// Uninitializes the decoder context and frees active resources.
     pub fn uninitialize(&mut self) -> c_long {
+        self.last_output_dst = [0; 3];
         if let Some(mut pCtx) = self.ctx.take() {
             crate::decoder::decoder_core::WelsEndDecoder(&mut pCtx);
         }
@@ -198,6 +211,14 @@ impl Decoder {
             .as_ref()
             .map_or(0, |pCtx| pCtx.pPictReoderingStatus.iNumOfPicts)
     }
+
+    /// `DECODER_OPTION_NUM_OF_THREADS` — this port is single-threaded, so the thread count is 0.
+    pub fn num_of_threads(&self) -> i32 {
+        0
+    }
+
+    /// `DECODER_OPTION_NUM_OF_THREADS` — accepted as a no-op on the single-threaded decoder.
+    pub fn set_num_of_threads(&mut self, _threads: i32) {}
 
     /// `DECODER_OPTION_END_OF_STREAM`, both ways.
     pub fn end_of_stream(&self) -> bool {
@@ -386,7 +407,8 @@ impl Decoder {
     ///
     /// On the impl because the message needs the trace object; the thunk only has to
     /// notice the null. Upstream: `welsDecoderExt.cpp`.
-    #[cfg(any(feature = "c-api", feature = "cxx-api"))]
+    #[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+    #[allow(dead_code)]
     pub(crate) fn report_init_null_param(&mut self) -> c_long {
         crate::common::wels_trace::WelsLog(
             self.trace.m_sLogCtx,
@@ -415,17 +437,32 @@ impl Decoder {
     /// `src` is one access unit, or `None` for the end-of-stream flush that
     /// `(NULL, 0)` means on the C interface.
     ///
-    /// The output window: when `pDstInfo.iBufferStatus == 1`, `ppDst[0..3]` and
-    /// `pDstInfo.pDst[0..3]` name planes inside this decoder's picture buffer with
-    /// the strides `pDstInfo.UsrData` reports. They stay valid until the next call on
-    /// this decoder and are not the caller's to free, which is why they are pointers
-    /// here and not slices.
-    pub fn decode(
+    /// When `pDstInfo.iBufferStatus == 1`, the decoded planes can be accessed
+    /// safely via [`SBufferInfo::yuv_planes`], [`SBufferInfo::y_rows`],
+    /// [`SBufferInfo::u_rows`], [`SBufferInfo::v_rows`], or
+    /// [`SBufferInfo::as_source_picture`].
+    ///
+    /// # Output Window
+    ///
+    /// Decoded plane slices borrow this decoder's internal picture buffer until
+    /// the next mutating call on this decoder ([`Self::decode`],
+    /// [`Self::decode_no_delay`], [`Self::flush`], [`Self::uninitialize`], or
+    /// re-initialization). Passing a stale `SBufferInfo` from an earlier call
+    /// after another decode/flush call returns `None` when a different DPB slot
+    /// (or no frame) is active, or reads the newly overwritten slot contents if
+    /// the same non-reference buffer slot was reused in-place.
+    pub fn decode(&mut self, src: Option<&[u8]>, pDstInfo: &mut SBufferInfo) -> DECODING_STATE {
+        let mut ppDst = [ptr::null_mut(); 3];
+        self.decode_raw(src, &mut ppDst, pDstInfo)
+    }
+
+    pub(crate) fn decode_raw(
         &mut self,
         src: Option<&[u8]>,
         ppDst: &mut [*mut u8; 3],
         pDstInfo: &mut SBufferInfo,
     ) -> DECODING_STATE {
+        self.last_output_dst = [0; 3];
         let Some(p_ctx) = self.ctx.as_deref_mut() else {
             return DECODING_STATE::dsInitialOptExpected;
         };
@@ -611,8 +648,12 @@ impl Decoder {
             OutputStatisticsLog(&mut *p_ctx);
             // Display reordering for concealed/decoded pictures.
             ReorderPicturesInDisplay(&mut *p_ctx, ppDst, pDstInfo);
+            let error_code = p_ctx.iErrorCode;
+            if pDstInfo.iBufferStatus == 1 {
+                self.last_output_dst = pDstInfo.pDst.map(|p| p as usize);
+            }
             // The accumulated error code, whole.
-            return DECODING_STATE(p_ctx.iErrorCode);
+            return DECODING_STATE(error_code);
         }
 
         // Error-free path: update decoded frame count for DECODER_OPTION_GET_STATISTICS
@@ -628,6 +669,9 @@ impl Decoder {
         }
         p_ctx.dDecTime += dec_started.elapsed().as_secs_f64() * 1e3;
         ReorderPicturesInDisplay(&mut *p_ctx, ppDst, pDstInfo);
+        if pDstInfo.iBufferStatus == 1 {
+            self.last_output_dst = pDstInfo.pDst.map(|p| p as usize);
+        }
 
         DECODING_STATE::dsErrorFree
     }
@@ -638,15 +682,27 @@ impl Decoder {
     ///
     /// `src` is one access unit, or `None` for the `(NULL, 0)` end-of-stream call.
     ///
-    /// The output window: on the call that completes a frame, `pDstInfo`'s
-    /// `pNalLenInByte` and `pDstBuff` name this decoder's parse-only buffers —
-    /// `iNalNum` lengths and their concatenated bytes — valid until the next call on
-    /// this decoder and not the caller's to free, as with [`Self::decode`]'s planes.
+    /// # Output Window
+    ///
+    /// On the call that completes a frame, `pDstInfo` describes this decoder's
+    /// internal parse-only buffers (`iNalNum` lengths and their concatenated bytes),
+    /// accessible via [`SParserBsInfo::nal_lengths`], [`SParserBsInfo::dst_buf`],
+    /// and [`SParserBsInfo::nals`] until the next call on this decoder. After a
+    /// subsequent `decode_parser` call, the internal buffer is reused or overwritten;
+    /// a stale `SParserBsInfo` returns empty slices when `iNalNum` no longer matches
+    /// the latest completed frame, or reads the newly overwritten bytes if the new
+    /// frame has the same `iNalNum`.
     pub fn decode_parser(
         &mut self,
         src: Option<&[u8]>,
         pDstInfo: &mut SParserBsInfo,
     ) -> DECODING_STATE {
+        pDstInfo.iNalNum = 0;
+        pDstInfo.pNalLenInByte = ptr::null_mut();
+        pDstInfo.pDstBuff = ptr::null_mut();
+        pDstInfo.iSpsWidthInPixel = 0;
+        pDstInfo.iSpsHeightInPixel = 0;
+        self.last_output_dst = [0; 3];
         let Some(p_ctx) = self.ctx.as_deref_mut() else {
             crate::common::wels_trace::WelsLog(
                 self.trace.m_sLogCtx,
@@ -687,9 +743,6 @@ impl Decoder {
                 p.pNalLenInByte.fill(0);
             }
         }
-        pDstInfo.iNalNum = 0;
-        pDstInfo.iSpsWidthInPixel = 0;
-        pDstInfo.iSpsHeightInPixel = 0;
         p_ctx.uiTimeStamp = pDstInfo.uiInBsTimeStamp;
         pDstInfo.uiOutBsTimeStamp = 0;
 
@@ -769,11 +822,23 @@ impl Decoder {
     /// Upstream: `CWelsDecoder::FlushFrame` in `welsDecoderExt.cpp`.
     ///
     /// Same output window as [`Self::decode`].
-    pub fn flush(
+    pub fn flush(&mut self, pDstInfo: &mut SBufferInfo) -> DECODING_STATE {
+        let mut ppDst = [ptr::null_mut(); 3];
+        self.flush_raw(&mut ppDst, pDstInfo)
+    }
+
+    pub(crate) fn flush_raw(
         &mut self,
         ppDst: &mut [*mut u8; 3],
         pDstInfo: &mut SBufferInfo,
     ) -> DECODING_STATE {
+        ppDst[0] = ptr::null_mut();
+        ppDst[1] = ptr::null_mut();
+        ppDst[2] = ptr::null_mut();
+        let uiInBsTimeStamp = pDstInfo.uiInBsTimeStamp;
+        *pDstInfo = SBufferInfo::default();
+        pDstInfo.uiInBsTimeStamp = uiInBsTimeStamp;
+        self.last_output_dst = [0; 3];
         // With no context there is no reordering state to drain: the buffers are the
         // context's own fields.
         let Some(p_ctx) = self.ctx.as_deref_mut() else {
@@ -783,8 +848,82 @@ impl Decoder {
             // `false`: drain the slot list without touching the live pool. See
             // `pool_for`.
             ReleaseBufferedReadyPictureReorder(&mut *p_ctx, false, ppDst, pDstInfo, true);
+            if pDstInfo.iBufferStatus == 1 {
+                self.last_output_dst = pDstInfo.pDst.map(|p| p as usize);
+            }
         }
         DECODING_STATE::dsErrorFree
+    }
+
+    pub(crate) fn slice_yuv_planes(
+        &self,
+        dst: &[*mut u8; 3],
+        y_len: usize,
+        uv_len: usize,
+    ) -> Option<(&[u8], &[u8], &[u8])> {
+        if dst[0].is_null() || dst.map(|p| p as usize) != self.last_output_dst {
+            return None;
+        }
+        let p_ctx = self.ctx.as_deref()?;
+        let pool = p_ctx.pPicBuff.as_deref()?;
+        for i in 0..pool.capacity().max(0) as usize {
+            let Some(pic) = pool.slot(pool.id(i)) else {
+                continue;
+            };
+            let p0 = pic.plane(0).as_slice();
+            let p1 = pic.plane(1).as_slice();
+            let p2 = pic.plane(2).as_slice();
+            if p0.is_empty() || p1.is_empty() || p2.is_empty() {
+                continue;
+            }
+            let Some(off0) = (dst[0] as usize).checked_sub(p0.as_ptr() as usize) else {
+                continue;
+            };
+            if off0 >= p0.len() {
+                continue;
+            }
+            let off1 = (dst[1] as usize).checked_sub(p1.as_ptr() as usize)?;
+            let off2 = (dst[2] as usize).checked_sub(p2.as_ptr() as usize)?;
+            return Some((
+                p0.get(off0..off0.checked_add(y_len)?)?,
+                p1.get(off1..off1.checked_add(uv_len)?)?,
+                p2.get(off2..off2.checked_add(uv_len)?)?,
+            ));
+        }
+        None
+    }
+
+    pub(crate) fn slice_parser_nal_lengths(&self, ptr: *const i32, count: usize) -> &[i32] {
+        let Some(p_ctx) = self.ctx.as_deref() else {
+            return &[];
+        };
+        if p_ctx.bFramePending {
+            return &[];
+        }
+        let Some(p) = p_ctx.pParserBsInfo.as_deref() else {
+            return &[];
+        };
+        let active_count = usize::try_from(p.iNalNum).unwrap_or(0);
+        if ptr.is_null() || count == 0 || count != active_count || ptr != p.pNalLenInByte.as_ptr() {
+            return &[];
+        }
+        p.pNalLenInByte.get(..count).unwrap_or(&[])
+    }
+
+    pub(crate) fn slice_parser_dst_buf(&self, ptr: *const u8, len: usize) -> &[u8] {
+        let Some(p_ctx) = self.ctx.as_deref() else {
+            return &[];
+        };
+        if p_ctx.bFramePending {
+            return &[];
+        }
+        let Some(p) = p_ctx.pParserBsInfo.as_deref() else {
+            return &[];
+        };
+        if ptr.is_null() || len == 0 || ptr != p.pDstBuff.as_ptr() {
+            return &[];
+        }
+        p.pDstBuff.get(..len).unwrap_or(&[])
     }
 
     /// `WelsGetDecoderCapability` — `welsDecoderExt.cpp`.
@@ -810,11 +949,10 @@ impl Decoder {
     pub fn decode_no_delay(
         &mut self,
         src: Option<&[u8]>,
-        ppDst: &mut [*mut u8; 3],
         pDstInfo: &mut SBufferInfo,
     ) -> DECODING_STATE {
-        let first = self.decode(src, ppDst, pDstInfo);
-        let second = self.decode(None, ppDst, pDstInfo);
+        let first = self.decode(src, pDstInfo);
+        let second = self.decode(None, pDstInfo);
         DECODING_STATE(first.0 | second.0)
     }
 
@@ -825,8 +963,9 @@ impl Decoder {
     /// `pOption` must be null or point at a readable, aligned object of the type
     /// `eOptionId` names, for the duration of this call (or for the decoder's lifetime
     /// in the case of `DECODER_OPTION_TRACE_CALLBACK_CONTEXT`).
-    #[allow(unsafe_code)]
-    pub unsafe fn set_option_raw(&mut self, eOptionId: i32, pOption: *mut c_void) -> c_long {
+    #[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+    #[allow(unsafe_code, dead_code)]
+    pub(crate) unsafe fn set_option_raw(&mut self, eOptionId: i32, pOption: *mut c_void) -> c_long {
         // Upstream: `welsDecoderExt.cpp`. Nine arms, and two head clauses:
         //
         //   1. `NUM_OF_THREADS` first, and it succeeds whether or not the decoder
@@ -928,8 +1067,9 @@ impl Decoder {
     ///
     /// `pOption` must be null or point at a writable, aligned object of the type
     /// `eOptionId` names, for the duration of this call.
-    #[allow(unsafe_code)]
-    pub unsafe fn get_option_raw(&self, eOptionId: i32, pOption: *mut c_void) -> c_long {
+    #[cfg(any(feature = "c-api", feature = "cxx-api", test))]
+    #[allow(unsafe_code, dead_code)]
+    pub(crate) unsafe fn get_option_raw(&self, eOptionId: i32, pOption: *mut c_void) -> c_long {
         // Upstream: `welsDecoderExt.cpp`. Three head clauses, in this order:
         //
         //   1. `NUM_OF_THREADS` is answered before the context is looked at —

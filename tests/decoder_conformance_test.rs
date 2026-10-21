@@ -2,65 +2,41 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE_CHROMIUM file.
 
+#[path = "common/mod.rs"]
 mod common;
 use common::Sha1Hasher;
 use openh264rs::api::codec_api::*;
 use openh264rs::split_annexb_units;
 
-fn update_hash_from_plane(
-    hasher: &mut Sha1Hasher,
-    plane: *const u8,
-    width: usize,
-    height: usize,
-    stride: usize,
-) {
-    if plane.is_null() || width == 0 || height == 0 || stride == 0 {
-        return;
-    }
-    unsafe {
-        for y in 0..height {
-            let row = std::slice::from_raw_parts(plane.add(y * stride), width);
-            hasher.update(row);
-        }
-    }
-}
-
-fn update_hash_from_frame(hasher: &mut Sha1Hasher, data: [*mut u8; 3], buf_info: &SBufferInfo) {
-    if buf_info.iBufferStatus == 1 {
-        let width = buf_info.UsrData.sSystemBuffer.iWidth as usize;
-        let height = buf_info.UsrData.sSystemBuffer.iHeight as usize;
-        let stride_y = buf_info.UsrData.sSystemBuffer.iStride[0] as usize;
-        let stride_uv = buf_info.UsrData.sSystemBuffer.iStride[1] as usize;
-
-        update_hash_from_plane(hasher, data[0], width, height, stride_y);
-        update_hash_from_plane(hasher, data[1], width / 2, height / 2, stride_uv);
-        update_hash_from_plane(hasher, data[2], width / 2, height / 2, stride_uv);
+fn update_hash_from_frame(hasher: &mut Sha1Hasher, dec: &Decoder, buf_info: &SBufferInfo) {
+    for row in buf_info
+        .y_rows(dec)
+        .chain(buf_info.u_rows(dec))
+        .chain(buf_info.v_rows(dec))
+    {
+        hasher.update(row);
     }
 }
 
 #[test]
-fn test_sha1_hasher_sanity() {
+pub(crate) fn test_sha1_hasher_sanity() {
     let mut hasher = Sha1Hasher::new();
     hasher.update(b"abc");
     assert_eq!(hasher.digest(), "a9993e364706816aba3e25717850c26c9cd0d89d");
 }
 
 #[test]
-fn test_decoder_capability_query() {
-    unsafe {
-        let mut dec_cap = SDecoderCapability::default();
-        let ret = WelsGetDecoderCapability(&mut dec_cap);
-        assert_eq!(ret, CM_RESULT_SUCCESS);
-        assert_eq!(dec_cap.iProfileIdc, 66);
-        assert_eq!(dec_cap.iProfileIop, 0xE0);
-        assert_eq!(dec_cap.iLevelIdc, 32);
-        assert_eq!(dec_cap.iMaxMbps, 216000);
-        assert_eq!(dec_cap.iMaxFs, 5120);
-        assert_eq!(dec_cap.iMaxCpb, 20000);
-        assert_eq!(dec_cap.iMaxDpb, 20480);
-        assert_eq!(dec_cap.iMaxBr, 20000);
-        assert!(!dec_cap.bRedPicCap);
-    }
+pub(crate) fn test_decoder_capability_query() {
+    let dec_cap = Decoder::capability();
+    assert_eq!(dec_cap.iProfileIdc, 66);
+    assert_eq!(dec_cap.iProfileIop, 0xE0);
+    assert_eq!(dec_cap.iLevelIdc, 32);
+    assert_eq!(dec_cap.iMaxMbps, 216000);
+    assert_eq!(dec_cap.iMaxFs, 5120);
+    assert_eq!(dec_cap.iMaxCpb, 20000);
+    assert_eq!(dec_cap.iMaxDpb, 20480);
+    assert_eq!(dec_cap.iMaxBr, 20000);
+    assert!(!dec_cap.bRedPicCap);
 }
 
 /// Decodes one asset and compares the SHA-1 of its output planes against the
@@ -74,132 +50,87 @@ fn test_single_bitstream_asset_ex(file_name: &str, expected_hash: &str, hash_con
     let data = common::read_stream(file_name);
     assert!(!data.is_empty(), "Bitstream asset {} is empty", file_name);
 
-    unsafe {
-        let mut p_decoder: *mut ISVCDecoder = std::ptr::null_mut();
-        let ret = WelsCreateDecoder(&mut p_decoder);
-        assert_eq!(
-            ret, CM_RESULT_SUCCESS as i64,
-            "Failed to create decoder for {}",
-            file_name
-        );
-        assert!(!p_decoder.is_null());
+    let mut decoder = Decoder::new();
 
-        let mut dec_param = SDecodingParam::default();
-        dec_param.uiTargetDqLayer = u8::MAX;
-        dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-        dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    let mut dec_param = SDecodingParam::default();
+    dec_param.uiTargetDqLayer = u8::MAX;
+    dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
 
-        let init_ret = ISVCDecoder::Initialize(p_decoder, &dec_param as *const SDecodingParam);
-        assert_eq!(
-            init_ret, CM_RESULT_SUCCESS as i64,
-            "Failed to initialize decoder for {}",
-            file_name
-        );
+    let init_ret = decoder.initialize(&dec_param);
+    assert_eq!(
+        init_ret, CM_RESULT_SUCCESS as std::ffi::c_long,
+        "Failed to initialize decoder for {}",
+        file_name
+    );
 
-        let mut hasher = Sha1Hasher::new();
-        let units = split_annexb_units(&data);
-        let mut decoded_frames = 0;
+    let mut hasher = Sha1Hasher::new();
+    let units = split_annexb_units(&data);
+    let mut decoded_frames = 0;
 
-        for unit in units {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let dec_ret = ISVCDecoder::DecodeFrame2(
-                p_decoder,
-                unit.as_ptr(),
-                unit.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
-            if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree)
-                && buf_info.iBufferStatus == 1
-            {
-                update_hash_from_frame(&mut hasher, p_dst, &buf_info);
-                decoded_frames += 1;
-            }
-
-            // A null `DecodeFrame2` after every NAL (`h264dec.cpp:418-430`)
-            // constructs the access unit the NAL completed instead of leaving it
-            // pending. That is observable: a same-id PPS arriving next is parked in
-            // the spare slot for `WriteBackActiveParameters` rather than overwriting
-            // `sPpsBuffer[id]` in place under the pending picture
-            // (`au_parser.cpp:1458` against `:1465`).
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let dec_ret = ISVCDecoder::DecodeFrame2(
-                p_decoder,
-                std::ptr::null(),
-                0,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
-            if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree)
-                && buf_info.iBufferStatus == 1
-            {
-                update_hash_from_frame(&mut hasher, p_dst, &buf_info);
-                decoded_frames += 1;
-            }
-        }
-
-        // Flush remaining frames in decoder buffer
-        let mut eos_flag = 1i32;
-        ISVCDecoder::SetOption(
-            p_decoder,
-            DECODER_OPTION::DECODER_OPTION_END_OF_STREAM,
-            &mut eos_flag as *mut i32 as *mut std::ffi::c_void,
-        );
-
-        let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
+    for unit in units {
         let mut buf_info = SBufferInfo::default();
-        let dec_ret = ISVCDecoder::DecodeFrame2(
-            p_decoder,
-            std::ptr::null(),
-            0,
-            p_dst.as_mut_ptr(),
-            &mut buf_info,
-        );
+        let dec_ret = decoder.decode(Some(unit), &mut buf_info);
         if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1
         {
-            update_hash_from_frame(&mut hasher, p_dst, &buf_info);
+            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
             decoded_frames += 1;
         }
 
-        let mut remaining_frames = 0i32;
-        ISVCDecoder::GetOption(
-            p_decoder,
-            DECODER_OPTION::DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER,
-            &mut remaining_frames as *mut i32 as *mut std::ffi::c_void,
-        );
-
-        for _f in 0..remaining_frames {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let flush_ret = ISVCDecoder::FlushFrame(p_decoder, p_dst.as_mut_ptr(), &mut buf_info);
-            if (hash_concealed || flush_ret == DECODING_STATE::dsErrorFree)
-                && buf_info.iBufferStatus == 1
-            {
-                update_hash_from_frame(&mut hasher, p_dst, &buf_info);
-                decoded_frames += 1;
-            }
+        // A null `DecodeFrame2` after every NAL (`h264dec.cpp:418-430`)
+        // constructs the access unit the NAL completed instead of leaving it
+        // pending. That is observable: a same-id PPS arriving next is parked in
+        // the spare slot for `WriteBackActiveParameters` rather than overwriting
+        // `sPpsBuffer[id]` in place under the pending picture
+        // (`au_parser.cpp:1458` against `:1465`).
+        let mut buf_info = SBufferInfo::default();
+        let dec_ret = decoder.decode(None, &mut buf_info);
+        if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1
+        {
+            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
+            decoded_frames += 1;
         }
-
-        assert!(decoded_frames > 0, "No frames decoded for {}", file_name);
-        let calculated_hash = hasher.digest();
-        // The frame count rides in the message: a count that also moved is a
-        // different defect from one that held.
-        assert_eq!(
-            calculated_hash, expected_hash,
-            "SHA-1 hash mismatch for bitstream asset {} ({decoded_frames} frames decoded)",
-            file_name
-        );
-
-        ISVCDecoder::Uninitialize(p_decoder);
-        WelsDestroyDecoder(p_decoder);
     }
+
+    // Flush remaining frames in decoder buffer
+    decoder.set_end_of_stream(true);
+
+    let mut buf_info = SBufferInfo::default();
+    let dec_ret = decoder.decode(None, &mut buf_info);
+    if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1 {
+        update_hash_from_frame(&mut hasher, &decoder, &buf_info);
+        decoded_frames += 1;
+    }
+
+    let remaining_frames = decoder.frames_remaining();
+
+    for _f in 0..remaining_frames {
+        let mut buf_info = SBufferInfo::default();
+        let flush_ret = decoder.flush(&mut buf_info);
+        if (hash_concealed || flush_ret == DECODING_STATE::dsErrorFree)
+            && buf_info.iBufferStatus == 1
+        {
+            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
+            decoded_frames += 1;
+        }
+    }
+
+    assert!(decoded_frames > 0, "No frames decoded for {}", file_name);
+    let calculated_hash = hasher.digest();
+    // The frame count rides in the message: a count that also moved is a
+    // different defect from one that held.
+    assert_eq!(
+        calculated_hash, expected_hash,
+        "SHA-1 hash mismatch for bitstream asset {} ({decoded_frames} frames decoded)",
+        file_name
+    );
+
+    decoder.uninitialize();
 }
 
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba_mw_d() {
+pub(crate) fn test_asset_ba_mw_d() {
     test_single_bitstream_asset_ex(
         "res/BA_MW_D.264",
         "afd7a9765961ca241bb4bdf344b31397bec7465a",
@@ -208,7 +139,7 @@ fn test_asset_ba_mw_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_adobe_pdf_sample_a_1024x768_50frms() {
+pub(crate) fn test_asset_adobe_pdf_sample_a_1024x768_50frms() {
     test_single_bitstream_asset_ex(
         "res/Adobe_PDF_sample_a_1024x768_50Frms.264",
         "9aa9a4d9598eb3e1093311826844f37c43e4c521",
@@ -217,7 +148,7 @@ fn test_asset_adobe_pdf_sample_a_1024x768_50frms() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba1_ft_c() {
+pub(crate) fn test_asset_ba1_ft_c() {
     test_single_bitstream_asset_ex(
         "res/BA1_FT_C.264",
         "418d152fb85709b6f172799dcb239038df437cfa",
@@ -226,7 +157,7 @@ fn test_asset_ba1_ft_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba1_sony_d() {
+pub(crate) fn test_asset_ba1_sony_d() {
     // I slices, one slice per picture. Deblocking enabled.
     test_single_bitstream_asset_ex(
         "res/BA1_Sony_D.jsv",
@@ -236,7 +167,7 @@ fn test_asset_ba1_sony_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba2_sony_f() {
+pub(crate) fn test_asset_ba2_sony_f() {
     // I/P slices, one slice per picture. Deblocking enabled. POC type 0.
     test_single_bitstream_asset_ex(
         "res/BA2_Sony_F.jsv",
@@ -246,7 +177,7 @@ fn test_asset_ba2_sony_f() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_bamq1_jvc_c() {
+pub(crate) fn test_asset_bamq1_jvc_c() {
     test_single_bitstream_asset_ex(
         "res/BAMQ1_JVC_C.264",
         "613cf662c23e5d9e1d7da7fe880a3c427411d171",
@@ -255,7 +186,7 @@ fn test_asset_bamq1_jvc_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_bamq2_jvc_c() {
+pub(crate) fn test_asset_bamq2_jvc_c() {
     test_single_bitstream_asset_ex(
         "res/BAMQ2_JVC_C.264",
         "11bcf3713f520e606a8326d37e00e5fd6c9fd4a0",
@@ -264,7 +195,7 @@ fn test_asset_bamq2_jvc_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_banm_mw_d() {
+pub(crate) fn test_asset_banm_mw_d() {
     test_single_bitstream_asset_ex(
         "res/BANM_MW_D.264",
         "92d924a857a1a7d7d9b224eaa3887830f15dee7f",
@@ -273,7 +204,7 @@ fn test_asset_banm_mw_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_basqp1_sony_c() {
+pub(crate) fn test_asset_basqp1_sony_c() {
     test_single_bitstream_asset_ex(
         "res/BASQP1_Sony_C.jsv",
         "3986c8c9d2876d2f0748b925101b152c6ec8b811",
@@ -282,7 +213,7 @@ fn test_asset_basqp1_sony_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_caba2_sva_b() {
+pub(crate) fn test_asset_caba2_sva_b() {
     // I/P slices, one slice per picture. Deblocking enabled. CABAC. POC type 0.
     // num_ref_frames=5.
     test_single_bitstream_asset_ex(
@@ -293,7 +224,7 @@ fn test_asset_caba2_sva_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_caba3_sva_b() {
+pub(crate) fn test_asset_caba3_sva_b() {
     // IPB slices with CABAC. Temporal direct prediction. num_ref_frames=5.
     test_single_bitstream_asset_ex(
         "res/CABA3_SVA_B.264",
@@ -303,7 +234,7 @@ fn test_asset_caba3_sva_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cabast3_sony_e() {
+pub(crate) fn test_asset_cabast3_sony_e() {
     // 4 slices per picture at first_mb_in_slice 0 / 99 / 198 / 297, with the slice
     // types changing inside the picture — I/P/I/P in the reference pictures, I/P/B/I
     // in the non-reference ones — and deblocking across the boundaries between them.
@@ -316,7 +247,7 @@ fn test_asset_cabast3_sony_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_canl1_sony_e() {
+pub(crate) fn test_asset_canl1_sony_e() {
     // I slices, one slice per picture. Deblocking disabled. CABAC. POC type 0.
     test_single_bitstream_asset_ex(
         "res/CANL1_Sony_E.jsv",
@@ -326,7 +257,7 @@ fn test_asset_canl1_sony_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_canl1_toshiba_g() {
+pub(crate) fn test_asset_canl1_toshiba_g() {
     // I slices, one slice per picture. Deblocking disabled. CABAC. POC type 2.
     test_single_bitstream_asset_ex(
         "res/CANL1_TOSHIBA_G.264",
@@ -336,7 +267,7 @@ fn test_asset_canl1_toshiba_g() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_canl2_sony_e() {
+pub(crate) fn test_asset_canl2_sony_e() {
     // I/P slices, one slice per picture. Deblocking disabled. CABAC. POC type 0.
     test_single_bitstream_asset_ex(
         "res/CANL2_Sony_E.jsv",
@@ -346,7 +277,7 @@ fn test_asset_canl2_sony_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ci1_ft_b() {
+pub(crate) fn test_asset_ci1_ft_b() {
     test_single_bitstream_asset_ex(
         "res/CI1_FT_B.264",
         "cbfec15e17a504678b19a1191992131c92a1ac26",
@@ -355,7 +286,7 @@ fn test_asset_ci1_ft_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ci_mw_d() {
+pub(crate) fn test_asset_ci_mw_d() {
     test_single_bitstream_asset_ex(
         "res/CI_MW_D.264",
         "289f29a103c8d95adf2909c646466904be8b06d7",
@@ -364,7 +295,7 @@ fn test_asset_ci_mw_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cvbs3_sony_c() {
+pub(crate) fn test_asset_cvbs3_sony_c() {
     // IPB slices with CAVLC. Temporal direct prediction. direct_8x8_inference=on. num_ref_frames=4.
     test_single_bitstream_asset_ex(
         "res/CVBS3_Sony_C.jsv",
@@ -374,7 +305,7 @@ fn test_asset_cvbs3_sony_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cvfc1_sony_c() {
+pub(crate) fn test_asset_cvfc1_sony_c() {
     test_single_bitstream_asset_ex(
         "res/CVFC1_Sony_C.jsv",
         "4641abd7419a5580b97f16e83fd1d566339229d0",
@@ -383,7 +314,7 @@ fn test_asset_cvfc1_sony_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ls_sva_d() {
+pub(crate) fn test_asset_ls_sva_d() {
     test_single_bitstream_asset_ex(
         "res/LS_SVA_D.264",
         "72118f4d1674cf14e58bed7e67cb3aeed3df62b9",
@@ -392,7 +323,7 @@ fn test_asset_ls_sva_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_midr_mw_d() {
+pub(crate) fn test_asset_midr_mw_d() {
     test_single_bitstream_asset_ex(
         "res/MIDR_MW_D.264",
         "9467030f4786f75644bf06a7fc809c36d1959827",
@@ -401,7 +332,7 @@ fn test_asset_midr_mw_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_mps_mw_a() {
+pub(crate) fn test_asset_mps_mw_a() {
     test_single_bitstream_asset_ex(
         "res/MPS_MW_A.264",
         "67f1cfbef0e8025ed60dedccf8d9558d0636be5f",
@@ -410,7 +341,7 @@ fn test_asset_mps_mw_a() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_mr1_bt_a() {
+pub(crate) fn test_asset_mr1_bt_a() {
     test_single_bitstream_asset_ex(
         "res/MR1_BT_A.h264",
         "6e585f8359667a16b03e5f49a06f5ceae8d991e0",
@@ -419,7 +350,7 @@ fn test_asset_mr1_bt_a() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_mr1_mw_a() {
+pub(crate) fn test_asset_mr1_mw_a() {
     test_single_bitstream_asset_ex(
         "res/MR1_MW_A.264",
         "d9e2bf34e9314dcc171ddaea2c5015d0421479f2",
@@ -428,7 +359,7 @@ fn test_asset_mr1_mw_a() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_mr2_mw_a() {
+pub(crate) fn test_asset_mr2_mw_a() {
     test_single_bitstream_asset_ex(
         "res/MR2_MW_A.264",
         "628b1d4eff04c2d277f7144e23484957dad63cbe",
@@ -437,7 +368,7 @@ fn test_asset_mr2_mw_a() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_mr2_tandberg_e() {
+pub(crate) fn test_asset_mr2_tandberg_e() {
     test_single_bitstream_asset_ex(
         "res/MR2_TANDBERG_E.264",
         "74d618bc7d9d41998edf4c85d51aa06111db6609",
@@ -446,7 +377,7 @@ fn test_asset_mr2_tandberg_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_nl1_sony_d() {
+pub(crate) fn test_asset_nl1_sony_d() {
     // I slices, one slice per picture. Deblocking disabled
     // (disable_deblocking_filter_idc=1).
     test_single_bitstream_asset_ex(
@@ -457,7 +388,7 @@ fn test_asset_nl1_sony_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_nl2_sony_h() {
+pub(crate) fn test_asset_nl2_sony_h() {
     // I/P slices, one slice per picture. Deblocking disabled. POC type 0.
     // Constrained Baseline, yuv420p progressive, 176x144.
     test_single_bitstream_asset_ex(
@@ -468,7 +399,7 @@ fn test_asset_nl2_sony_h() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_nlmq1_jvc_c() {
+pub(crate) fn test_asset_nlmq1_jvc_c() {
     test_single_bitstream_asset_ex(
         "res/NLMQ1_JVC_C.264",
         "f3265c6ddf8db1b2bf604d8a2954f75532e28cda",
@@ -477,7 +408,7 @@ fn test_asset_nlmq1_jvc_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_nlmq2_jvc_c() {
+pub(crate) fn test_asset_nlmq2_jvc_c() {
     test_single_bitstream_asset_ex(
         "res/NLMQ2_JVC_C.264",
         "350ae86ef9ba09390d63a09b7f9ff54184109ca8",
@@ -486,7 +417,7 @@ fn test_asset_nlmq2_jvc_c() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_nrf_mw_e() {
+pub(crate) fn test_asset_nrf_mw_e() {
     test_single_bitstream_asset_ex(
         "res/NRF_MW_E.264",
         "20732198c04cd2591350a361e4510892f6eed3f0",
@@ -495,7 +426,7 @@ fn test_asset_nrf_mw_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_qcif_2p_i_allipcm() {
+pub(crate) fn test_asset_qcif_2p_i_allipcm() {
     test_single_bitstream_asset_ex(
         "res/QCIF_2P_I_allIPCM.264",
         "8724c0866ebdba7ebb7209a0c0c3ae3ae38a0240",
@@ -504,7 +435,7 @@ fn test_asset_qcif_2p_i_allipcm() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_ba1_b() {
+pub(crate) fn test_asset_sva_ba1_b() {
     test_single_bitstream_asset_ex(
         "res/SVA_BA1_B.264",
         "c4543b24823b16c424c673616c36c7f537089b2d",
@@ -513,7 +444,7 @@ fn test_asset_sva_ba1_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_ba2_d() {
+pub(crate) fn test_asset_sva_ba2_d() {
     // I/P slices, one slice per picture. Deblocking enabled. POC type 2.
     test_single_bitstream_asset_ex(
         "res/SVA_BA2_D.264",
@@ -523,7 +454,7 @@ fn test_asset_sva_ba2_d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_base_b() {
+pub(crate) fn test_asset_sva_base_b() {
     // 3 slices per picture. CAVLC. I/P slices, POC type 2, 5 ref frames.
     // disable_deblocking_filter_idc=0, so deblocking filters across slice boundaries.
     test_single_bitstream_asset_ex(
@@ -534,7 +465,7 @@ fn test_asset_sva_base_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_cl1_e() {
+pub(crate) fn test_asset_sva_cl1_e() {
     test_single_bitstream_asset_ex(
         "res/SVA_CL1_E.264",
         "4fe09ab6cdc965ea10a20f1d6dd38aca954412bb",
@@ -543,7 +474,7 @@ fn test_asset_sva_cl1_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_fm1_e() {
+pub(crate) fn test_asset_sva_fm1_e() {
     test_single_bitstream_asset_ex(
         "res/SVA_FM1_E.264",
         "fad08c4ff7cf2307b6579853d0f4652fc26645d3",
@@ -552,7 +483,7 @@ fn test_asset_sva_fm1_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_nl1_b() {
+pub(crate) fn test_asset_sva_nl1_b() {
     // I slices, one slice per picture. Deblocking disabled
     // (disable_deblocking_filter_idc=1).
     test_single_bitstream_asset_ex(
@@ -563,7 +494,7 @@ fn test_asset_sva_nl1_b() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sva_nl2_e() {
+pub(crate) fn test_asset_sva_nl2_e() {
     test_single_bitstream_asset_ex(
         "res/SVA_NL2_E.264",
         "70453ef8097c94dd190d6d2d1d5cb83c67e66238",
@@ -572,7 +503,7 @@ fn test_asset_sva_nl2_e() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sarvui() {
+pub(crate) fn test_asset_sarvui() {
     test_single_bitstream_asset_ex(
         "res/SarVui.264",
         "98ff2d67860462d8d8bcc9352097c06cc401d97e",
@@ -581,7 +512,7 @@ fn test_asset_sarvui() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_static() {
+pub(crate) fn test_asset_static() {
     test_single_bitstream_asset_ex(
         "res/Static.264",
         "91dd4a7a796805b2cd015cae8fd630d96c663f42",
@@ -590,7 +521,7 @@ fn test_asset_static() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_zhling_1280x720() {
+pub(crate) fn test_asset_zhling_1280x720() {
     test_single_bitstream_asset_ex(
         "res/Zhling_1280x720.264",
         "ad99f5eaa2d73ae3840e7da67313de8cfc866ce6",
@@ -599,7 +530,7 @@ fn test_asset_zhling_1280x720() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_sps_subsetsps_bothvui() {
+pub(crate) fn test_asset_sps_subsetsps_bothvui() {
     test_single_bitstream_asset_ex(
         "res/sps_subsetsps_bothVUI.264",
         "d3a47032eb5dcc1963343a68e9bea12435bf1e4c",
@@ -608,7 +539,7 @@ fn test_asset_sps_subsetsps_bothvui() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_test_cif_p_cabac_slice() {
+pub(crate) fn test_asset_test_cif_p_cabac_slice() {
     test_single_bitstream_asset_ex(
         "res/test_cif_P_CABAC_slice.264",
         "521bbd0ba2422369b724c7054545cf107a56f959",
@@ -617,7 +548,7 @@ fn test_asset_test_cif_p_cabac_slice() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_test_qcif_cabac() {
+pub(crate) fn test_asset_test_qcif_cabac() {
     test_single_bitstream_asset_ex(
         "res/test_qcif_cabac.264",
         "587d1d05943f3cd416bf69469975fdee05361e69",
@@ -626,7 +557,7 @@ fn test_asset_test_qcif_cabac() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_test_scalinglist_jm() {
+pub(crate) fn test_asset_test_scalinglist_jm() {
     test_single_bitstream_asset_ex(
         "res/test_scalinglist_jm.264",
         "f690a3af2896a53360215fb5d35016bfd41499b3",
@@ -635,7 +566,7 @@ fn test_asset_test_scalinglist_jm() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_test_vd_1d() {
+pub(crate) fn test_asset_test_vd_1d() {
     test_single_bitstream_asset_ex(
         "res/test_vd_1d.264",
         "5827d2338b79ff82cd091c707823e466197281d3",
@@ -644,7 +575,7 @@ fn test_asset_test_vd_1d() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_test_vd_rc() {
+pub(crate) fn test_asset_test_vd_rc() {
     test_single_bitstream_asset_ex(
         "res/test_vd_rc.264",
         "eea02e97bfec89d0418593a8abaaf55d02eaa1ca",
@@ -653,7 +584,7 @@ fn test_asset_test_vd_rc() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cisco_men_whisper_640x320_cabac_bframe_9() {
+pub(crate) fn test_asset_cisco_men_whisper_640x320_cabac_bframe_9() {
     test_single_bitstream_asset_ex(
         "res/Cisco_Men_whisper_640x320_CABAC_Bframe_9.264",
         "2b349c1bc806b6e0412008747b2463d77b576476",
@@ -662,7 +593,7 @@ fn test_asset_cisco_men_whisper_640x320_cabac_bframe_9() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cisco_men_whisper_640x320_cavlc_bframe_9() {
+pub(crate) fn test_asset_cisco_men_whisper_640x320_cavlc_bframe_9() {
     test_single_bitstream_asset_ex(
         "res/Cisco_Men_whisper_640x320_CAVLC_Bframe_9.264",
         "e5b76ff7e2f44e9b33906f8a4039d0d2bdb1580b",
@@ -671,7 +602,7 @@ fn test_asset_cisco_men_whisper_640x320_cavlc_bframe_9() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cisco_adobe_pdf_sample_a_1024x768_cavlc_bframe_9() {
+pub(crate) fn test_asset_cisco_adobe_pdf_sample_a_1024x768_cavlc_bframe_9() {
     test_single_bitstream_asset_ex(
         "res/Cisco_Adobe_PDF_sample_a_1024x768_CAVLC_Bframe_9.264",
         "9d758d9e6f4dead0d7b361f3ddf2ee009d0ea190",
@@ -693,7 +624,7 @@ fn test_asset_cisco_adobe_pdf_sample_a_1024x768_cavlc_bframe_9() {
 //    prefetch.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_narrow_16x16() {
+pub(crate) fn test_asset_narrow_16x16() {
     test_single_bitstream_asset_ex(
         "res/narrow_16x16.264",
         "6299ce8a7dc8a86d367dca65ca123eb499fc5ca8",
@@ -702,7 +633,7 @@ fn test_asset_narrow_16x16() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_narrow_24x18() {
+pub(crate) fn test_asset_narrow_24x18() {
     test_single_bitstream_asset_ex(
         "res/narrow_24x18.264",
         "f6197477215d8847b570982d3c2747da2911f047",
@@ -719,7 +650,7 @@ fn test_asset_narrow_24x18() {
 // — and expands its border.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_narrow_16x16_idr_lost() {
+pub(crate) fn test_asset_narrow_16x16_idr_lost() {
     test_single_bitstream_asset_ex(
         "res/narrow_16x16_idr_lost.264",
         "754db24b395cc7aff338e036a416a9b5bb409c81",
@@ -739,7 +670,7 @@ fn test_asset_narrow_16x16_idr_lost() {
 // `transform_8x8_mode_flag` to write.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_grid_48x32() {
+pub(crate) fn test_asset_grid_48x32() {
     test_single_bitstream_asset_ex(
         "res/grid_48x32.264",
         "a56242a64a22edee058cd9cd14179f54bcd79b97",
@@ -757,7 +688,7 @@ fn test_asset_grid_48x32() {
 // `bFreezeOutput`.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba_mw_d_idr_lost() {
+pub(crate) fn test_asset_ba_mw_d_idr_lost() {
     test_single_bitstream_asset_ex(
         "res/BA_MW_D_IDR_LOST.264",
         "f31e54a50296406f7f55d95c959e800d5dfbbe44",
@@ -766,7 +697,7 @@ fn test_asset_ba_mw_d_idr_lost() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_ba_mw_d_p_lost() {
+pub(crate) fn test_asset_ba_mw_d_p_lost() {
     test_single_bitstream_asset_ex(
         "res/BA_MW_D_P_LOST.264",
         "66ec2f1d66356de3dfadffa298bbe838347a9eb1",
@@ -785,7 +716,7 @@ fn test_asset_ba_mw_d_p_lost() {
 // legible rather than a diffuse hash change.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_fmo_2groups_64x64() {
+pub(crate) fn test_asset_fmo_2groups_64x64() {
     test_single_bitstream_asset_ex(
         "res/fmo_2groups_64x64.264",
         "6420bae4a88f86a0f3f54c94aee59b2c1e7b7319",
@@ -816,7 +747,7 @@ fn test_asset_fmo_2groups_64x64() {
 //    `ParseResidualBlockCabac8x8`.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cqm8x8_intra_176x144() {
+pub(crate) fn test_asset_cqm8x8_intra_176x144() {
     test_single_bitstream_asset_ex(
         "res/cqm8x8_intra_176x144.264",
         "42ee8dab05d3eff2e31219b2cf29ee9a8d1e1454",
@@ -825,7 +756,7 @@ fn test_asset_cqm8x8_intra_176x144() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cqm8x8_inter_176x144() {
+pub(crate) fn test_asset_cqm8x8_inter_176x144() {
     test_single_bitstream_asset_ex(
         "res/cqm8x8_inter_176x144.264",
         "af78d465b33871858868f29eb61b79e7a4c5e5e1",
@@ -834,7 +765,7 @@ fn test_asset_cqm8x8_inter_176x144() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cqm8x8_cabac_inter_176x144() {
+pub(crate) fn test_asset_cqm8x8_cabac_inter_176x144() {
     test_single_bitstream_asset_ex(
         "res/cqm8x8_cabac_inter_176x144.264",
         "15745e18965e4169b8d77feb2a3ac7fdb60a177a",
@@ -854,7 +785,7 @@ fn test_asset_cqm8x8_cabac_inter_176x144() {
 //    where each slice carries its own `pred_weight_table`.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_high_8x8_multislice_176x144() {
+pub(crate) fn test_asset_high_8x8_multislice_176x144() {
     test_single_bitstream_asset_ex(
         "res/high_8x8_multislice_176x144.264",
         "e1f880c0a650e08a5bc7675dfb488d4ef47ea655",
@@ -863,7 +794,7 @@ fn test_asset_high_8x8_multislice_176x144() {
 }
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_multislice_weighted_176x144() {
+pub(crate) fn test_asset_multislice_weighted_176x144() {
     test_single_bitstream_asset_ex(
         "res/multislice_weighted_176x144.264",
         "dea28402c0f14935d2cfd1bc4c28c6ed654ff7c4",
@@ -886,7 +817,7 @@ fn test_asset_multislice_weighted_176x144() {
 // each picture takes.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_asset_cacqp3_sony_d() {
+pub(crate) fn test_asset_cacqp3_sony_d() {
     test_single_bitstream_asset_ex(
         "res/CACQP3_Sony_D.jsv",
         "2ab41abd239c1c556e91ff027f47002001ee8605",

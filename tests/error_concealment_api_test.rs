@@ -4,12 +4,13 @@
 
 //! Decoder error-concealment modes — `test/api/decoder_ec_test.cpp`.
 
+#[path = "common/mod.rs"]
 mod common;
 
 use openh264rs::api::codec_api::*;
 
 #[test]
-fn test_decoder_error_concealment_modes() {
+pub(crate) fn test_decoder_error_concealment_modes() {
     let ec_modes = [
         ERROR_CON_IDC::ERROR_CON_DISABLE,
         ERROR_CON_IDC::ERROR_CON_FRAME_COPY,
@@ -22,82 +23,49 @@ fn test_decoder_error_concealment_modes() {
     ];
 
     for &ec_mode in &ec_modes {
-        unsafe {
-            let mut p_decoder: *mut ISVCDecoder = std::ptr::null_mut();
-            let ret = WelsCreateDecoder(&mut p_decoder);
-            assert_eq!(ret, CM_RESULT_SUCCESS as i64);
-            assert!(!p_decoder.is_null());
+        let mut decoder = Decoder::new();
 
-            let mut param = SDecodingParam::default();
-            param.uiTargetDqLayer = u8::MAX;
-            param.eEcActiveIdc = ec_mode;
+        let mut param = SDecodingParam::default();
+        param.uiTargetDqLayer = u8::MAX;
+        param.eEcActiveIdc = ec_mode;
 
-            let init_ret = ISVCDecoder::Initialize(p_decoder, &param as *const SDecodingParam);
-            assert_eq!(init_ret, CM_RESULT_SUCCESS as i64);
+        let init_ret = decoder.initialize(&param);
+        assert_eq!(init_ret, CM_RESULT_SUCCESS as std::ffi::c_long);
 
-            let mut current_ec: i32 = 0;
-            let get_opt_ret = ISVCDecoder::GetOption(
-                p_decoder,
-                DECODER_OPTION::DECODER_OPTION_ERROR_CON_IDC,
-                &mut current_ec as *mut i32 as *mut std::ffi::c_void,
-            );
-            assert_eq!(get_opt_ret, CM_RESULT_SUCCESS as i64);
+        assert_eq!(decoder.error_concealment(), Some(ec_mode));
 
-            let uninit_ret = ISVCDecoder::Uninitialize(p_decoder);
-            assert_eq!(uninit_ret, CM_RESULT_SUCCESS as i64);
-
-            WelsDestroyDecoder(p_decoder);
-        }
+        let uninit_ret = decoder.uninitialize();
+        assert_eq!(uninit_ret, CM_RESULT_SUCCESS as std::ffi::c_long);
     }
 }
 
 /// Decodes `data` and returns the OR of every `DecodeFrame2` state, optionally
-/// switching the concealment mode through `SetOption` after `Initialize` — the one
+/// switching the concealment mode through `set_error_concealment` after `Initialize` — the one
 /// write the public API makes into the parameter block after configuration.
-unsafe fn decode_states(
-    data: &[u8],
-    init_ec: ERROR_CON_IDC,
-    switch_to: Option<ERROR_CON_IDC>,
-) -> i32 {
-    unsafe {
-        let mut p_decoder: *mut ISVCDecoder = std::ptr::null_mut();
-        assert_eq!(WelsCreateDecoder(&mut p_decoder), CM_RESULT_SUCCESS as i64);
+fn decode_states(data: &[u8], init_ec: ERROR_CON_IDC, switch_to: Option<ERROR_CON_IDC>) -> i32 {
+    let mut decoder = Decoder::new();
 
-        let mut param = SDecodingParam::default();
-        param.uiTargetDqLayer = u8::MAX;
-        param.eEcActiveIdc = init_ec;
-        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        assert_eq!(
-            ISVCDecoder::Initialize(p_decoder, &param),
-            CM_RESULT_SUCCESS as i64
-        );
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = init_ec;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    assert_eq!(
+        decoder.initialize(&param),
+        CM_RESULT_SUCCESS as std::ffi::c_long
+    );
 
-        if let Some(mode) = switch_to {
-            let mut val = mode;
-            ISVCDecoder::SetOption(
-                p_decoder,
-                DECODER_OPTION::DECODER_OPTION_ERROR_CON_IDC,
-                &mut val as *mut ERROR_CON_IDC as *mut std::ffi::c_void,
-            );
-        }
-
-        let mut states = 0i32;
-        for unit in openh264rs::split_annexb_units(data) {
-            let mut p_dst: [*mut u8; 3] = [std::ptr::null_mut(); 3];
-            let mut buf_info = SBufferInfo::default();
-            let ret = ISVCDecoder::DecodeFrame2(
-                p_decoder,
-                unit.as_ptr(),
-                unit.len() as i32,
-                p_dst.as_mut_ptr(),
-                &mut buf_info,
-            );
-            states |= ret.0;
-        }
-        ISVCDecoder::Uninitialize(p_decoder);
-        WelsDestroyDecoder(p_decoder);
-        states
+    if let Some(mode) = switch_to {
+        decoder.set_error_concealment(mode as i32);
     }
+
+    let mut states = 0i32;
+    for unit in openh264rs::split_annexb_units(data) {
+        let mut buf_info = SBufferInfo::default();
+        let ret = decoder.decode(Some(unit), &mut buf_info);
+        states |= ret.0;
+    }
+    decoder.uninitialize();
+    states
 }
 
 /// The block the api writes and the block the decoder reads are one block: the
@@ -112,29 +80,27 @@ unsafe fn decode_states(
 ///   `dsBitstreamError` instead.
 #[test]
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
-fn test_error_con_idc_set_after_initialize_reaches_the_decoder() {
+pub(crate) fn test_error_con_idc_set_after_initialize_reaches_the_decoder() {
     let data = common::read_stream("BA_MW_D_IDR_LOST.264");
 
     const CONCEALED: i32 = 0x20; // dsDataErrorConcealed
 
-    unsafe {
-        let concealing = decode_states(&data, ERROR_CON_IDC::ERROR_CON_SLICE_COPY, None);
-        assert_ne!(
-            concealing & CONCEALED,
-            0,
-            "the asset did not conceal at all — this test no longer covers the behaviour it checks"
-        );
+    let concealing = decode_states(&data, ERROR_CON_IDC::ERROR_CON_SLICE_COPY, None);
+    assert_ne!(
+        concealing & CONCEALED,
+        0,
+        "the asset did not conceal at all — this test no longer covers the behaviour it checks"
+    );
 
-        let switched = decode_states(
-            &data,
-            ERROR_CON_IDC::ERROR_CON_SLICE_COPY,
-            Some(ERROR_CON_IDC::ERROR_CON_DISABLE),
-        );
-        assert_eq!(
-            switched & CONCEALED,
-            0,
-            "concealment still ran after SetOption(ERROR_CON_IDC = DISABLE): the api wrote one \
-             parameter block and the decoder read another"
-        );
-    }
+    let switched = decode_states(
+        &data,
+        ERROR_CON_IDC::ERROR_CON_SLICE_COPY,
+        Some(ERROR_CON_IDC::ERROR_CON_DISABLE),
+    );
+    assert_eq!(
+        switched & CONCEALED,
+        0,
+        "concealment still ran after SetOption(ERROR_CON_IDC = DISABLE): the api wrote one \
+         parameter block and the decoder read another"
+    );
 }
