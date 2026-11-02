@@ -56,6 +56,26 @@ const _: () = {
     assert!(align_of::<ffi::SParserBsInfo>() == align_of::<rust_types::SParserBsInfo>());
     assert!(size_of::<ffi::SDecoderCapability>() == size_of::<rust_types::SDecoderCapability>());
     assert!(align_of::<ffi::SDecoderCapability>() == align_of::<rust_types::SDecoderCapability>());
+    assert!(size_of::<ffi::SDecoderStatistics>() == size_of::<rust_types::SDecoderStatistics>());
+    assert!(align_of::<ffi::SDecoderStatistics>() == align_of::<rust_types::SDecoderStatistics>());
+    assert!(size_of::<ffi::SVuiSarInfo>() == size_of::<rust_types::SVuiSarInfo>());
+    assert!(align_of::<ffi::SVuiSarInfo>() == align_of::<rust_types::SVuiSarInfo>());
+    assert!(size_of::<ffi::SBitrateInfo>() == size_of::<rust_types::SBitrateInfo>());
+    assert!(align_of::<ffi::SBitrateInfo>() == align_of::<rust_types::SBitrateInfo>());
+    assert!(size_of::<ffi::SLTRRecoverRequest>() == size_of::<rust_types::SLTRRecoverRequest>());
+    assert!(align_of::<ffi::SLTRRecoverRequest>() == align_of::<rust_types::SLTRRecoverRequest>());
+    assert!(size_of::<ffi::SLTRMarkingFeedback>() == size_of::<rust_types::SLTRMarkingFeedback>());
+    assert!(
+        align_of::<ffi::SLTRMarkingFeedback>() == align_of::<rust_types::SLTRMarkingFeedback>()
+    );
+    assert!(size_of::<ffi::SLTRConfig>() == size_of::<rust_types::SLTRConfig>());
+    assert!(align_of::<ffi::SLTRConfig>() == align_of::<rust_types::SLTRConfig>());
+    assert!(size_of::<ffi::SProfileInfo>() == size_of::<rust_types::SProfileInfo>());
+    assert!(align_of::<ffi::SProfileInfo>() == align_of::<rust_types::SProfileInfo>());
+    assert!(size_of::<ffi::SLevelInfo>() == size_of::<rust_types::SLevelInfo>());
+    assert!(align_of::<ffi::SLevelInfo>() == align_of::<rust_types::SLevelInfo>());
+    assert!(size_of::<ffi::SDeliveryStatus>() == size_of::<rust_types::SDeliveryStatus>());
+    assert!(align_of::<ffi::SDeliveryStatus>() == align_of::<rust_types::SDeliveryStatus>());
 };
 
 // ---------------------------------------------------------------------------
@@ -541,6 +561,31 @@ impl From<rust_types::SDecoderCapability> for ffi::SDecoderCapability {
     }
 }
 
+#[allow(clippy::useless_conversion)]
+impl From<rust_types::SEncoderStatistics> for ffi::SEncoderStatistics {
+    fn from(v: rust_types::SEncoderStatistics) -> Self {
+        Self {
+            uiWidth: v.uiWidth,
+            uiHeight: v.uiHeight,
+            fAverageFrameSpeedInMs: v.fAverageFrameSpeedInMs,
+            fAverageFrameRate: v.fAverageFrameRate,
+            fLatestFrameRate: v.fLatestFrameRate,
+            uiBitRate: v.uiBitRate,
+            uiAverageFrameQP: v.uiAverageFrameQP,
+            uiInputFrameCount: v.uiInputFrameCount,
+            uiSkippedFrameCount: v.uiSkippedFrameCount,
+            uiResolutionChangeTimes: v.uiResolutionChangeTimes,
+            uiIDRReqNum: v.uiIDRReqNum,
+            uiIDRSentNum: v.uiIDRSentNum,
+            uiLTRSentNum: v.uiLTRSentNum,
+            iStatisticsTs: v.iStatisticsTs,
+            iTotalEncodedBytes: u64::from(v.iTotalEncodedBytes),
+            iLastStatisticsBytes: u64::from(v.iLastStatisticsBytes),
+            iLastStatisticsFrameCount: u64::from(v.iLastStatisticsFrameCount),
+        }
+    }
+}
+
 /// Opaque type representing `void` pointer payloads across the `cxx` FFI boundary.
 #[repr(C)]
 pub struct c_void {
@@ -672,6 +717,25 @@ impl ISVCEncoder {
             let Ok(option_id) = rust_types::ENCODER_OPTION::try_from(option_id) else {
                 return CM_INIT_PARA_ERROR;
             };
+            if option_id == rust_types::ENCODER_OPTION::ENCODER_OPTION_GET_STATISTICS {
+                if option.is_null() {
+                    return CM_INIT_PARA_ERROR;
+                }
+                let mut rust_stats = rust_types::SEncoderStatistics::default();
+                let rc = unsafe {
+                    self.inner.get_option_raw(
+                        option_id,
+                        (&mut rust_stats as *mut rust_types::SEncoderStatistics)
+                            as *mut std::ffi::c_void,
+                    )
+                };
+                if rc == CM_RESULT_SUCCESS {
+                    unsafe {
+                        (option as *mut ffi::SEncoderStatistics).write(rust_stats.into());
+                    }
+                }
+                return rc;
+            }
             unsafe {
                 self.inner
                     .get_option_raw(option_id, option as *mut std::ffi::c_void)
@@ -1288,6 +1352,29 @@ pub mod ffi {
         SPS_PPS_LISTING = 0x06,
     }
 
+    /// Spatial layer index (`LAYER_NUM`).
+    #[repr(i32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum LAYER_NUM {
+        SPATIAL_LAYER_0 = 0,
+        SPATIAL_LAYER_1 = 1,
+        SPATIAL_LAYER_2 = 2,
+        SPATIAL_LAYER_3 = 3,
+        SPATIAL_LAYER_ALL = 4,
+    }
+
+    /// Keyframe / LTR request and feedback types (`KEY_FRAME_REQUEST_TYPE`).
+    #[repr(i32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum KEY_FRAME_REQUEST_TYPE {
+        NO_RECOVERY_REQUSET = 0,
+        LTR_RECOVERY_REQUEST = 1,
+        IDR_RECOVERY_REQUEST = 2,
+        NO_LTR_MARKING_FEEDBACK = 3,
+        LTR_MARKING_SUCCESS = 4,
+        LTR_MARKING_FAILED = 5,
+    }
+
     /// OpenH264 version record (`OpenH264Version`).
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub struct OpenH264Version {
@@ -1506,6 +1593,122 @@ pub mod ffi {
         pub iMaxDpb: i32,
         pub iMaxBr: i32,
         pub bRedPicCap: bool,
+    }
+
+    /// Video encoder runtime statistics (`SEncoderStatistics`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SEncoderStatistics {
+        pub uiWidth: u32,
+        pub uiHeight: u32,
+        pub fAverageFrameSpeedInMs: f32,
+        pub fAverageFrameRate: f32,
+        pub fLatestFrameRate: f32,
+        pub uiBitRate: u32,
+        pub uiAverageFrameQP: u32,
+        pub uiInputFrameCount: u32,
+        pub uiSkippedFrameCount: u32,
+        pub uiResolutionChangeTimes: u32,
+        pub uiIDRReqNum: u32,
+        pub uiIDRSentNum: u32,
+        pub uiLTRSentNum: u32,
+        pub iStatisticsTs: i64,
+        pub iTotalEncodedBytes: u64,
+        pub iLastStatisticsBytes: u64,
+        pub iLastStatisticsFrameCount: u64,
+    }
+
+    /// Video decoder runtime statistics (`SDecoderStatistics`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SDecoderStatistics {
+        pub uiWidth: u32,
+        pub uiHeight: u32,
+        pub fAverageFrameSpeedInMs: f32,
+        pub fActualAverageFrameSpeedInMs: f32,
+        pub uiDecodedFrameCount: u32,
+        pub uiResolutionChangeTimes: u32,
+        pub uiIDRCorrectNum: u32,
+        pub uiAvgEcRatio: u32,
+        pub uiAvgEcPropRatio: u32,
+        pub uiEcIDRNum: u32,
+        pub uiEcFrameNum: u32,
+        pub uiIDRLostNum: u32,
+        pub uiFreezingIDRNum: u32,
+        pub uiFreezingNonIDRNum: u32,
+        pub iAvgLumaQp: i32,
+        pub iSpsReportErrorNum: i32,
+        pub iSubSpsReportErrorNum: i32,
+        pub iPpsReportErrorNum: i32,
+        pub iSpsNoExistNalNum: i32,
+        pub iSubSpsNoExistNalNum: i32,
+        pub iPpsNoExistNalNum: i32,
+        pub uiProfile: u32,
+        pub uiLevel: u32,
+        pub iCurrentActiveSpsId: i32,
+        pub iCurrentActivePpsId: i32,
+        pub iStatisticsLogInterval: u32,
+    }
+
+    /// VUI sample aspect ratio metadata (`SVuiSarInfo`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SVuiSarInfo {
+        pub uiSarWidth: u32,
+        pub uiSarHeight: u32,
+        pub bOverscanAppropriateFlag: bool,
+    }
+
+    /// Bitrate info per layer (`SBitrateInfo`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SBitrateInfo {
+        pub iLayer: LAYER_NUM,
+        pub iBitrate: i32,
+    }
+
+    /// Long-term reference recovery request (`SLTRRecoverRequest`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SLTRRecoverRequest {
+        pub uiFeedbackType: u32,
+        pub uiIDRPicId: u32,
+        pub iLastCorrectFrameNum: i32,
+        pub iCurrentFrameNum: i32,
+        pub iLayerId: i32,
+    }
+
+    /// Long-term reference marking feedback (`SLTRMarkingFeedback`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SLTRMarkingFeedback {
+        pub uiFeedbackType: u32,
+        pub uiIDRPicId: u32,
+        pub iLTRFrameNum: i32,
+        pub iLayerId: i32,
+    }
+
+    /// Long-term reference configuration (`SLTRConfig`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SLTRConfig {
+        pub bEnableLongTermReference: bool,
+        pub iLTRRefNum: i32,
+    }
+
+    /// Layer profile configuration (`SProfileInfo`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SProfileInfo {
+        pub iLayer: i32,
+        pub uiProfileIdc: EProfileIdc,
+    }
+
+    /// Layer level configuration (`SLevelInfo`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SLevelInfo {
+        pub iLayer: i32,
+        pub uiLevelIdc: ELevelIdc,
+    }
+
+    /// Frame delivery status (`SDeliveryStatus`).
+    #[derive(Debug, Copy, Clone)]
+    pub struct SDeliveryStatus {
+        pub bDeliveryFlag: bool,
+        pub iDropFrameType: i32,
+        pub iDropFrameSize: i32,
     }
 
     extern "Rust" {
@@ -1748,6 +1951,124 @@ impl Default for ffi::SBufferInfo {
     }
 }
 
+impl Default for ffi::SEncoderStatistics {
+    fn default() -> Self {
+        rust_types::SEncoderStatistics::default().into()
+    }
+}
+
+impl Default for ffi::SDecoderStatistics {
+    fn default() -> Self {
+        Self {
+            uiWidth: 0,
+            uiHeight: 0,
+            fAverageFrameSpeedInMs: 0.0,
+            fActualAverageFrameSpeedInMs: 0.0,
+            uiDecodedFrameCount: 0,
+            uiResolutionChangeTimes: 0,
+            uiIDRCorrectNum: 0,
+            uiAvgEcRatio: 0,
+            uiAvgEcPropRatio: 0,
+            uiEcIDRNum: 0,
+            uiEcFrameNum: 0,
+            uiIDRLostNum: 0,
+            uiFreezingIDRNum: 0,
+            uiFreezingNonIDRNum: 0,
+            iAvgLumaQp: 0,
+            iSpsReportErrorNum: 0,
+            iSubSpsReportErrorNum: 0,
+            iPpsReportErrorNum: 0,
+            iSpsNoExistNalNum: 0,
+            iSubSpsNoExistNalNum: 0,
+            iPpsNoExistNalNum: 0,
+            uiProfile: 0,
+            uiLevel: 0,
+            iCurrentActiveSpsId: 0,
+            iCurrentActivePpsId: 0,
+            iStatisticsLogInterval: 0,
+        }
+    }
+}
+
+impl Default for ffi::SVuiSarInfo {
+    fn default() -> Self {
+        Self {
+            uiSarWidth: 0,
+            uiSarHeight: 0,
+            bOverscanAppropriateFlag: false,
+        }
+    }
+}
+
+impl Default for ffi::SBitrateInfo {
+    fn default() -> Self {
+        Self {
+            iLayer: ffi::LAYER_NUM::SPATIAL_LAYER_0,
+            iBitrate: 0,
+        }
+    }
+}
+
+impl Default for ffi::SLTRRecoverRequest {
+    fn default() -> Self {
+        Self {
+            uiFeedbackType: 0,
+            uiIDRPicId: 0,
+            iLastCorrectFrameNum: 0,
+            iCurrentFrameNum: 0,
+            iLayerId: 0,
+        }
+    }
+}
+
+impl Default for ffi::SLTRMarkingFeedback {
+    fn default() -> Self {
+        Self {
+            uiFeedbackType: 0,
+            uiIDRPicId: 0,
+            iLTRFrameNum: 0,
+            iLayerId: 0,
+        }
+    }
+}
+
+impl Default for ffi::SLTRConfig {
+    fn default() -> Self {
+        Self {
+            bEnableLongTermReference: false,
+            iLTRRefNum: 0,
+        }
+    }
+}
+
+impl Default for ffi::SProfileInfo {
+    fn default() -> Self {
+        Self {
+            iLayer: 0,
+            uiProfileIdc: ffi::EProfileIdc::PRO_UNKNOWN,
+        }
+    }
+}
+
+impl Default for ffi::SLevelInfo {
+    fn default() -> Self {
+        Self {
+            iLayer: 0,
+            uiLevelIdc: ffi::ELevelIdc::LEVEL_UNKNOWN,
+        }
+    }
+}
+
+impl Default for ffi::SDeliveryStatus {
+    fn default() -> Self {
+        Self {
+            bDeliveryFlag: false,
+            iDropFrameType: 0,
+            iDropFrameSize: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,6 +2118,18 @@ mod tests {
             assert_eq!(enc.encode_frame(&src_pic, &mut bs_info), CM_RESULT_SUCCESS);
             assert!(bs_info.iFrameSizeInBytes > 0);
             assert!(bs_info.iLayerNum > 0);
+
+            let mut enc_stats = ffi::SEncoderStatistics::default();
+            assert_eq!(
+                enc.get_option(
+                    ffi::ENCODER_OPTION::ENCODER_OPTION_GET_STATISTICS,
+                    (&mut enc_stats as *mut ffi::SEncoderStatistics) as *mut c_void,
+                ),
+                CM_RESULT_SUCCESS
+            );
+            assert_eq!(enc_stats.uiWidth, width as u32);
+            assert_eq!(enc_stats.uiHeight, height as u32);
+            assert_eq!(enc_stats.uiInputFrameCount, 1);
 
             let mut bitstream = Vec::new();
             for i in 0..bs_info.iLayerNum as usize {
