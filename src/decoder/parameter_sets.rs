@@ -301,59 +301,6 @@ pub struct TagSps {
     pub sVui: SVui,
 }
 
-impl TagSps {
-    /// The all-zero SPS, which is where `ParseSps` starts.
-    ///
-    /// Not [`Default`]: that is a usable SPS, with `uiBitDepthLuma`/`uiBitDepthChroma`
-    /// 8 and `bFrameMbsOnlyFlag` `true` — the values a parse that never writes them
-    /// must still read.
-    pub fn memset_zero() -> Self {
-        Self {
-            iSpsId: 0,
-            iMbWidth: 0,
-            iMbHeight: 0,
-            uiTotalMbCount: 0,
-            uiLog2MaxFrameNum: 0,
-            uiPocType: 0,
-            iLog2MaxPocLsb: 0,
-            iOffsetForNonRefPic: 0,
-            iOffsetForTopToBottomField: 0,
-            iNumRefFramesInPocCycle: 0,
-            iOffsetForRefFrame: [0; 256],
-            iNumRefFrames: 0,
-            // `SPosOffset`'s derived `Default` is four zeroed `i32`s.
-            sFrameCrop: SPosOffset::default(),
-            uiProfileIdc: 0,
-            uiLevelIdc: 0,
-            uiChromaFormatIdc: 0,
-            uiChromaArrayType: 0,
-            // 8 in `Default`.
-            uiBitDepthLuma: 0,
-            uiBitDepthChroma: 0,
-            bDeltaPicOrderAlwaysZeroFlag: false,
-            bGapsInFrameNumValueAllowedFlag: false,
-            // `true` in `Default`.
-            bFrameMbsOnlyFlag: false,
-            bMbaffFlag: false,
-            bDirect8x8InferenceFlag: false,
-            bFrameCroppingFlag: false,
-            bVuiParamPresentFlag: false,
-            bConstraintSet0Flag: false,
-            bConstraintSet1Flag: false,
-            bConstraintSet2Flag: false,
-            bConstraintSet3Flag: false,
-            bSeparateColorPlaneFlag: false,
-            bQpPrimeYZeroTransfBypassFlag: false,
-            bSeqScalingMatrixPresentFlag: false,
-            bSeqScalingListPresentFlag: [false; 12],
-            iScalingList4x4: [[0; 16]; 6],
-            iScalingList8x8: [[0; 64]; 6],
-            // `TagVui`'s `Default` is field-for-field zero already.
-            sVui: SVui::default(),
-        }
-    }
-}
-
 pub type SSps = TagSps;
 
 impl Default for TagSps {
@@ -430,21 +377,6 @@ pub struct TagSubsetSps {
     pub bAdditionalExtension2DataFlag: bool,
 }
 
-impl TagSubsetSps {
-    /// The all-zero subset SPS. Distinct from `Default`, which inherits
-    /// [`TagSps::default`]'s non-zero fields through `sSps`.
-    pub fn memset_zero() -> Self {
-        Self {
-            sSps: TagSps::memset_zero(),
-            // `TagSpsSvcExt`'s derived `Default` is field-for-field zero.
-            sSpsSvcExt: SSpsSvcExt::default(),
-            bSvcVuiParamPresentFlag: false,
-            bAdditionalExtension2Flag: false,
-            bAdditionalExtension2DataFlag: false,
-        }
-    }
-}
-
 pub type SSubsetSps = TagSubsetSps;
 
 /// Picture Parameter Set (PPS) structure, refer to Section 7.3.2.2 in ITU-T H.264 Rec.
@@ -492,50 +424,6 @@ pub struct TagPps {
     pub iScalingList8x8: [[u8; 64]; 6],
 
     pub iSecondChromaQPIndexOffset: i32,
-}
-
-impl TagPps {
-    /// The all-zero PPS, which is where `ParsePps` starts.
-    ///
-    /// Not [`Default`]: that is a usable PPS, with `uiNumSliceGroups`,
-    /// `uiNumRefIdxL0Active` and `uiNumRefIdxL1Active` 1 and `iPicInitQp`/`iPicInitQs`
-    /// 26.
-    pub fn memset_zero() -> Self {
-        Self {
-            iSpsId: 0,
-            iPpsId: 0,
-            // 1 in `Default`.
-            uiNumSliceGroups: 0,
-            uiSliceGroupMapType: 0,
-            uiRunLength: [0; MAX_SLICEGROUP_IDS],
-            uiTopLeft: [0; MAX_SLICEGROUP_IDS],
-            uiBottomRight: [0; MAX_SLICEGROUP_IDS],
-            uiSliceGroupChangeRate: 0,
-            uiPicSizeInMapUnits: 0,
-            uiSliceGroupId: [0; MAX_SLICEGROUP_IDS],
-            // 1 in `Default`.
-            uiNumRefIdxL0Active: 0,
-            uiNumRefIdxL1Active: 0,
-            // 26 in `Default`.
-            iPicInitQp: 0,
-            iPicInitQs: 0,
-            iChromaQpIndexOffset: [0; 2],
-            bEntropyCodingModeFlag: false,
-            bPicOrderPresentFlag: false,
-            bSliceGroupChangeDirectionFlag: false,
-            bDeblockingFilterControlPresentFlag: false,
-            bConstainedIntraPredFlag: false,
-            bRedundantPicCntPresentFlag: false,
-            bWeightedPredFlag: false,
-            uiWeightedBipredIdc: 0,
-            bTransform8x8ModeFlag: false,
-            bPicScalingMatrixPresentFlag: false,
-            bPicScalingListPresentFlag: [false; 12],
-            iScalingList4x4: [[0; 16]; 6],
-            iScalingList8x8: [[0; 64]; 6],
-            iSecondChromaQPIndexOffset: 0,
-        }
-    }
 }
 
 pub type SPps = TagPps;

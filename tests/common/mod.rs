@@ -21,9 +21,12 @@ pub mod prng;
 #[allow(unused_imports)]
 pub use sha1::Sha1Hasher;
 
-/// Resolves `CARGO_MANIFEST_DIR` (absolute under Cargo; relative to the
-/// Chromium checkout root `//` under GN).
+/// Resolves the crate root directory (`OPENH264_MANIFEST_DIR`, or
+/// `CARGO_MANIFEST_DIR` resolved directly or relative to `//` under GN).
 pub fn manifest_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("OPENH264_MANIFEST_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if dir.exists() {
         return dir.to_path_buf();

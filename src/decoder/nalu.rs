@@ -1857,10 +1857,7 @@ pub fn ParseSps(
 ) -> i32 {
     let buf = pCtx.sRawData.window_from(kiRbspStart);
 
-    // `memset_zero`, not `default()`: `SSubsetSps::default()` sets
-    // `uiBitDepthLuma`/`Chroma` to 8 and `bFrameMbsOnlyFlag` to true through `sSps`,
-    // which the parse then reads on the paths that do not write them.
-    let mut sTempSubsetSps = SSubsetSps::memset_zero();
+    let mut sTempSubsetSps = SSubsetSps::default();
     let pSubsetSps = &mut sTempSubsetSps;
 
     let kbUseSubsetFlag = IS_SUBSET_SPS_NAL(pCtx.sCurNalHead.eNalUnitType);
@@ -2284,10 +2281,7 @@ pub fn ParsePps(
 ) -> i32 {
     let buf = pCtx.sRawData.window_from(kiRbspStart);
 
-    // `memset_zero`, not `default()`, for the reason `ParseSps` gives: `SPps::default()`
-    // sets `uiNumSliceGroups`, `uiNumRefIdxL0Active`/`L1Active` to 1 and
-    // `iPicInitQp`/`Qs` to 26.
-    let mut sTempPpsStore = SPps::memset_zero();
+    let mut sTempPpsStore = SPps::default();
     let pPps = &mut sTempPpsStore;
 
     let mut uiCode: u32 = 0;
@@ -2933,7 +2927,7 @@ pub fn ParseScalingList(
 /// (`au_parser.cpp:1794`).
 pub fn ResetFmoList(pCtx: &mut SWelsDecoderContext) -> i32 {
     let iCountNum = pCtx.iActiveFmoNum;
-    crate::decoder::fmo::UninitFmoList(&mut pCtx.sFmoList, iCountNum);
+    crate::decoder::fmo::UninitFmoList(&mut pCtx.sFmoList[..], iCountNum);
     pCtx.iActiveFmoNum = 0;
     iCountNum
 }
@@ -3246,7 +3240,7 @@ mod au_list_tests {
     fn parse_pps_rejects_oversized_slice_group_run_length() {
         use crate::encoder::vlc_encoder::{BsWriteOneBit, BsWriteUE};
 
-        let mut ctx = SWelsDecoderContext::default();
+        let mut ctx = SWelsDecoderContext::new_boxed();
         let mut raw = [0u8; 128];
         let mut writer = BsWriter::new();
         let buf = &mut raw[..];
@@ -3317,7 +3311,7 @@ mod au_list_tests {
 
     #[test]
     fn parse_non_vcl_nal_rejects_empty_rbsp_without_reusing_stale_cursor() {
-        let mut ctx = SWelsDecoderContext::default();
+        let mut ctx = SWelsDecoderContext::new_boxed();
         ctx.sRawData.grow_to(128).unwrap();
         ctx.sRawData.rewind();
 

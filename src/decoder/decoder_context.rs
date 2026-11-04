@@ -264,13 +264,21 @@ pub use crate::decoder::nalu::{SNalUnit, SNalUnitHeader, SNalUnitHeaderExt};
 
 pub use crate::decoder::slice::{SRefBasePicMarking, SSliceHeader, SSliceHeaderExt};
 
+/// Allocates `[val; N]` directly on the heap via `Vec`, avoiding an `N`-element
+/// temporary array on the caller's stack.
+fn boxed_array<T: Clone, const N: usize>(val: T) -> Box<[T; N]> {
+    let Ok(arr) = vec![val; N].into_boxed_slice().try_into() else {
+        unreachable!()
+    };
+    arr
+}
+
 #[repr(C)]
-#[derive(Copy, Clone)]
 pub struct SWelsDecoderSpsPpsCTX {
     pub sFrameCrop: SPosOffset,
-    pub sSpsBuffer: [SSps; MAX_SPS_COUNT + 1],
-    pub sPpsBuffer: [SPps; MAX_PPS_COUNT + 1],
-    pub sSubsetSpsBuffer: [SSubsetSps; MAX_SPS_COUNT + 1],
+    pub sSpsBuffer: Box<[SSps; MAX_SPS_COUNT + 1]>,
+    pub sPpsBuffer: Box<[SPps; MAX_PPS_COUNT + 1]>,
+    pub sSubsetSpsBuffer: Box<[SSubsetSps; MAX_SPS_COUNT + 1]>,
     pub sPrefixNal: SNalUnit,
     /// Which SPS each dependency layer activated, as an id. Distinct [`SpsRef`]s
     /// name distinct slots, so `SpsRef` equality is SPS identity.
@@ -302,9 +310,9 @@ impl SWelsDecoderSpsPpsCTX {
     pub fn memset_zero() -> Self {
         Self {
             sFrameCrop: SPosOffset::default(),
-            sSpsBuffer: [SSps::memset_zero(); MAX_SPS_COUNT + 1],
-            sPpsBuffer: [SPps::memset_zero(); MAX_PPS_COUNT + 1],
-            sSubsetSpsBuffer: [SSubsetSps::memset_zero(); MAX_SPS_COUNT + 1],
+            sSpsBuffer: boxed_array(SSps::default()),
+            sPpsBuffer: boxed_array(SPps::default()),
+            sSubsetSpsBuffer: boxed_array(SSubsetSps::default()),
             sPrefixNal: SNalUnit::default(),
             pActiveLayerSps: [None; MAX_LAYER_NUM],
             bAvcBasedFlag: false,
@@ -333,9 +341,9 @@ impl Default for SWelsDecoderSpsPpsCTX {
     fn default() -> Self {
         Self {
             sFrameCrop: SPosOffset::default(),
-            sSpsBuffer: [SSps::default(); MAX_SPS_COUNT + 1],
-            sPpsBuffer: [SPps::default(); MAX_PPS_COUNT + 1],
-            sSubsetSpsBuffer: [SSubsetSps::default(); MAX_SPS_COUNT + 1],
+            sSpsBuffer: boxed_array(SSps::default()),
+            sPpsBuffer: boxed_array(SPps::default()),
+            sSubsetSpsBuffer: boxed_array(SSubsetSps::default()),
             sPrefixNal: SNalUnit::default(),
             pActiveLayerSps: [None; MAX_LAYER_NUM],
             bAvcBasedFlag: true,
@@ -1167,7 +1175,7 @@ pub struct SWelsDecoderContext {
     pub bUsedAsRef: bool,
     pub iFrameNum: i32,
     pub iErrorCode: i32,
-    pub sFmoList: [SFmo; MAX_PPS_COUNT],
+    pub sFmoList: Box<[SFmo; MAX_PPS_COUNT]>,
     /// The active FMO entry, as the PPS id that selects it. `sFmoList` is indexed by
     /// PPS id and nothing else.
     pub fmo_id: Option<i32>,
@@ -1233,9 +1241,9 @@ pub struct SWelsDecoderContext {
     pub bFramePending: bool,
     pub bFrameFinish: bool,
     pub iNalNum: i32,
-    pub sSpsBsInfo: [SSpsBsInfo; MAX_SPS_COUNT],
-    pub sSubsetSpsBsInfo: [SSpsBsInfo; MAX_PPS_COUNT],
-    pub sPpsBsInfo: [SPpsBsInfo; MAX_PPS_COUNT],
+    pub sSpsBsInfo: Box<[SSpsBsInfo; MAX_SPS_COUNT]>,
+    pub sSubsetSpsBsInfo: Box<[SSpsBsInfo; MAX_PPS_COUNT]>,
+    pub sPpsBsInfo: Box<[SPpsBsInfo; MAX_PPS_COUNT]>,
     /// The parse-only descriptor, **owned** and reached through [`parser_bs`].
     /// `None` outside parse-only mode.
     pub pParserBsInfo: Option<Box<ParseOnlyBsBuffers>>,
@@ -1280,8 +1288,8 @@ pub struct SWelsDecoderContext {
     pub pECRefPic: [Option<PicId>; 16],
     pub uiTimeStamp: u64,
     pub uiDecodingTimeStamp: u32,
-    pub pDequant_coeff_buffer4x4: [[[u16; 16]; 52]; 6],
-    pub pDequant_coeff_buffer8x8: [[[u16; 64]; 52]; 6],
+    pub pDequant_coeff_buffer4x4: Box<[[[u16; 16]; 52]; 6]>,
+    pub pDequant_coeff_buffer8x8: Box<[[[u16; 64]; 52]; 6]>,
     pub iDequantCoeffPpsid: i32,
     pub bDequantCoeff4x4Init: bool,
     pub bUseScalingList: bool,
@@ -1319,9 +1327,7 @@ impl Default for SWelsDecoderContext {
             bUsedAsRef: false,
             iFrameNum: 0,
             iErrorCode: 0,
-            // `SFmo` is not `Copy`, so this is 256 calls rather than a repeat
-            // expression.
-            sFmoList: std::array::from_fn(|_| SFmo::default()),
+            sFmoList: boxed_array(SFmo::default()),
             fmo_id: None,
             iActiveFmoNum: 0,
             pDec: None,
@@ -1368,9 +1374,9 @@ impl Default for SWelsDecoderContext {
             bFramePending: false,
             bFrameFinish: false,
             iNalNum: 0,
-            sSpsBsInfo: [SSpsBsInfo::default(); MAX_SPS_COUNT],
-            sSubsetSpsBsInfo: [SSpsBsInfo::default(); MAX_PPS_COUNT],
-            sPpsBsInfo: [SPpsBsInfo::default(); MAX_PPS_COUNT],
+            sSpsBsInfo: boxed_array(SSpsBsInfo::default()),
+            sSubsetSpsBsInfo: boxed_array(SSpsBsInfo::default()),
+            sPpsBsInfo: boxed_array(SPpsBsInfo::default()),
             pParserBsInfo: None,
             // Uninstalled until `WelsInitDecoderFuncs`.
             pGetI16x16LumaPredFunc: [None; 7],
@@ -1408,8 +1414,8 @@ impl Default for SWelsDecoderContext {
             pECRefPic: [None; 16],
             uiTimeStamp: 0,
             uiDecodingTimeStamp: 0,
-            pDequant_coeff_buffer4x4: [[[0; 16]; 52]; 6],
-            pDequant_coeff_buffer8x8: [[[0; 64]; 52]; 6],
+            pDequant_coeff_buffer4x4: boxed_array([[0; 16]; 52]),
+            pDequant_coeff_buffer8x8: boxed_array([[0; 64]; 52]),
             iDequantCoeffPpsid: 0,
             // `WelsCalcDeqCoeffScalingList` writes both buffers and this flag
             // together.
