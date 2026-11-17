@@ -38,9 +38,14 @@
 //!
 //! Every read stays inside `vaa_span(pic_width, pic_height, pic_stride)` bytes of
 //! each plane; the last macroblock's window is `15 * stride + 16` bytes.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
-#[cfg(target_arch = "x86_64")]
+use super::lanes::ld16;
+use super::sse2_token;
+use crate::simd::{
+    simd_entry,
+    tokens::{Avx2Token, Sse2Token},
+};
 use core::arch::x86_64::*;
 
 // ============================================================================
@@ -91,51 +96,62 @@ struct HalfStats {
 
 /// The low dword of the low quadword, and of the high one — the two quadrants of a
 /// `psadbw` accumulator.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn halves_i32(v: __m128i) -> [i32; 2] {
-    unsafe {
-        [
-            _mm_cvtsi128_si32(v),
-            _mm_cvtsi128_si32(_mm_srli_si128(v, 8)),
-        ]
-    }
+#[target_feature(enable = "sse2")]
+#[inline]
+fn halves_i32(v: __m128i) -> [i32; 2] {
+    [
+        _mm_cvtsi128_si32(v),
+        _mm_cvtsi128_si32(_mm_srli_si128(v, 8)),
+    ]
 }
 
 /// Sum of the four dwords — the asm's `pshufd`/`paddd` pair, twice.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn sum_i32(v: __m128i) -> i32 {
-    unsafe {
-        let v = _mm_add_epi32(v, _mm_srli_si128(v, 8));
-        _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_si128(v, 4)))
-    }
+#[target_feature(enable = "sse2")]
+#[inline]
+fn sum_i32(v: __m128i) -> i32 {
+    let v = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+    _mm_cvtsi128_si32(_mm_add_epi32(v, _mm_srli_si128(v, 4)))
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn fold256_add_epi32(v: __m256i) -> __m128i {
-    unsafe { _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)) }
+#[target_feature(enable = "avx2")]
+#[inline]
+fn fold256_add_epi32(v: __m256i) -> __m128i {
+    _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1))
 }
 
-/// The eight rows of one half-macroblock, from plane pointers anchored at its
-/// top-left sample.
-///
-/// `WELS_SAD_16x2_SSE2`, `WELS_SAD_SUM_SQSUM_16x1_SSE2`,
-/// `WELS_SAD_SUM_SQSUM_SQDIFF_16x1_SSE2`, `WELS_SAD_SD_MAD_16x1_SSE2` and
-/// `WELS_SAD_BGD_SQDIFF_16x1_SSE2` are all this loop with a different subset of the
-/// accumulators live, which is what the three flags select.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn half_mb<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
-    cur_ptr: *const u8,
-    ref_ptr: *const u8,
-    stride: usize,
-) -> HalfStats {
-    unsafe {
+macro_rules! half_mb_sse2_row {
+    ($ca:expr, $rb:expr, $zero:expr, $sad:ident, $cur_sum:ident, $ref_sum:ident, $mad:ident, $sqsum:ident, $sqdiff:ident, $VAR:expr, $SQDIFF:expr, $BGD:expr) => {{
+        let a = ld16($ca);
+        let b = ld16($rb);
+
+        $sad = _mm_add_epi32($sad, _mm_sad_epu8(a, b));
+        if $VAR || $BGD {
+            $cur_sum = _mm_add_epi32($cur_sum, _mm_sad_epu8(a, $zero));
+        }
+        if $BGD {
+            $ref_sum = _mm_add_epi32($ref_sum, _mm_sad_epu8(b, $zero));
+            let d = _mm_sub_epi8(_mm_max_epu8(a, b), _mm_min_epu8(a, b));
+            $mad = _mm_max_epu8($mad, d);
+        }
+        if $VAR {
+            let lo = _mm_unpacklo_epi8(a, $zero);
+            let hi = _mm_unpackhi_epi8(a, $zero);
+            $sqsum = _mm_add_epi32($sqsum, _mm_madd_epi16(lo, lo));
+            $sqsum = _mm_add_epi32($sqsum, _mm_madd_epi16(hi, hi));
+        }
+        if $SQDIFF {
+            let d = _mm_sub_epi8(_mm_max_epu8(a, b), _mm_min_epu8(a, b));
+            let lo = _mm_unpacklo_epi8(d, $zero);
+            let hi = _mm_unpackhi_epi8(d, $zero);
+            $sqdiff = _mm_add_epi32($sqdiff, _mm_madd_epi16(lo, lo));
+            $sqdiff = _mm_add_epi32($sqdiff, _mm_madd_epi16(hi, hi));
+        }
+    }};
+}
+
+macro_rules! half_mb_sse2 {
+    ($head:ident, $last:expr, $VAR:expr, $SQDIFF:expr, $BGD:expr) => {{
         let zero = _mm_setzero_si128();
-        // `psadbw` accumulators: the low quadword is the left quadrant, the high one
-        // the right.
         let mut sad = zero;
         let mut cur_sum = zero;
         let mut ref_sum = zero;
@@ -143,45 +159,29 @@ unsafe fn half_mb<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
         let mut sqsum = zero;
         let mut sqdiff = zero;
 
-        for k in 0..8 {
-            let base = k * stride;
-            let a = _mm_loadu_si128(cur_ptr.add(base) as *const __m128i);
-            let b = _mm_loadu_si128(ref_ptr.add(base) as *const __m128i);
-
-            sad = _mm_add_epi32(sad, _mm_sad_epu8(a, b));
-            if VAR || BGD {
-                cur_sum = _mm_add_epi32(cur_sum, _mm_sad_epu8(a, zero));
-            }
-            if BGD {
-                ref_sum = _mm_add_epi32(ref_sum, _mm_sad_epu8(b, zero));
-                let d = _mm_sub_epi8(_mm_max_epu8(a, b), _mm_min_epu8(a, b));
-                mad = _mm_max_epu8(mad, d);
-            }
-            if VAR {
-                let lo = _mm_unpacklo_epi8(a, zero);
-                let hi = _mm_unpackhi_epi8(a, zero);
-                sqsum = _mm_add_epi32(sqsum, _mm_madd_epi16(lo, lo));
-                sqsum = _mm_add_epi32(sqsum, _mm_madd_epi16(hi, hi));
-            }
-            if SQDIFF {
-                let d = _mm_sub_epi8(_mm_max_epu8(a, b), _mm_min_epu8(a, b));
-                let lo = _mm_unpacklo_epi8(d, zero);
-                let hi = _mm_unpackhi_epi8(d, zero);
-                sqdiff = _mm_add_epi32(sqdiff, _mm_madd_epi16(lo, lo));
-                sqdiff = _mm_add_epi32(sqdiff, _mm_madd_epi16(hi, hi));
-            }
+        for _ in 0..7 {
+            let (ca, rb) = $head.next().expect("vaa sse2 row");
+            half_mb_sse2_row!(
+                ca, rb, zero, sad, cur_sum, ref_sum, mad, sqsum, sqdiff, $VAR, $SQDIFF, $BGD
+            );
+        }
+        {
+            let (ca, rb): (&[u8; 16], &[u8; 16]) = $last;
+            half_mb_sse2_row!(
+                ca, rb, zero, sad, cur_sum, ref_sum, mad, sqsum, sqdiff, $VAR, $SQDIFF, $BGD
+            );
         }
 
         let mut out = HalfStats {
             sad: halves_i32(sad),
             ..Default::default()
         };
-        if VAR || BGD {
+        if $VAR || $BGD {
             let c = halves_i32(cur_sum);
-            if VAR {
+            if $VAR {
                 out.sum = c[0] + c[1];
             }
-            if BGD {
+            if $BGD {
                 let r = halves_i32(ref_sum);
                 out.sd = [c[0] - r[0], c[1] - r[1]];
                 let m = _mm_max_epu8(mad, _mm_srli_si128(mad, 4));
@@ -191,24 +191,48 @@ unsafe fn half_mb<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
                 out.mad = [lo as u8, hi as u8];
             }
         }
-        if VAR {
+        if $VAR {
             out.sqsum = sum_i32(sqsum);
         }
-        if SQDIFF {
+        if $SQDIFF {
             out.sqdiff = sum_i32(sqdiff);
         }
         out
-    }
+    }};
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn half_mb_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
-    cur_ptr: *const u8,
-    ref_ptr: *const u8,
-    stride: usize,
-) -> HalfStats {
-    unsafe {
+macro_rules! half_mb_avx2_pair {
+    ($ca0:expr, $rb0:expr, $ca1:expr, $rb1:expr, $zero:expr, $sad256:ident, $cur_sum256:ident, $ref_sum256:ident, $mad256:ident, $sqsum256:ident, $sqdiff256:ident, $VAR:expr, $SQDIFF:expr, $BGD:expr) => {{
+        let a = _mm256_set_m128i(ld16($ca1), ld16($ca0));
+        let b = _mm256_set_m128i(ld16($rb1), ld16($rb0));
+
+        $sad256 = _mm256_add_epi32($sad256, _mm256_sad_epu8(a, b));
+        if $VAR || $BGD {
+            $cur_sum256 = _mm256_add_epi32($cur_sum256, _mm256_sad_epu8(a, $zero));
+        }
+        if $BGD {
+            $ref_sum256 = _mm256_add_epi32($ref_sum256, _mm256_sad_epu8(b, $zero));
+            let d = _mm256_sub_epi8(_mm256_max_epu8(a, b), _mm256_min_epu8(a, b));
+            $mad256 = _mm256_max_epu8($mad256, d);
+        }
+        if $VAR {
+            let lo = _mm256_unpacklo_epi8(a, $zero);
+            let hi = _mm256_unpackhi_epi8(a, $zero);
+            $sqsum256 = _mm256_add_epi32($sqsum256, _mm256_madd_epi16(lo, lo));
+            $sqsum256 = _mm256_add_epi32($sqsum256, _mm256_madd_epi16(hi, hi));
+        }
+        if $SQDIFF {
+            let d = _mm256_sub_epi8(_mm256_max_epu8(a, b), _mm256_min_epu8(a, b));
+            let lo = _mm256_unpacklo_epi8(d, $zero);
+            let hi = _mm256_unpackhi_epi8(d, $zero);
+            $sqdiff256 = _mm256_add_epi32($sqdiff256, _mm256_madd_epi16(lo, lo));
+            $sqdiff256 = _mm256_add_epi32($sqdiff256, _mm256_madd_epi16(hi, hi));
+        }
+    }};
+}
+
+macro_rules! half_mb_avx2 {
+    ($head:ident, $last:expr, $VAR:expr, $SQDIFF:expr, $BGD:expr) => {{
         let zero = _mm256_setzero_si256();
         let mut sad256 = zero;
         let mut cur_sum256 = zero;
@@ -217,51 +241,33 @@ unsafe fn half_mb_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
         let mut sqsum256 = zero;
         let mut sqdiff256 = zero;
 
-        for step in 0..4 {
-            let k = step * 2;
-            let base0 = k * stride;
-            let base1 = base0 + stride;
-            let a0 = _mm_loadu_si128(cur_ptr.add(base0) as *const __m128i);
-            let a1 = _mm_loadu_si128(cur_ptr.add(base1) as *const __m128i);
-            let b0 = _mm_loadu_si128(ref_ptr.add(base0) as *const __m128i);
-            let b1 = _mm_loadu_si128(ref_ptr.add(base1) as *const __m128i);
-            let a = _mm256_set_m128i(a1, a0);
-            let b = _mm256_set_m128i(b1, b0);
-
-            sad256 = _mm256_add_epi32(sad256, _mm256_sad_epu8(a, b));
-            if VAR || BGD {
-                cur_sum256 = _mm256_add_epi32(cur_sum256, _mm256_sad_epu8(a, zero));
-            }
-            if BGD {
-                ref_sum256 = _mm256_add_epi32(ref_sum256, _mm256_sad_epu8(b, zero));
-                let d = _mm256_sub_epi8(_mm256_max_epu8(a, b), _mm256_min_epu8(a, b));
-                mad256 = _mm256_max_epu8(mad256, d);
-            }
-            if VAR {
-                let lo = _mm256_unpacklo_epi8(a, zero);
-                let hi = _mm256_unpackhi_epi8(a, zero);
-                sqsum256 = _mm256_add_epi32(sqsum256, _mm256_madd_epi16(lo, lo));
-                sqsum256 = _mm256_add_epi32(sqsum256, _mm256_madd_epi16(hi, hi));
-            }
-            if SQDIFF {
-                let d = _mm256_sub_epi8(_mm256_max_epu8(a, b), _mm256_min_epu8(a, b));
-                let lo = _mm256_unpacklo_epi8(d, zero);
-                let hi = _mm256_unpackhi_epi8(d, zero);
-                sqdiff256 = _mm256_add_epi32(sqdiff256, _mm256_madd_epi16(lo, lo));
-                sqdiff256 = _mm256_add_epi32(sqdiff256, _mm256_madd_epi16(hi, hi));
-            }
+        for _ in 0..3 {
+            let (ca0, rb0) = $head.next().expect("vaa avx2 row 0");
+            let (ca1, rb1) = $head.next().expect("vaa avx2 row 1");
+            half_mb_avx2_pair!(
+                ca0, rb0, ca1, rb1, zero, sad256, cur_sum256, ref_sum256, mad256, sqsum256,
+                sqdiff256, $VAR, $SQDIFF, $BGD
+            );
+        }
+        {
+            let (ca0, rb0) = $head.next().expect("vaa avx2 row 6");
+            let (ca1, rb1): (&[u8; 16], &[u8; 16]) = $last;
+            half_mb_avx2_pair!(
+                ca0, rb0, ca1, rb1, zero, sad256, cur_sum256, ref_sum256, mad256, sqsum256,
+                sqdiff256, $VAR, $SQDIFF, $BGD
+            );
         }
 
         let mut out = HalfStats {
             sad: halves_i32(fold256_add_epi32(sad256)),
             ..Default::default()
         };
-        if VAR || BGD {
+        if $VAR || $BGD {
             let c = halves_i32(fold256_add_epi32(cur_sum256));
-            if VAR {
+            if $VAR {
                 out.sum = c[0] + c[1];
             }
-            if BGD {
+            if $BGD {
                 let r = halves_i32(fold256_add_epi32(ref_sum256));
                 out.sd = [c[0] - r[0], c[1] - r[1]];
                 let mad = _mm_max_epu8(
@@ -275,78 +281,19 @@ unsafe fn half_mb_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
                 out.mad = [lo as u8, hi as u8];
             }
         }
-        if VAR {
+        if $VAR {
             out.sqsum = sum_i32(fold256_add_epi32(sqsum256));
         }
-        if SQDIFF {
+        if $SQDIFF {
             out.sqdiff = sum_i32(fold256_add_epi32(sqdiff256));
         }
         out
-    }
+    }};
 }
 
-/// One macroblock: the top half, then the bottom half eight rows down.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn mb_stats<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
-    cur: &[u8],
-    refp: &[u8],
-    stride: usize,
-) -> MbStats {
-    // The window a macroblock reads, checked once: sixteen rows of sixteen bytes,
-    // the last of which ends `15 * stride + 16` past the origin.
-    let cur = &cur[..15 * stride + 16];
-    let refp = &refp[..15 * stride + 16];
-    let bottom = 8 * stride;
-    let cur_ptr = cur.as_ptr();
-    let ref_ptr = refp.as_ptr();
-    let (top, bot) = unsafe {
-        (
-            half_mb::<VAR, SQDIFF, BGD>(cur_ptr, ref_ptr, stride),
-            half_mb::<VAR, SQDIFF, BGD>(cur_ptr.add(bottom), ref_ptr.add(bottom), stride),
-        )
-    };
-    MbStats {
-        sad: [top.sad[0], top.sad[1], bot.sad[0], bot.sad[1]],
-        sd: [top.sd[0], top.sd[1], bot.sd[0], bot.sd[1]],
-        mad: [top.mad[0], top.mad[1], bot.mad[0], bot.mad[1]],
-        sum: top.sum + bot.sum,
-        sqsum: top.sqsum + bot.sqsum,
-        sqdiff: top.sqdiff + bot.sqdiff,
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn mb_stats_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
-    cur: &[u8],
-    refp: &[u8],
-    stride: usize,
-) -> MbStats {
-    let cur = &cur[..15 * stride + 16];
-    let refp = &refp[..15 * stride + 16];
-    let bottom = 8 * stride;
-    let cur_ptr = cur.as_ptr();
-    let ref_ptr = refp.as_ptr();
-    let (top, bot) = unsafe {
-        (
-            half_mb_avx2::<VAR, SQDIFF, BGD>(cur_ptr, ref_ptr, stride),
-            half_mb_avx2::<VAR, SQDIFF, BGD>(cur_ptr.add(bottom), ref_ptr.add(bottom), stride),
-        )
-    };
-    MbStats {
-        sad: [top.sad[0], top.sad[1], bot.sad[0], bot.sad[1]],
-        sd: [top.sd[0], top.sd[1], bot.sd[0], bot.sd[1]],
-        mad: [top.mad[0], top.mad[1], bot.mad[0], bot.mad[1]],
-        sum: top.sum + bot.sum,
-        sqsum: top.sqsum + bot.sqsum,
-        sqdiff: top.sqdiff + bot.sqdiff,
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn walk_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+#[cold]
+#[inline(never)]
+fn walk_narrow<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     cur: &[u8],
     refp: &[u8],
     pic_width: i32,
@@ -359,16 +306,40 @@ unsafe fn walk_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
     let step = usize::try_from((pic_stride << 4) - pic_width)
         .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
-
     let mut frame_sad = 0i32;
     let mut mb_index = 0usize;
     let mut row_origin = 0usize;
     for _ in 0..mb_height {
         let mut mb_origin = row_origin;
         for _ in 0..mb_width {
-            let s = unsafe {
-                mb_stats_avx2::<VAR, SQDIFF, BGD>(&cur[mb_origin..], &refp[mb_origin..], stride)
-            };
+            let mut s = MbStats::default();
+            for qy in 0..2 {
+                for ry in 0..8 {
+                    let base = mb_origin + (qy * 8 + ry) * stride;
+                    let ca = cur[base..].first_chunk::<16>().expect("vaa cur row");
+                    let rb = refp[base..].first_chunk::<16>().expect("vaa ref row");
+                    for j in 0..16 {
+                        let q = qy * 2 + (j >> 3);
+                        let c = ca[j] as i32;
+                        let r = rb[j] as i32;
+                        let d = (c - r).abs();
+                        s.sad[q] += d;
+                        if VAR {
+                            s.sum += c;
+                            s.sqsum += c * c;
+                        }
+                        if SQDIFF {
+                            s.sqdiff += d * d;
+                        }
+                        if BGD {
+                            s.sd[q] += c - r;
+                            if d as u8 > s.mad[q] {
+                                s.mad[q] = d as u8;
+                            }
+                        }
+                    }
+                }
+            }
             frame_sad = frame_sad.wrapping_add(s.sad[0] + s.sad[1] + s.sad[2] + s.sad[3]);
             out.sad8x8[mb_index] = s.sad;
             if VAR {
@@ -390,10 +361,202 @@ unsafe fn walk_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     frame_sad
 }
 
-/// The picture walk, macroblock by macroblock, returning the frame's total SAD.
-#[cfg(target_arch = "x86_64")]
+/// Splits a 16x16 macroblock window (`stride >= 16`) into 15 `stride`-stepped rows +
+/// final row with zero per-row bounds checks or integer divisions.
 #[inline(always)]
-unsafe fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+fn split_mb16<'a>(
+    cur: &'a [u8],
+    refp: &'a [u8],
+    stride: usize,
+) -> (
+    impl Iterator<Item = (&'a [u8; 16], &'a [u8; 16])>,
+    (&'a [u8; 16], &'a [u8; 16]),
+) {
+    let s = stride.max(16);
+    let len = 15 * s + 16;
+    let c_buf = &cur[..len];
+    let r_buf = &refp[..len];
+    let (ch, ct) = c_buf.split_at(15 * s);
+    let (rh, rt) = r_buf.split_at(15 * s);
+    let tail = (
+        ct.first_chunk::<16>().expect("validated vaa cur tail"),
+        rt.first_chunk::<16>().expect("validated vaa ref tail"),
+    );
+    let head = ch.chunks_exact(s).zip(rh.chunks_exact(s)).map(|(cr, rr)| {
+        (
+            cr.first_chunk::<16>().expect("validated vaa cur row"),
+            rr.first_chunk::<16>().expect("validated vaa ref row"),
+        )
+    });
+    (head, tail)
+}
+
+/// One macroblock (`stride >= 16`): the top half, then the bottom half eight rows down.
+#[target_feature(enable = "sse2")]
+#[inline]
+fn mb_stats<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+    cur: &[u8],
+    refp: &[u8],
+    stride: usize,
+) -> MbStats {
+    let (mut head, tail) = split_mb16(cur, refp, stride);
+    let top_last = head.next().expect("vaa top row 0");
+    // `half_mb_sse2!` processes 7 rows from `head` + 1 `last` row; since addition and
+    // max across the 8 rows of a half-MB are commutative, passing `top_last` (row 0) as
+    // the 8th row after rows 1..8 consumes rows 0..8 with zero branching.
+    let top = half_mb_sse2!(head, top_last, VAR, SQDIFF, BGD);
+    let bot = half_mb_sse2!(head, tail, VAR, SQDIFF, BGD);
+    MbStats {
+        sad: [top.sad[0], top.sad[1], bot.sad[0], bot.sad[1]],
+        sd: [top.sd[0], top.sd[1], bot.sd[0], bot.sd[1]],
+        mad: [top.mad[0], top.mad[1], bot.mad[0], bot.mad[1]],
+        sum: top.sum + bot.sum,
+        sqsum: top.sqsum + bot.sqsum,
+        sqdiff: top.sqdiff + bot.sqdiff,
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+fn mb_stats_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+    cur: &[u8],
+    refp: &[u8],
+    stride: usize,
+) -> MbStats {
+    let (mut head, tail) = split_mb16(cur, refp, stride);
+    let top_last = head.next().expect("vaa top row 0");
+    let top = half_mb_avx2!(head, top_last, VAR, SQDIFF, BGD);
+    let bot = half_mb_avx2!(head, tail, VAR, SQDIFF, BGD);
+    MbStats {
+        sad: [top.sad[0], top.sad[1], bot.sad[0], bot.sad[1]],
+        sd: [top.sd[0], top.sd[1], bot.sd[0], bot.sd[1]],
+        mad: [top.mad[0], top.mad[1], bot.mad[0], bot.mad[1]],
+        sum: top.sum + bot.sum,
+        sqsum: top.sqsum + bot.sqsum,
+        sqdiff: top.sqdiff + bot.sqdiff,
+    }
+}
+
+simd_entry! {
+    #[target_feature(enable = "avx2")]
+    fn walk_avx2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+        cur: &[u8],
+        refp: &[u8],
+        pic_width: i32,
+        pic_height: i32,
+        pic_stride: i32,
+        out: &mut Outputs<'_>,
+        _token: Avx2Token,
+    ) -> i32 {
+        let mb_width = pic_width >> 4;
+        let mb_height = pic_height >> 4;
+        let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
+        let step = usize::try_from((pic_stride << 4) - pic_width)
+            .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
+
+        let mut frame_sad = 0i32;
+        let mut mb_index = 0usize;
+        let mut row_origin = 0usize;
+        for _ in 0..mb_height {
+            let mut mb_origin = row_origin;
+            for _ in 0..mb_width {
+                let s = mb_stats_avx2::<VAR, SQDIFF, BGD>(&cur[mb_origin..], &refp[mb_origin..], stride);
+                frame_sad = frame_sad.wrapping_add(s.sad[0] + s.sad[1] + s.sad[2] + s.sad[3]);
+                out.sad8x8[mb_index] = s.sad;
+                if VAR {
+                    out.sum16x16[mb_index] = s.sum;
+                    out.sqsum16x16[mb_index] = s.sqsum;
+                }
+                if SQDIFF {
+                    out.sqdiff16x16[mb_index] = s.sqdiff;
+                }
+                if BGD {
+                    out.sd8x8[mb_index] = s.sd;
+                    out.mad8x8[mb_index] = s.mad;
+                }
+                mb_index += 1;
+                mb_origin += 16;
+            }
+            row_origin = mb_origin + step;
+        }
+        frame_sad
+    }
+
+    #[target_feature(enable = "sse2")]
+    fn walk_sse2<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+        cur: &[u8],
+        refp: &[u8],
+        pic_width: i32,
+        pic_height: i32,
+        pic_stride: i32,
+        out: &mut Outputs<'_>,
+        _token: Sse2Token,
+    ) -> i32 {
+        let mb_width = pic_width >> 4;
+        let mb_height = pic_height >> 4;
+        let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
+        let step = usize::try_from((pic_stride << 4) - pic_width)
+            .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
+
+        let mut frame_sad = 0i32;
+        let mut mb_index = 0usize;
+        let mut row_origin = 0usize;
+        for _ in 0..mb_height {
+            let mut mb_origin = row_origin;
+            for _ in 0..mb_width {
+                let s = mb_stats::<VAR, SQDIFF, BGD>(&cur[mb_origin..], &refp[mb_origin..], stride);
+                // The frame total accumulates in the C++'s quadrant order.
+                frame_sad = frame_sad.wrapping_add(s.sad[0] + s.sad[1] + s.sad[2] + s.sad[3]);
+                out.sad8x8[mb_index] = s.sad;
+                if VAR {
+                    out.sum16x16[mb_index] = s.sum;
+                    out.sqsum16x16[mb_index] = s.sqsum;
+                }
+                if SQDIFF {
+                    out.sqdiff16x16[mb_index] = s.sqdiff;
+                }
+                if BGD {
+                    out.sd8x8[mb_index] = s.sd;
+                    out.mad8x8[mb_index] = s.mad;
+                }
+                mb_index += 1;
+                mb_origin += 16;
+            }
+            row_origin = mb_origin + step;
+        }
+        frame_sad
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn walk_fallback<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+    cur: &[u8],
+    refp: &[u8],
+    pic_width: i32,
+    pic_height: i32,
+    pic_stride: i32,
+    out: &mut Outputs<'_>,
+) -> i32 {
+    if let Some(token) = Avx2Token::try_new_enabled() {
+        return walk_avx2::<VAR, SQDIFF, BGD>(
+            cur, refp, pic_width, pic_height, pic_stride, out, token,
+        );
+    }
+    walk_sse2::<VAR, SQDIFF, BGD>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        out,
+        sse2_token(),
+    )
+}
+
+/// The picture walk, macroblock by macroblock, returning the frame's total SAD.
+#[inline(always)]
+fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     cur: &[u8],
     refp: &[u8],
     pic_width: i32,
@@ -409,44 +572,15 @@ unsafe fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     let span = crate::processing::vaacalc::vaa_span(pic_width, pic_height, pic_stride);
     let cur = &cur[..span];
     let refp = &refp[..span];
-    if crate::simd::has_avx2() {
-        return unsafe {
-            walk_avx2::<VAR, SQDIFF, BGD>(cur, refp, pic_width, pic_height, pic_stride, out)
-        };
+    if pic_stride < 16 {
+        return walk_narrow::<VAR, SQDIFF, BGD>(cur, refp, pic_width, pic_height, pic_stride, out);
     }
-    let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
-    let step = usize::try_from((pic_stride << 4) - pic_width)
-        .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
-
-    let mut frame_sad = 0i32;
-    let mut mb_index = 0usize;
-    let mut row_origin = 0usize;
-    for _ in 0..mb_height {
-        let mut mb_origin = row_origin;
-        for _ in 0..mb_width {
-            let s = unsafe {
-                mb_stats::<VAR, SQDIFF, BGD>(&cur[mb_origin..], &refp[mb_origin..], stride)
-            };
-            // The frame total accumulates in the C++'s quadrant order.
-            frame_sad = frame_sad.wrapping_add(s.sad[0] + s.sad[1] + s.sad[2] + s.sad[3]);
-            out.sad8x8[mb_index] = s.sad;
-            if VAR {
-                out.sum16x16[mb_index] = s.sum;
-                out.sqsum16x16[mb_index] = s.sqsum;
-            }
-            if SQDIFF {
-                out.sqdiff16x16[mb_index] = s.sqdiff;
-            }
-            if BGD {
-                out.sd8x8[mb_index] = s.sd;
-                out.mad8x8[mb_index] = s.mad;
-            }
-            mb_index += 1;
-            mb_origin += 16;
-        }
-        row_origin = mb_origin + step;
+    if let Some(token) = Avx2Token::try_fast_enabled() {
+        return walk_avx2::<VAR, SQDIFF, BGD>(
+            cur, refp, pic_width, pic_height, pic_stride, out, token,
+        );
     }
-    frame_sad
+    walk_fallback::<VAR, SQDIFF, BGD>(cur, refp, pic_width, pic_height, pic_stride, out)
 }
 
 // ============================================================================
@@ -454,7 +588,6 @@ unsafe fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
 // ============================================================================
 
 /// `VAACalcSad_sse2`.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn vaa_calc_sad(
     cur: &[u8],
@@ -472,12 +605,10 @@ pub fn vaa_calc_sad(
         sqsum16x16: &mut [],
         sqdiff16x16: &mut [],
     };
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { walk::<false, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<false, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out)
 }
 
 /// `VAACalcSadVar_sse2`.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn vaa_calc_sad_var(
@@ -498,12 +629,10 @@ pub fn vaa_calc_sad_var(
         sqsum16x16,
         sqdiff16x16: &mut [],
     };
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { walk::<true, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out)
 }
 
 /// `VAACalcSadSsd_sse2`.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn vaa_calc_sad_ssd(
@@ -525,12 +654,10 @@ pub fn vaa_calc_sad_ssd(
         sqsum16x16,
         sqdiff16x16,
     };
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { walk::<true, true, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, true, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out)
 }
 
 /// `VAACalcSadBgd_sse2`.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn vaa_calc_sad_bgd(
@@ -551,12 +678,10 @@ pub fn vaa_calc_sad_bgd(
         sqsum16x16: &mut [],
         sqdiff16x16: &mut [],
     };
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { walk::<false, false, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<false, false, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out)
 }
 
 /// `VAACalcSadSsdBgd_sse2`.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn vaa_calc_sad_ssd_bgd(
@@ -580,8 +705,7 @@ pub fn vaa_calc_sad_ssd_bgd(
         sqsum16x16,
         sqdiff16x16,
     };
-    // SAFETY: SSE2 is part of the x86_64 baseline.
-    unsafe { walk::<true, true, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, true, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out)
 }
 
 #[cfg(test)]

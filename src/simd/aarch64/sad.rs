@@ -15,9 +15,8 @@
 //! each for the left and right probes.
 //!
 //! There is no upstream 8x4 or 4x8 kernel; those slots run the same row loop at those
-//! heights. Nor is there a second, wider tier on aarch64: `has_avx2()` is false on
-//! every aarch64 build, so the `_avx2` slots are never installed and forward to the
-//! baseline kernel.
+//! heights. Nor is there a second, wider tier on aarch64: the `_avx2` constructors
+//! return `None`, leaving the baseline NEON slots installed.
 //!
 //! # Accumulators
 //!
@@ -40,257 +39,247 @@
 //! the asm reads them. Their row loops take that block a `G`-row window at a time,
 //! because only a *constant* row offset inside a span folds and a loop LLVM does not
 //! unroll has no constant offsets; see `sad_four_16x`.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld4, ld8, ld16};
+use super::neon_token;
 use crate::safe::plane::{BlockRows, RefSamples};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // Row loops
 // ============================================================================
 
-/// Two rows per step into four accumulators; see the header.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_16x<S: RefSamples, const H: usize>(sample1: &S, sample2: &S, dx: isize, dy: isize) -> i32 {
-    const { assert!(H % 2 == 0, "sad_16x steps two rows; H must be even") };
-    let (s1, s2) = (sample1.span::<16, H>(0, 0), sample2.span::<16, H>(dy, dx));
-    let mut acc = [vdupq_n_u16(0); 4];
-    let mut y = 0usize;
-    while y < H {
-        let (a, b) = (ld16(&s1.row::<16>(y, 0)), ld16(&s2.row::<16>(y, 0)));
-        acc[0] = vabal_u8(acc[0], vget_low_u8(a), vget_low_u8(b));
-        acc[1] = vabal_high_u8(acc[1], a, b);
-        let (a, b) = (ld16(&s1.row::<16>(y + 1, 0)), ld16(&s2.row::<16>(y + 1, 0)));
-        acc[2] = vabal_u8(acc[2], vget_low_u8(a), vget_low_u8(b));
-        acc[3] = vabal_high_u8(acc[3], a, b);
-        y += 2;
-    }
-    vaddlvq_u16(vaddq_u16(
-        vaddq_u16(acc[0], acc[1]),
-        vaddq_u16(acc[2], acc[3]),
-    )) as i32
-}
-
-/// Two rows per step into two accumulators.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_8x<S: RefSamples, const H: usize>(sample1: &S, sample2: &S, dx: isize, dy: isize) -> i32 {
-    const { assert!(H % 2 == 0, "sad_8x steps two rows; H must be even") };
-    let (s1, s2) = (sample1.span::<8, H>(0, 0), sample2.span::<8, H>(dy, dx));
-    let mut acc = [vdupq_n_u16(0); 2];
-    let mut y = 0usize;
-    while y < H {
-        acc[0] = vabal_u8(acc[0], ld8(&s1.row::<8>(y, 0)), ld8(&s2.row::<8>(y, 0)));
-        acc[1] = vabal_u8(
-            acc[1],
-            ld8(&s1.row::<8>(y + 1, 0)),
-            ld8(&s2.row::<8>(y + 1, 0)),
-        );
-        y += 2;
-    }
-    vaddlvq_u16(vaddq_u16(acc[0], acc[1])) as i32
-}
-
-/// The asm loads each row into `.s[0]` and reduces over `.4h`; `ld4` zeroes the
-/// upper lanes instead, so the full-width reduce is exact.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_4x<S: RefSamples, const H: usize>(sample1: &S, sample2: &S, dx: isize, dy: isize) -> i32 {
-    const { assert!(H % 2 == 0, "sad_4x steps two rows; H must be even") };
-    let (s1, s2) = (sample1.span::<4, H>(0, 0), sample2.span::<4, H>(dy, dx));
-    let mut acc = [vdupq_n_u16(0); 2];
-    let mut y = 0usize;
-    while y < H {
-        acc[0] = vabal_u8(acc[0], ld4(&s1.row::<4>(y, 0)), ld4(&s2.row::<4>(y, 0)));
-        acc[1] = vabal_u8(
-            acc[1],
-            ld4(&s1.row::<4>(y + 1, 0)),
-            ld4(&s2.row::<4>(y + 1, 0)),
-        );
-        y += 2;
-    }
-    vaddlvq_u16(vaddq_u16(acc[0], acc[1])) as i32
-}
-
-/// The four whole-sample neighbours — up, down, left, right — two accumulators
-/// each (low and high halves), so no chain is longer than the block is tall.
-///
-/// # The probe span
-///
-/// All four probes of a row live in one `W + 2` by `G + 2` window of `sample2` cut at
-/// `(-1, -1)`: the up and down probes are span rows `j` and `j + 2` at column 1, the
-/// left and right are span row `j + 1` at columns 0 and 2. That is exactly what the
-/// asm's `LOAD_8X8_2` plus two extra rows, read at offsets 0 and 2, does.
-///
-/// # `G`: how many rows one cut covers
-///
-/// Only a constant row offset inside a span folds; LLVM cannot place a symbolic
-/// `y * stride` inside the span, and the per-row checks would stay. So a cut covers
-/// `G` rows, the rows inside are read at constant offsets, and their checks all fold
-/// into that one cut. `G` has to be small enough that the `G`-row walk unrolls — that
-/// is what makes those offsets constant — so it is `H` for the shapes that unroll
-/// whole and a divisor of `H` for the ones that do not.
-///
-/// The two block spans are cut once, outside the loop, and the groups are
-/// [`BlockRows::window`]s of them: cutting from the cursor per group would put the
-/// stride validation inside the loop. `HW` is `H + 2`, a separate parameter only
-/// because stable Rust cannot compute `H + 2` in a const-argument position.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_four_16x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    const {
-        assert!(
-            G % 2 == 0 && H % G == 0,
-            "the block is a whole number of G-row cuts"
-        )
-    };
-    const {
-        assert!(
-            HW == H + 2,
-            "the probe span is two rows taller than the block"
-        )
-    };
-    let mut acc = [[vdupq_n_u16(0); 2]; 4];
-    let s1 = sample1.span::<16, H>(0, 0);
-    let s2 = sample2.span::<18, HW>(-1, -1);
-    let mut y = 0usize;
-    while y < H {
-        let s1 = s1.window::<16>(y, G);
-        let s2 = s2.window::<18>(y, G + 2);
-        for j in 0..G {
-            let a = ld16(&s1.row::<16>(j, 0));
-            let probes = [
-                ld16(&s2.row::<16>(j, 1)),
-                ld16(&s2.row::<16>(j + 2, 1)),
-                ld16(&s2.row::<16>(j + 1, 0)),
-                ld16(&s2.row::<16>(j + 1, 2)),
-            ];
-            for (k, p) in probes.into_iter().enumerate() {
-                acc[k][0] = vabal_u8(acc[k][0], vget_low_u8(a), vget_low_u8(p));
-                acc[k][1] = vabal_high_u8(acc[k][1], a, p);
-            }
+simd_entry! {
+    /// Two rows per step into four accumulators; see the header.
+    #[target_feature(enable = "neon")]
+    fn sad_16x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: NeonToken,
+    ) -> i32 {
+        const { assert!(H % 2 == 0, "sad_16x steps two rows; H must be even") };
+        let (s1, s2) = (sample1.span::<16, H>(0, 0), sample2.span::<16, H>(dy, dx));
+        let mut acc = [vdupq_n_u16(0); 4];
+        let mut y = 0usize;
+        while y < H {
+            let (a, b) = (ld16(&s1.row::<16>(y, 0)), ld16(&s2.row::<16>(y, 0)));
+            acc[0] = vabal_u8(acc[0], vget_low_u8(a), vget_low_u8(b));
+            acc[1] = vabal_high_u8(acc[1], a, b);
+            let (a, b) = (ld16(&s1.row::<16>(y + 1, 0)), ld16(&s2.row::<16>(y + 1, 0)));
+            acc[2] = vabal_u8(acc[2], vget_low_u8(a), vget_low_u8(b));
+            acc[3] = vabal_high_u8(acc[3], a, b);
+            y += 2;
         }
-        y += G;
+        vaddlvq_u16(vaddq_u16(
+            vaddq_u16(acc[0], acc[1]),
+            vaddq_u16(acc[2], acc[3]),
+        )) as i32
     }
-    for k in 0..4 {
-        sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
-    }
-}
 
-/// See [`sad_four_16x`] for the probe span and for what `G` and `HW` select.
-///
-/// The two accumulators are the row parity here, not the byte halves, so the inner
-/// pair walk is written out: the accumulator index has to be a constant for the
-/// array to stay in registers.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_four_8x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    const {
-        assert!(
-            G % 2 == 0 && H % G == 0,
-            "the block is a whole number of G-row cuts"
-        )
-    };
-    const {
-        assert!(
-            HW == H + 2,
-            "the probe span is two rows taller than the block"
-        )
-    };
-    let mut acc = [[vdupq_n_u16(0); 2]; 4];
-    let s1 = sample1.span::<8, H>(0, 0);
-    let s2 = sample2.span::<10, HW>(-1, -1);
-    let mut y = 0usize;
-    while y < H {
-        let s1 = s1.window::<8>(y, G);
-        let s2 = s2.window::<10>(y, G + 2);
-        let mut i = 0usize;
-        while i < G {
-            for j in 0..2usize {
-                let yy = i + j;
-                let a = ld8(&s1.row::<8>(yy, 0));
+    /// Two rows per step into two accumulators.
+    #[target_feature(enable = "neon")]
+    fn sad_8x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: NeonToken,
+    ) -> i32 {
+        const { assert!(H % 2 == 0, "sad_8x steps two rows; H must be even") };
+        let (s1, s2) = (sample1.span::<8, H>(0, 0), sample2.span::<8, H>(dy, dx));
+        let mut acc = [vdupq_n_u16(0); 2];
+        let mut y = 0usize;
+        while y < H {
+            acc[0] = vabal_u8(acc[0], ld8(&s1.row::<8>(y, 0)), ld8(&s2.row::<8>(y, 0)));
+            acc[1] = vabal_u8(
+                acc[1],
+                ld8(&s1.row::<8>(y + 1, 0)),
+                ld8(&s2.row::<8>(y + 1, 0)),
+            );
+            y += 2;
+        }
+        vaddlvq_u16(vaddq_u16(acc[0], acc[1])) as i32
+    }
+
+    /// The asm loads each row into `.s[0]` and reduces over `.4h`; `ld4` zeroes the
+    /// upper lanes instead, so the full-width reduce is exact.
+    #[target_feature(enable = "neon")]
+    fn sad_4x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: NeonToken,
+    ) -> i32 {
+        const { assert!(H % 2 == 0, "sad_4x steps two rows; H must be even") };
+        let (s1, s2) = (sample1.span::<4, H>(0, 0), sample2.span::<4, H>(dy, dx));
+        let mut acc = [vdupq_n_u16(0); 2];
+        let mut y = 0usize;
+        while y < H {
+            acc[0] = vabal_u8(acc[0], ld4(&s1.row::<4>(y, 0)), ld4(&s2.row::<4>(y, 0)));
+            acc[1] = vabal_u8(
+                acc[1],
+                ld4(&s1.row::<4>(y + 1, 0)),
+                ld4(&s2.row::<4>(y + 1, 0)),
+            );
+            y += 2;
+        }
+        vaddlvq_u16(vaddq_u16(acc[0], acc[1])) as i32
+    }
+
+    /// The four whole-sample neighbours — up, down, left, right — two accumulators
+    /// each (low and high halves), so no chain is longer than the block is tall.
+    #[target_feature(enable = "neon")]
+    fn sad_four_16x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: NeonToken,
+    ) {
+        const {
+            assert!(
+                G % 2 == 0 && H % G == 0,
+                "the block is a whole number of G-row cuts"
+            )
+        };
+        const {
+            assert!(
+                HW == H + 2,
+                "the probe span is two rows taller than the block"
+            )
+        };
+        let mut acc = [[vdupq_n_u16(0); 2]; 4];
+        let s1 = sample1.span::<16, H>(0, 0);
+        let s2 = sample2.span::<18, HW>(-1, -1);
+        let mut y = 0usize;
+        while y < H {
+            let s1 = s1.window::<16>(y, G);
+            let s2 = s2.window::<18>(y, G + 2);
+            for j in 0..G {
+                let a = ld16(&s1.row::<16>(j, 0));
                 let probes = [
-                    ld8(&s2.row::<8>(yy, 1)),
-                    ld8(&s2.row::<8>(yy + 2, 1)),
-                    ld8(&s2.row::<8>(yy + 1, 0)),
-                    ld8(&s2.row::<8>(yy + 1, 2)),
+                    ld16(&s2.row::<16>(j, 1)),
+                    ld16(&s2.row::<16>(j + 2, 1)),
+                    ld16(&s2.row::<16>(j + 1, 0)),
+                    ld16(&s2.row::<16>(j + 1, 2)),
                 ];
                 for (k, p) in probes.into_iter().enumerate() {
-                    acc[k][j] = vabal_u8(acc[k][j], a, p);
+                    acc[k][0] = vabal_u8(acc[k][0], vget_low_u8(a), vget_low_u8(p));
+                    acc[k][1] = vabal_high_u8(acc[k][1], a, p);
                 }
             }
-            i += 2;
+            y += G;
         }
-        y += G;
+        for k in 0..4 {
+            sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
+        }
     }
-    for k in 0..4 {
-        sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
-    }
-}
 
-/// See [`sad_four_16x`] for the probe span and for what `G` and `HW` select.
-///
-/// The two accumulators are the row parity here, not the byte halves, so the inner
-/// pair walk is written out: the accumulator index has to be a constant for the
-/// array to stay in registers.
-#[inline]
-#[target_feature(enable = "neon")]
-fn sad_four_4x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    const {
-        assert!(
-            G % 2 == 0 && H % G == 0,
-            "the block is a whole number of G-row cuts"
-        )
-    };
-    const {
-        assert!(
-            HW == H + 2,
-            "the probe span is two rows taller than the block"
-        )
-    };
-    let mut acc = [[vdupq_n_u16(0); 2]; 4];
-    let s1 = sample1.span::<4, H>(0, 0);
-    let s2 = sample2.span::<6, HW>(-1, -1);
-    let mut y = 0usize;
-    while y < H {
-        let s1 = s1.window::<4>(y, G);
-        let s2 = s2.window::<6>(y, G + 2);
-        let mut i = 0usize;
-        while i < G {
-            for j in 0..2usize {
-                let yy = i + j;
-                let a = ld4(&s1.row::<4>(yy, 0));
-                let probes = [
-                    ld4(&s2.row::<4>(yy, 1)),
-                    ld4(&s2.row::<4>(yy + 2, 1)),
-                    ld4(&s2.row::<4>(yy + 1, 0)),
-                    ld4(&s2.row::<4>(yy + 1, 2)),
-                ];
-                for (k, p) in probes.into_iter().enumerate() {
-                    acc[k][j] = vabal_u8(acc[k][j], a, p);
+    /// See [`sad_four_16x`] for the probe span and for what `G` and `HW` select.
+    #[target_feature(enable = "neon")]
+    fn sad_four_8x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: NeonToken,
+    ) {
+        const {
+            assert!(
+                G % 2 == 0 && H % G == 0,
+                "the block is a whole number of G-row cuts"
+            )
+        };
+        const {
+            assert!(
+                HW == H + 2,
+                "the probe span is two rows taller than the block"
+            )
+        };
+        let mut acc = [[vdupq_n_u16(0); 2]; 4];
+        let s1 = sample1.span::<8, H>(0, 0);
+        let s2 = sample2.span::<10, HW>(-1, -1);
+        let mut y = 0usize;
+        while y < H {
+            let s1 = s1.window::<8>(y, G);
+            let s2 = s2.window::<10>(y, G + 2);
+            let mut i = 0usize;
+            while i < G {
+                for j in 0..2usize {
+                    let yy = i + j;
+                    let a = ld8(&s1.row::<8>(yy, 0));
+                    let probes = [
+                        ld8(&s2.row::<8>(yy, 1)),
+                        ld8(&s2.row::<8>(yy + 2, 1)),
+                        ld8(&s2.row::<8>(yy + 1, 0)),
+                        ld8(&s2.row::<8>(yy + 1, 2)),
+                    ];
+                    for (k, p) in probes.into_iter().enumerate() {
+                        acc[k][j] = vabal_u8(acc[k][j], a, p);
+                    }
                 }
+                i += 2;
             }
-            i += 2;
+            y += G;
         }
-        y += G;
+        for k in 0..4 {
+            sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
+        }
     }
-    for k in 0..4 {
-        sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
+
+    /// See [`sad_four_16x`] for the probe span and for what `G` and `HW` select.
+    #[target_feature(enable = "neon")]
+    fn sad_four_4x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: NeonToken,
+    ) {
+        const {
+            assert!(
+                G % 2 == 0 && H % G == 0,
+                "the block is a whole number of G-row cuts"
+            )
+        };
+        const {
+            assert!(
+                HW == H + 2,
+                "the probe span is two rows taller than the block"
+            )
+        };
+        let mut acc = [[vdupq_n_u16(0); 2]; 4];
+        let s1 = sample1.span::<4, H>(0, 0);
+        let s2 = sample2.span::<6, HW>(-1, -1);
+        let mut y = 0usize;
+        while y < H {
+            let s1 = s1.window::<4>(y, G);
+            let s2 = s2.window::<6>(y, G + 2);
+            let mut i = 0usize;
+            while i < G {
+                for j in 0..2usize {
+                    let yy = i + j;
+                    let a = ld4(&s1.row::<4>(yy, 0));
+                    let probes = [
+                        ld4(&s2.row::<4>(yy, 1)),
+                        ld4(&s2.row::<4>(yy + 2, 1)),
+                        ld4(&s2.row::<4>(yy + 1, 0)),
+                        ld4(&s2.row::<4>(yy + 1, 2)),
+                    ];
+                    for (k, p) in probes.into_iter().enumerate() {
+                        acc[k][j] = vabal_u8(acc[k][j], a, p);
+                    }
+                }
+                i += 2;
+            }
+            y += G;
+        }
+        for k in 0..4 {
+            sad[k] = vaddlvq_u16(vaddq_u16(acc[k][0], acc[k][1])) as i32;
+        }
     }
 }
 
@@ -301,8 +290,7 @@ fn sad_four_4x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
 /// `WelsSampleSad16x16_AArch64_neon`.
 #[inline]
 pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { sad_16x::<S, 16>(sample1, sample2, 0, 0) }
+    sad_16x::<S, 16>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// The AVX2 slot's kernel — never installed on aarch64; see the module header.
@@ -310,94 +298,98 @@ pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 // that is compiled but not aliased goes dead.
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn sample_sad_16x16_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    sample_sad_16x16(sample1, sample2)
+pub(crate) fn sample_sad_16x16_avx2() -> Option<
+    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+> {
+    None
 }
 
 /// `WelsSampleSad16x8_AArch64_neon`.
 #[inline]
 pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_16x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_16x::<S, 8>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// See [`sample_sad_16x16_avx2`].
 // Dead in a set that is compiled but not aliased, as above.
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn sample_sad_16x8_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    sample_sad_16x8(sample1, sample2)
+pub(crate) fn sample_sad_16x8_avx2() -> Option<
+    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+> {
+    None
 }
 
 /// `WelsSampleSad8x16_AArch64_neon`.
 #[inline]
 pub fn sample_sad_8x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 16>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 16>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// `WelsSampleSad8x8_AArch64_neon`.
 #[inline]
 pub fn sample_sad_8x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 8>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// `WelsSampleSad4x4_AArch64_neon`.
 #[inline]
 pub fn sample_sad_4x4<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_4x::<S, 4>(sample1, sample2, 0, 0) }
+    sad_4x::<S, 4>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// No upstream kernel; the 8-wide loop at height 4.
 #[inline]
 pub fn sample_sad_8x4<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 4>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 4>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// No upstream kernel; the 4-wide loop at height 8.
 #[inline]
 pub fn sample_sad_4x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_4x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_4x::<S, 8>(sample1, sample2, 0, 0, neon_token())
 }
 
 /// `WelsSampleSadFour16x16_AArch64_neon`.
 #[inline]
 pub fn sample_sad_four_16x16<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_16x::<S, 16, 18, 4>(sample1, sample2, sad) }
+    sad_four_16x::<S, 16, 18, 4>(sample1, sample2, sad, neon_token())
 }
 
 /// `WelsSampleSadFour16x8_AArch64_neon`.
 #[inline]
 pub fn sample_sad_four_16x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_16x::<S, 8, 10, 4>(sample1, sample2, sad) }
+    sad_four_16x::<S, 8, 10, 4>(sample1, sample2, sad, neon_token())
 }
 
 /// `WelsSampleSadFour8x16_AArch64_neon`.
 #[inline]
 pub fn sample_sad_four_8x16<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_8x::<S, 16, 18, 8>(sample1, sample2, sad) }
+    sad_four_8x::<S, 16, 18, 8>(sample1, sample2, sad, neon_token())
 }
 
 /// `WelsSampleSadFour8x8_AArch64_neon`.
 #[inline]
 pub fn sample_sad_four_8x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_8x::<S, 8, 10, 8>(sample1, sample2, sad) }
+    sad_four_8x::<S, 8, 10, 8>(sample1, sample2, sad, neon_token())
 }
 
 /// `WelsSampleSadFour4x4_AArch64_neon`.
 #[inline]
 pub fn sample_sad_four_4x4<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_4x::<S, 4, 6, 4>(sample1, sample2, sad) }
+    sad_four_4x::<S, 4, 6, 4>(sample1, sample2, sad, neon_token())
 }
 
 /// No upstream kernel; the 8-wide loop at height 4.
 #[inline]
 pub fn sample_sad_four_8x4<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_8x::<S, 4, 6, 4>(sample1, sample2, sad) }
+    sad_four_8x::<S, 4, 6, 4>(sample1, sample2, sad, neon_token())
 }
 
 /// No upstream kernel; the 4-wide loop at height 8.
 #[inline]
 pub fn sample_sad_four_4x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sad_four_4x::<S, 8, 10, 8>(sample1, sample2, sad) }
+    sad_four_4x::<S, 8, 10, 8>(sample1, sample2, sad, neon_token())
 }
 
 // ============================================================================
@@ -441,22 +433,11 @@ mod tests {
         assert_eq!(sample_sad_4x8(&c1, &c2), sample_sad::<4, 8, _>(&c1, &c2));
     }
 
-    /// The `_avx2` pair is the baseline kernel under another name here, and runs
-    /// everywhere: there is no instruction to test for on this target.
+    /// On aarch64 there is no wider SAD tier, so the `_avx2` constructors return `None`.
     #[test]
     fn test_avx2_sad_parity() {
-        let (p1, p2) = make_test_planes(64, 64);
-        let c1 = PlaneCursor::new(&p1, 64 * 8 + 8, 64);
-        let c2 = PlaneCursor::new(&p2, 64 * 8 + 8, 64);
-
-        assert_eq!(
-            sample_sad_16x16_avx2(&c1, &c2),
-            sample_sad::<16, 16, _>(&c1, &c2)
-        );
-        assert_eq!(
-            sample_sad_16x8_avx2(&c1, &c2),
-            sample_sad::<16, 8, _>(&c1, &c2)
-        );
+        assert!(sample_sad_16x16_avx2().is_none());
+        assert!(sample_sad_16x8_avx2().is_none());
     }
 
     #[test]

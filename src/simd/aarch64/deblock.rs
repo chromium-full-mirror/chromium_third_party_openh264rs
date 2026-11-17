@@ -24,12 +24,14 @@
 //! lines are gathered as eight-byte rows and turned into tap vectors by an 8x8 byte
 //! transpose — `trn1`/`trn2` on bytes, then halfwords, then words — which is its own
 //! inverse and so also brings them back.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{any_set, ld4, ld8, ld8_i16, ld16, st16, to8};
+use super::neon_token;
 use crate::safe::plane::{BlockRows, PlaneSamples, RefSamples};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // Lane helpers
@@ -244,15 +246,15 @@ fn transpose8x8(r: [uint8x8_t; 8]) -> [uint8x8_t; 8] {
     ]
 }
 
-/// A vertical luma edge's sixteen lines, taps `-4 .. 4` of each, as eight tap
+simd_entry! {
+/// A vertical luma edge's sixteen lines, taps `-4 .. 4`, gathered into eight tap
 /// vectors of sixteen lines: two 8x8 transposes, one per half.
 ///
 /// The lines come out of one span rather than sixteen `row_n` calls — one bounds check
 /// instead of sixteen; see [`RefSamples::span`]. The cut is the exact bounding box of what
 /// the taps read, so the reach is unchanged.
-#[inline]
 #[target_feature(enable = "neon")]
-fn gather_luma_lines(pix: &impl RefSamples) -> [[u8; 16]; 8] {
+fn gather_luma_lines<R: RefSamples>(pix: &R, _token: NeonToken) -> [[u8; 16]; 8] {
     let s = pix.span::<8, 16>(0, -4);
     let mut lines = [vdup_n_u8(0); 16];
     for (i, l) in lines.iter_mut().enumerate() {
@@ -273,11 +275,11 @@ fn gather_luma_lines(pix: &impl RefSamples) -> [[u8; 16]; 8] {
 
 /// The inverse of [`gather_luma_lines`] for taps `FIRST .. FIRST + N` only — the
 /// ones the filter may have changed — written back at column `FIRST - 4`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn scatter_luma_lines<const FIRST: usize, const N: usize>(
-    pix: &mut impl PlaneSamples,
+fn scatter_luma_lines<const FIRST: usize, const N: usize, P: PlaneSamples>(
+    pix: &mut P,
     t: &[[u8; 16]; 8],
+    _token: NeonToken,
 ) {
     let mut top = [vdup_n_u8(0); 8];
     let mut bot = [vdup_n_u8(0); 8];
@@ -299,9 +301,12 @@ fn scatter_luma_lines<const FIRST: usize, const N: usize>(
 
 /// A vertical chroma edge's eight lines per plane, taps `-2 .. 2`, as four tap
 /// vectors holding the Cb lines low and the Cr lines high.
-#[inline]
 #[target_feature(enable = "neon")]
-fn gather_chroma_lines(cb: &impl RefSamples, cr: &impl RefSamples) -> [[u8; 16]; 4] {
+fn gather_chroma_lines<R1: RefSamples, R2: RefSamples>(
+    cb: &R1,
+    cr: &R2,
+    _token: NeonToken,
+) -> [[u8; 16]; 4] {
     let (sb, sr) = (cb.span::<4, 8>(0, -2), cr.span::<4, 8>(0, -2));
     let mut a = [vdup_n_u8(0); 8];
     let mut b = [vdup_n_u8(0); 8];
@@ -319,9 +324,13 @@ fn gather_chroma_lines(cb: &impl RefSamples, cr: &impl RefSamples) -> [[u8; 16];
 }
 
 /// The inverse of [`gather_chroma_lines`] for `p0` and `q0` — taps 1 and 2.
-#[inline]
 #[target_feature(enable = "neon")]
-fn scatter_chroma_lines(cb: &mut impl PlaneSamples, cr: &mut impl PlaneSamples, t: &[[u8; 16]; 4]) {
+fn scatter_chroma_lines<P1: PlaneSamples, P2: PlaneSamples>(
+    cb: &mut P1,
+    cr: &mut P2,
+    t: &[[u8; 16]; 4],
+    _token: NeonToken,
+) {
     let mut a = [vdup_n_u8(0); 8];
     let mut b = [vdup_n_u8(0); 8];
     for x in 0..4 {
@@ -342,7 +351,7 @@ fn scatter_chroma_lines(cb: &mut impl PlaneSamples, cr: &mut impl PlaneSamples, 
 // ============================================================================
 
 /// `DeblockLumaLt4V_AArch64_neon`'s body, on gathered rows.
-#[inline]
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 fn luma_lt4_16(
     p2: &[u8; 16],
@@ -354,6 +363,7 @@ fn luma_lt4_16(
     alpha: i32,
     beta: i32,
     tc: &[i8; 4],
+    _token: NeonToken,
 ) {
     let (alpha_v, beta_v) = (vdupq_n_u8(alpha as u8), vdupq_n_u8(beta as u8));
     let tc0 = tc_luma(tc);
@@ -391,7 +401,7 @@ fn luma_lt4_16(
 }
 
 /// `DeblockLumaEq4V_AArch64_neon`'s body, on gathered rows.
-#[inline]
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 fn luma_eq4_16(
     p3: &[u8; 16],
@@ -404,6 +414,7 @@ fn luma_eq4_16(
     q3: &[u8; 16],
     alpha: i32,
     beta: i32,
+    _token: NeonToken,
 ) {
     let (alpha_v, beta_v) = (vdupq_n_u8(alpha as u8), vdupq_n_u8(beta as u8));
     let (vp3, vp2, vp1, vp0) = (ld16(p3), ld16(p2), ld16(p1), ld16(p0));
@@ -432,7 +443,7 @@ fn luma_eq4_16(
 
 /// `DeblockChromaLt4V_AArch64_neon`'s body: the Cb lines in the low eight lanes, Cr
 /// in the high eight.
-#[inline]
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 fn chroma_lt4_16(
     p1: &[u8; 16],
@@ -442,6 +453,7 @@ fn chroma_lt4_16(
     alpha: i32,
     beta: i32,
     tc: &[i8; 4],
+    _token: NeonToken,
 ) {
     let (alpha_v, beta_v) = (vdupq_n_u8(alpha as u8), vdupq_n_u8(beta as u8));
     let tc0 = tc_chroma(tc);
@@ -463,7 +475,6 @@ fn chroma_lt4_16(
 }
 
 /// `DeblockChromaEq4V_AArch64_neon`'s body.
-#[inline]
 #[target_feature(enable = "neon")]
 fn chroma_eq4_16(
     p1: &[u8; 16],
@@ -472,6 +483,7 @@ fn chroma_eq4_16(
     q1: &[u8; 16],
     alpha: i32,
     beta: i32,
+    _token: NeonToken,
 ) {
     let (alpha_v, beta_v) = (vdupq_n_u8(alpha as u8), vdupq_n_u8(beta as u8));
     let (vp1, vp0, vq0, vq1) = (ld16(p1), ld16(p0), ld16(q0), ld16(q1));
@@ -496,6 +508,7 @@ fn chroma_eq4_16(
     st16(p0, vbslq_u8(mask, vcombine_u8(p0_lo, p0_hi), vp0));
     st16(q0, vbslq_u8(mask, vcombine_u8(q0_lo, q0_hi), vq0));
 }
+}
 
 // ============================================================================
 // The edge-direction wrappers
@@ -516,6 +529,7 @@ pub fn deblock_luma_lt4(
     beta: i32,
     tc: &[i8; 4],
 ) {
+    let token = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, pix.stride() as isize);
         // Horizontal edge: taps step vertically in y (-3, -2, -1, 0, 1, 2), which is
@@ -532,18 +546,15 @@ pub fn deblock_luma_lt4(
             )
         };
 
-        // SAFETY: NEON is baseline on aarch64; see the module header.
-        unsafe {
-            luma_lt4_16(
-                &p2, &mut p1, &mut p0, &mut q0, &mut q1, &q2, alpha, beta, tc,
-            )
-        };
+        luma_lt4_16(
+            &p2, &mut p1, &mut p0, &mut q0, &mut q1, &q2, alpha, beta, tc, token,
+        );
 
         pix.set_block::<16, 4>(-2, 0, &[p1, p0, q0, q1]);
     } else if step_x == 1 {
         debug_assert_eq!(step_y, pix.stride() as isize);
         // Vertical edge: line i has its taps at row i, columns -4..4.
-        let mut t = unsafe { gather_luma_lines(&*pix) };
+        let mut t = gather_luma_lines(&*pix, token);
         let [
             _,
             ref t1,
@@ -554,10 +565,10 @@ pub fn deblock_luma_lt4(
             ref t6,
             _,
         ] = t;
-        unsafe { luma_lt4_16(t1, t2, t3, t4, t5, t6, alpha, beta, tc) };
+        luma_lt4_16(t1, t2, t3, t4, t5, t6, alpha, beta, tc, token);
         // Write back only the columns the filter can modify — `p1..q1` — since at
         // `iEdge == 0` the outer columns belong to the previous macroblock.
-        unsafe { scatter_luma_lines::<2, 4>(pix, &t) };
+        scatter_luma_lines::<2, 4, _>(pix, &t, token);
     } else {
         crate::common::deblocking_common::deblock_luma_lt4_scalar(
             pix, step_x, step_y, alpha, beta, tc,
@@ -573,6 +584,7 @@ pub fn deblock_luma_eq4(
     alpha: i32,
     beta: i32,
 ) {
+    let token = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, pix.stride() as isize);
         // Taps `-4 .. 3`: one 16-wide, 8-tall span, as in `deblock_luma_lt4`.
@@ -590,16 +602,14 @@ pub fn deblock_luma_eq4(
             )
         };
 
-        unsafe {
-            luma_eq4_16(
-                &p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, &q3, alpha, beta,
-            )
-        };
+        luma_eq4_16(
+            &p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, &q3, alpha, beta, token,
+        );
 
         pix.set_block::<16, 6>(-3, 0, &[p2, p1, p0, q0, q1, q2]);
     } else if step_x == 1 {
         debug_assert_eq!(step_y, pix.stride() as isize);
-        let mut t = unsafe { gather_luma_lines(&*pix) };
+        let mut t = gather_luma_lines(&*pix, token);
         let [
             ref t0,
             ref mut t1,
@@ -610,9 +620,9 @@ pub fn deblock_luma_eq4(
             ref mut t6,
             ref t7,
         ] = t;
-        unsafe { luma_eq4_16(t0, t1, t2, t3, t4, t5, t6, t7, alpha, beta) };
+        luma_eq4_16(t0, t1, t2, t3, t4, t5, t6, t7, alpha, beta, token);
         // `p2..q2` only, as above.
-        unsafe { scatter_luma_lines::<1, 6>(pix, &t) };
+        scatter_luma_lines::<1, 6, _>(pix, &t, token);
     } else {
         crate::common::deblocking_common::deblock_luma_eq4_scalar(pix, step_x, step_y, alpha, beta);
     }
@@ -628,6 +638,7 @@ pub fn deblock_chroma_lt4(
     beta: i32,
     tc: &[i8; 4],
 ) {
+    let token = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, cb.stride() as isize);
         debug_assert_eq!(step_x, cr.stride() as isize);
@@ -645,7 +656,7 @@ pub fn deblock_chroma_lt4(
             }
         }
 
-        unsafe { chroma_lt4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, tc) };
+        chroma_lt4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, tc, token);
 
         cb.set_block::<8, 2>(
             -1,
@@ -666,10 +677,10 @@ pub fn deblock_chroma_lt4(
     } else if step_x == 1 {
         debug_assert_eq!(step_y, cb.stride() as isize);
         debug_assert_eq!(step_y, cr.stride() as isize);
-        let mut t = unsafe { gather_chroma_lines(&*cb, &*cr) };
+        let mut t = gather_chroma_lines(&*cb, &*cr, token);
         let [ref t0, ref mut t1, ref mut t2, ref t3] = t;
-        unsafe { chroma_lt4_16(t0, t1, t2, t3, alpha, beta, tc) };
-        unsafe { scatter_chroma_lines(cb, cr, &t) };
+        chroma_lt4_16(t0, t1, t2, t3, alpha, beta, tc, token);
+        scatter_chroma_lines(cb, cr, &t, token);
     } else {
         crate::common::deblocking_common::deblock_chroma_lt4_scalar(
             cb, cr, step_x, step_y, alpha, beta, tc,
@@ -686,6 +697,7 @@ pub fn deblock_chroma_eq4(
     alpha: i32,
     beta: i32,
 ) {
+    let token = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, cb.stride() as isize);
         debug_assert_eq!(step_x, cr.stride() as isize);
@@ -703,7 +715,7 @@ pub fn deblock_chroma_eq4(
             }
         }
 
-        unsafe { chroma_eq4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta) };
+        chroma_eq4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, token);
 
         cb.set_block::<8, 2>(
             -1,
@@ -724,10 +736,10 @@ pub fn deblock_chroma_eq4(
     } else if step_x == 1 {
         debug_assert_eq!(step_y, cb.stride() as isize);
         debug_assert_eq!(step_y, cr.stride() as isize);
-        let mut t = unsafe { gather_chroma_lines(&*cb, &*cr) };
+        let mut t = gather_chroma_lines(&*cb, &*cr, token);
         let [ref t0, ref mut t1, ref mut t2, ref t3] = t;
-        unsafe { chroma_eq4_16(t0, t1, t2, t3, alpha, beta) };
-        unsafe { scatter_chroma_lines(cb, cr, &t) };
+        chroma_eq4_16(t0, t1, t2, t3, alpha, beta, token);
+        scatter_chroma_lines(cb, cr, &t, token);
     } else {
         crate::common::deblocking_common::deblock_chroma_eq4_scalar(
             cb, cr, step_x, step_y, alpha, beta,
@@ -755,13 +767,13 @@ fn dup_halves(row: &[u8; 8]) -> [u8; 16] {
     v
 }
 
+simd_entry! {
 /// [`gather_chroma_lines`] for one plane: eight lines, one transpose. The taps land in
 /// the low half and repeat in the high half, which the filter core then filters
 /// redundantly — a lane-parallel no-op — rather than the two transposes and sixteen
 /// line loads that reading the same plane through the two-plane gather would cost.
-#[inline]
 #[target_feature(enable = "neon")]
-fn gather_chroma_lines1(cbcr: &impl RefSamples) -> [[u8; 16]; 4] {
+fn gather_chroma_lines1<R: RefSamples>(cbcr: &R, _token: NeonToken) -> [[u8; 16]; 4] {
     let s = cbcr.span::<4, 8>(0, -2);
     let mut a = [vdup_n_u8(0); 8];
     for (i, lane) in a.iter_mut().enumerate() {
@@ -776,9 +788,8 @@ fn gather_chroma_lines1(cbcr: &impl RefSamples) -> [[u8; 16]; 4] {
 }
 
 /// [`scatter_chroma_lines`] for one plane: `p0` and `q0` of the low half.
-#[inline]
 #[target_feature(enable = "neon")]
-fn scatter_chroma_lines1(cbcr: &mut impl PlaneSamples, t: &[[u8; 16]; 4]) {
+fn scatter_chroma_lines1<P: PlaneSamples>(cbcr: &mut P, t: &[[u8; 16]; 4], _token: NeonToken) {
     let mut a = [vdup_n_u8(0); 8];
     for x in 0..4 {
         a[x] = vget_low_u8(ld16(&t[x]));
@@ -786,6 +797,7 @@ fn scatter_chroma_lines1(cbcr: &mut impl PlaneSamples, t: &[[u8; 16]; 4]) {
     let a = transpose8x8(a);
     let out: [[u8; 2]; 8] = std::array::from_fn(|i| to8(a[i])[1..3].try_into().expect("p0, q0"));
     cbcr.set_block::<2, 8>(0, -1, &out);
+}
 }
 
 /// `DeblockChromaLt4V2_c` / `DeblockChromaLt4H2_c`, on one plane.
@@ -797,6 +809,7 @@ pub fn deblock_chroma_lt42(
     beta: i32,
     tc: &[i8; 4],
 ) {
+    let tok = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, cbcr.stride() as isize);
         // Taps `-2 .. 1`: one 8-wide, 4-tall span, in both halves.
@@ -810,7 +823,7 @@ pub fn deblock_chroma_lt42(
             )
         };
 
-        unsafe { chroma_lt4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, tc) };
+        chroma_lt4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, tc, tok);
 
         cbcr.set_block::<8, 2>(
             -1,
@@ -823,10 +836,10 @@ pub fn deblock_chroma_lt42(
     } else if step_x == 1 {
         debug_assert_eq!(step_y, cbcr.stride() as isize);
         // Eight lines into the low half, repeated into the high half.
-        let mut t = unsafe { gather_chroma_lines1(&*cbcr) };
+        let mut t = gather_chroma_lines1(&*cbcr, tok);
         let [ref t0, ref mut t1, ref mut t2, ref t3] = t;
-        unsafe { chroma_lt4_16(t0, t1, t2, t3, alpha, beta, tc) };
-        unsafe { scatter_chroma_lines1(cbcr, &t) };
+        chroma_lt4_16(t0, t1, t2, t3, alpha, beta, tc, tok);
+        scatter_chroma_lines1(cbcr, &t, tok);
     } else {
         crate::common::deblocking_common::deblock_chroma_lt42_scalar(
             cbcr, step_x, step_y, alpha, beta, tc,
@@ -842,6 +855,7 @@ pub fn deblock_chroma_eq42(
     alpha: i32,
     beta: i32,
 ) {
+    let tok = neon_token();
     if step_y == 1 {
         debug_assert_eq!(step_x, cbcr.stride() as isize);
         let (p1, mut p0, mut q0, q1) = {
@@ -854,7 +868,7 @@ pub fn deblock_chroma_eq42(
             )
         };
 
-        unsafe { chroma_eq4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta) };
+        chroma_eq4_16(&p1, &mut p0, &mut q0, &q1, alpha, beta, tok);
 
         cbcr.set_block::<8, 2>(
             -1,
@@ -866,10 +880,10 @@ pub fn deblock_chroma_eq42(
         );
     } else if step_x == 1 {
         debug_assert_eq!(step_y, cbcr.stride() as isize);
-        let mut t = unsafe { gather_chroma_lines1(&*cbcr) };
+        let mut t = gather_chroma_lines1(&*cbcr, tok);
         let [ref t0, ref mut t1, ref mut t2, ref t3] = t;
-        unsafe { chroma_eq4_16(t0, t1, t2, t3, alpha, beta) };
-        unsafe { scatter_chroma_lines1(cbcr, &t) };
+        chroma_eq4_16(t0, t1, t2, t3, alpha, beta, tok);
+        scatter_chroma_lines1(cbcr, &t, tok);
     } else {
         crate::common::deblocking_common::deblock_chroma_eq42_scalar(
             cbcr, step_x, step_y, alpha, beta,
@@ -898,11 +912,6 @@ pub fn deblock_chroma_eq42(
 // and an absent neighbour (`None`) is defined to give zero.
 
 use crate::encoder::encoder_context::SMVUnitXY;
-
-const _: () = assert!(
-    size_of::<SMVUnitXY>() == 4 && align_of::<SMVUnitXY>() == 2,
-    "`ld_mv4` reads `[SMVUnitXY; 16]` as 32 contiguous `i16`"
-);
 
 /// The 4x4 transpose of a macroblock's sixteen block indices: entry `j` is block
 /// `4 * (j % 4) + j / 4`, so the four vertical-edge positions of one column land in
@@ -944,10 +953,7 @@ fn nzc_term(cur: uint8x16_t, prev: uint8x16_t) -> uint8x16_t {
 #[target_feature(enable = "neon")]
 fn ld_mv4<const K: usize>(mv: &[SMVUnitXY; 16]) -> int16x8_t {
     const { assert!(K < 4, "a macroblock holds four groups of four vectors") };
-    // SAFETY: `SMVUnitXY` is `#[repr(C)]` over two `i16` — asserted above — so
-    // `[SMVUnitXY; 16]` is 32 contiguous `i16` with no padding, and `K < 4` puts the
-    // eight lanes read here at halfwords `8K .. 8K + 8` of it.
-    unsafe { vld1q_s16(mv.as_ptr().cast::<i16>().add(K * 8)) }
+    gather_mv4(mv, [4 * K, 4 * K + 1, 4 * K + 2, 4 * K + 3])
 }
 
 /// Four motion vectors gathered from scattered indices — the left neighbour's last
@@ -1025,11 +1031,10 @@ pub fn bs_calc(
     inside: u8,
     bs: &mut [[[u8; 4]; 4]; 2],
 ) {
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { bs_calc_neon(cur_nzc, cur_mv, left, top, inside, bs) }
+    bs_calc_neon(cur_nzc, cur_mv, left, top, inside, bs, neon_token())
 }
 
-#[inline]
+simd_entry! {
 #[target_feature(enable = "neon")]
 fn bs_calc_neon(
     cur_nzc: &[i8; 24],
@@ -1038,6 +1043,7 @@ fn bs_calc_neon(
     top: Option<(&[i8; 24], &[SMVUnitXY; 16])>,
     inside: u8,
     bs: &mut [[[u8; 4]; 4]; 2],
+    _token: NeonToken,
 ) {
     // The counts, in both orders: raster for the horizontal edges, column-major for
     // the vertical ones. Only the sixteen luma entries take part.
@@ -1134,6 +1140,7 @@ fn bs_calc_neon(
     let (v, h) = bs.split_at_mut(1);
     st16(v[0].as_flattened_mut(), vertical);
     st16(h[0].as_flattened_mut(), horizontal);
+}
 }
 
 // ============================================================================

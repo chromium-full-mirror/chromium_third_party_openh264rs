@@ -301,16 +301,73 @@ pub trait SampleCursor: RefSamples + Copy {}
 
 impl SampleCursor for PlaneCursor<'_> {}
 
+/// Zero-copy view of one `W`-sample row inside a [`BlockRows`] span (`&[u8; W]` on a
+/// plain byte plane, `&[Cell<u8>; W]` on a shared plane), allowing kernels with odd or
+/// padded row widths (`SW = 9, 13, 14, 17, 21, 22`) to load register-sized sub-windows
+/// directly from memory without staging `[u8; SW]` on the stack.
+#[allow(private_bounds)]
+pub trait RowSampleView<const W: usize>: Copy + sealed::Sealed {
+    /// Sample at column `x` (`x < W`).
+    fn sample(self, x: usize) -> u8;
+
+    /// `N` contiguous samples starting at column `x` (`x + N <= W`), by value.
+    fn sub<const N: usize>(self, x: usize) -> [u8; N];
+}
+
+impl<const W: usize> sealed::Sealed for &[u8; W] {}
+impl<const W: usize> RowSampleView<W> for &[u8; W] {
+    #[inline(always)]
+    fn sample(self, x: usize) -> u8 {
+        self[x]
+    }
+
+    #[inline(always)]
+    fn sub<const N: usize>(self, x: usize) -> [u8; N] {
+        *self[x..x + N]
+            .first_chunk::<N>()
+            .expect("sub-slice within row")
+    }
+}
+
+impl<const W: usize> sealed::Sealed for &[core::cell::Cell<u8>; W] {}
+impl<const W: usize> RowSampleView<W> for &[core::cell::Cell<u8>; W] {
+    #[inline(always)]
+    fn sample(self, x: usize) -> u8 {
+        self[x].get()
+    }
+
+    #[inline(always)]
+    fn sub<const N: usize>(self, x: usize) -> [u8; N] {
+        let s = self[x..x + N]
+            .first_chunk::<N>()
+            .expect("sub-slice within row");
+        core::array::from_fn(|i| s[i].get())
+    }
+}
+
 /// The rows of a block whose bounds have already been checked once, as a whole.
 ///
 /// Handed out by [`RefSamples::span`], which is where the checking happens and where the
 /// argument for why the rows inside are free is written down.
 ///
-/// Sealed so `unsafe` SIMD kernels can rely on [`as_ptr_and_stride`](Self::as_ptr_and_stride)
-/// returning a pointer and stride validated for the `(H - 1) * stride + W` span cut by
-/// [`RefSamples::span`].
+/// Sealed to the crate's span types ([`PlaneSpan`] and
+/// [`CellSpan`](crate::encoder::rec_view::CellSpan)).
 #[allow(private_bounds)]
 pub trait BlockRows: sealed::Sealed {
+    /// Borrowed view of a `W`-sample row inside this span.
+    type View<'b, const W: usize>: RowSampleView<W>
+    where
+        Self: 'b;
+
+    /// Raw backing slice for cold narrow-stride fallbacks (passed in two registers).
+    type RawSlice<'b>: Copy
+    where
+        Self: 'b;
+
+    /// Returns `(slice, stride)` by value without taking the address of `self` or the
+    /// originating cursor, preserving SROA in callers and callees.
+    fn raw_parts(&self) -> (Self::RawSlice<'_>, u32);
+
     /// `W` samples of row `y` starting at column `x` of the span, by value.
     ///
     /// Coordinates are span-relative and unsigned: whatever `(dx0, dy0)` the span was cut
@@ -341,8 +398,121 @@ pub trait BlockRows: sealed::Sealed {
     where
         Self: Sized;
 
-    /// Raw pointer to the start of the validated span and its row stride in bytes.
-    fn as_ptr_and_stride(&self) -> (*const u8, usize);
+    /// Splits a span cut for width `>= W` and height `>= H` into borrowed row views for
+    /// the first `H - 1` rows and the `H - 1`-th row when `W > 0`, `H > 0`, and
+    /// `stride >= W`.
+    fn split_views<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = Self::View<'_, W>>, Self::View<'_, W>)>;
+
+    /// Splits a span cut for width `>= W` and height `>= H` into the first `H - 1`
+    /// rows (yielded lazily via `chunks_exact(stride)`) and a lazy reader for the
+    /// `H - 1`-th row, when `W > 0`, `H > 0`, and `stride >= W`. Because
+    /// `(H - 1) * stride` was already validated by `span`, `split_at((H - 1) * stride)`
+    /// and `chunks_exact(stride)` fold away all per-row bounds checks and integer
+    /// divisions without materializing the tail row before the loop.
+    fn split_rows<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = [u8; W]>, impl FnOnce() -> [u8; W])>;
+
+    /// Splits off the suffix starting at `mid` elements (`&b[mid..]`). Keeping the
+    /// suffix preserves the `+ W` tail term in `(m * s + W) - k * s == (m - k) * s + W`,
+    /// so every `split_at` and `first_chunk::<W>()` folds algebraically for all `s: u32`
+    /// (including `s < W` and `s == 0`) with zero runtime branches.
+    fn split_suffix<'b>(b: Self::RawSlice<'b>, mid: usize) -> Self::RawSlice<'b>
+    where
+        Self: 'b;
+
+    /// Reads the leading `W` samples of a raw backing slice (`b.len() == m * s + W >= W`).
+    fn read_head<'b, const W: usize>(b: Self::RawSlice<'b>) -> [u8; W]
+    where
+        Self: 'b;
+
+    /// Reads `(left, mid, right)` `W`-wide probes at columns `0`, `1`, and `2` of the
+    /// leading `SW`-wide row (`SW == W + 2`) directly into registers without staging
+    /// `[u8; SW]` on the stack.
+    fn read_head3<'b, const W: usize, const SW: usize>(
+        b: Self::RawSlice<'b>,
+    ) -> ([u8; W], [u8; W], [u8; W])
+    where
+        Self: 'b;
+
+    /// Returns `(slice_of_4_rows, stride)` for a 4-row span (`3 * s + W` elements).
+    fn all_1_quad<const W: usize>(&self) -> (Self::RawSlice<'_>, usize);
+
+    /// Returns `([rows_0..4, rows_4..8], stride)` for an 8-row span (`7 * s + W` elements).
+    #[inline(always)]
+    fn all_2_quads<const W: usize>(&self) -> ([Self::RawSlice<'_>; 2], usize) {
+        let (raw, st) = self.raw_parts();
+        let s = st as usize;
+        let q0 = Self::slice_prefix(raw, 7 * s + W);
+        let q1 = Self::split_suffix(q0, 4 * s);
+        ([q0, q1], s)
+    }
+
+    /// Returns `([rows_0..4, ..8, ..12, ..16], stride)` for a 16-row span (`15 * s + W` elements).
+    #[inline(always)]
+    fn all_4_quads<const W: usize>(&self) -> ([Self::RawSlice<'_>; 4], usize) {
+        let (raw, st) = self.raw_parts();
+        let s = st as usize;
+        let q0 = Self::slice_prefix(raw, 15 * s + W);
+        let q2 = Self::split_suffix(q0, 8 * s);
+        let q1 = Self::split_suffix(q0, 4 * s);
+        let q3 = Self::split_suffix(q2, 4 * s);
+        ([q0, q1, q2, q3], s)
+    }
+
+    /// Slices `&b[..len]` on a raw backing slice.
+    fn slice_prefix<'b>(b: Self::RawSlice<'b>, len: usize) -> Self::RawSlice<'b>
+    where
+        Self: 'b;
+
+    /// Reads four consecutive `W`-wide rows separated by `s` elements from a suffix slice
+    /// of length `m * s + W` (`m >= 3`), folding all bounds checks for every `s: u32`.
+    #[inline(always)]
+    fn read_quad<'b, const W: usize>(
+        q0: Self::RawSlice<'b>,
+        s: usize,
+    ) -> ([u8; W], [u8; W], [u8; W], [u8; W])
+    where
+        Self: 'b,
+    {
+        let q2 = Self::split_suffix(q0, 2 * s);
+        let q1 = Self::split_suffix(q0, s);
+        let q3 = Self::split_suffix(q2, s);
+        (
+            Self::read_head::<W>(q0),
+            Self::read_head::<W>(q1),
+            Self::read_head::<W>(q2),
+            Self::read_head::<W>(q3),
+        )
+    }
+
+    /// Reads four consecutive `(left, mid, right)` `W`-wide probe triples separated by `s`
+    /// elements from a suffix slice of length `m * s + SW` (`m >= 3`, `SW == W + 2`).
+    #[inline(always)]
+    fn read_quad3<'b, const W: usize, const SW: usize>(
+        q0: Self::RawSlice<'b>,
+        s: usize,
+    ) -> (
+        ([u8; W], [u8; W], [u8; W]),
+        ([u8; W], [u8; W], [u8; W]),
+        ([u8; W], [u8; W], [u8; W]),
+        ([u8; W], [u8; W], [u8; W]),
+    )
+    where
+        Self: 'b,
+    {
+        let q2 = Self::split_suffix(q0, 2 * s);
+        let q1 = Self::split_suffix(q0, s);
+        let q3 = Self::split_suffix(q2, s);
+        (
+            Self::read_head3::<W, SW>(q0),
+            Self::read_head3::<W, SW>(q1),
+            Self::read_head3::<W, SW>(q2),
+            Self::read_head3::<W, SW>(q3),
+        )
+    }
 }
 
 #[allow(private_bounds)]
@@ -699,28 +869,137 @@ impl<'a> PlaneSpan<'a> {
 
 impl sealed::Sealed for PlaneSpan<'_> {}
 
+#[inline(always)]
+fn plane_row_ref<const W: usize>(r: &[u8]) -> &[u8; W] {
+    r.first_chunk::<W>().expect("validated span row")
+}
+
+#[inline(always)]
+fn plane_row_val<const W: usize>(r: &[u8]) -> [u8; W] {
+    *r.first_chunk::<W>().expect("validated span row")
+}
+
+#[inline(always)]
+fn plane_row_mut<const W: usize>(r: &mut [u8]) -> &mut [u8; W] {
+    r.first_chunk_mut::<W>().expect("validated span row")
+}
+
 impl BlockRows for PlaneSpan<'_> {
+    type View<'b, const W: usize>
+        = &'b [u8; W]
+    where
+        Self: 'b;
+
+    type RawSlice<'b>
+        = &'b [u8]
+    where
+        Self: 'b;
+
+    #[inline(always)]
+    fn raw_parts(&self) -> (&[u8], u32) {
+        (self.buf, self.stride)
+    }
+
     #[inline(always)]
     fn row<const W: usize>(&self, y: usize, x: usize) -> [u8; W] {
-        let r: &[u8; W] = self.buf[y * self.stride as usize + x..][..W]
-            .try_into()
-            .unwrap();
+        let off = y * (self.stride as usize) + x;
+        let r: &[u8; W] = self.buf[off..off + W].try_into().unwrap();
         *r
     }
 
     #[inline(always)]
     fn window<const W: usize>(&self, y: usize, h: usize) -> Self {
         let stride = self.stride as usize;
+        let off = y * stride;
         let len = if h == 0 { 0 } else { (h - 1) * stride + W };
         Self {
-            buf: &self.buf[y * stride..][..len],
+            buf: &self.buf[off..off + len],
             stride: self.stride,
         }
     }
 
     #[inline(always)]
-    fn as_ptr_and_stride(&self) -> (*const u8, usize) {
-        (self.buf.as_ptr(), self.stride as usize)
+    fn slice_prefix<'b>(b: &'b [u8], len: usize) -> &'b [u8]
+    where
+        Self: 'b,
+    {
+        &b[..len]
+    }
+
+    #[inline(always)]
+    fn split_suffix<'b>(b: &'b [u8], mid: usize) -> &'b [u8]
+    where
+        Self: 'b,
+    {
+        b.split_at(mid).1
+    }
+
+    #[inline(always)]
+    fn read_head<'b, const W: usize>(b: &'b [u8]) -> [u8; W]
+    where
+        Self: 'b,
+    {
+        plane_row_val::<W>(b)
+    }
+
+    #[inline(always)]
+    fn read_head3<'b, const W: usize, const SW: usize>(b: &'b [u8]) -> ([u8; W], [u8; W], [u8; W])
+    where
+        Self: 'b,
+    {
+        const { assert!(SW == W + 2, "SW must equal W + 2") };
+        let c = b.first_chunk::<SW>().expect("validated 3-probe span row");
+        (
+            *c[..W].first_chunk::<W>().unwrap(),
+            *c[1..1 + W].first_chunk::<W>().unwrap(),
+            *c[2..2 + W].first_chunk::<W>().unwrap(),
+        )
+    }
+
+    #[inline(always)]
+    fn all_1_quad<const W: usize>(&self) -> (&[u8], usize) {
+        let s = self.stride as usize;
+        (&self.buf[..3 * s + W], s)
+    }
+
+    #[inline(always)]
+    fn split_views<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = &[u8; W]>, &[u8; W])> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let raw_s = self.stride as usize;
+        if raw_s < W {
+            return None;
+        }
+        let s_nz = raw_s.max(W).max(1);
+        let hm1 = H - 1;
+        let buf = self.buf.get(..hm1 * raw_s + W)?;
+        let (head, tail) = buf.split_at(hm1 * raw_s);
+        let last = tail.first_chunk::<W>()?;
+        Some((head.chunks_exact(s_nz).map(plane_row_ref::<W>), last))
+    }
+
+    #[inline(always)]
+    fn split_rows<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = [u8; W]>, impl FnOnce() -> [u8; W])> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let raw_s = self.stride as usize;
+        if raw_s < W {
+            return None;
+        }
+        let s_nz = raw_s.max(W).max(1);
+        let hm1 = H - 1;
+        let buf = self.buf.get(..hm1 * raw_s + W)?;
+        let (head, tail) = buf.split_at(hm1 * raw_s);
+        let last = tail.first_chunk::<W>()?;
+        Some((head.chunks_exact(s_nz).map(plane_row_val::<W>), move || {
+            *last
+        }))
     }
 }
 
@@ -776,9 +1055,8 @@ impl<'a> PlaneSpanMut<'a> {
     /// span was cut for cannot reach.
     #[inline(always)]
     pub fn row_mut<const W: usize>(&mut self, y: usize, x: usize) -> &mut [u8; W] {
-        (&mut self.buf[y * self.stride as usize + x..][..W])
-            .try_into()
-            .unwrap()
+        let off = y * (self.stride as usize) + x;
+        (&mut self.buf[off..off + W]).try_into().unwrap()
     }
 
     /// The `h`-row, `W`-wide window starting at row `y` — [`BlockRows::window`]'s write
@@ -796,11 +1074,32 @@ impl<'a> PlaneSpanMut<'a> {
     #[inline]
     pub fn window_mut<const W: usize>(&mut self, y: usize, h: usize) -> PlaneSpanMut<'_> {
         let stride = self.stride as usize;
+        let off = y * stride;
         let len = if h == 0 { 0 } else { (h - 1) * stride + W };
         PlaneSpanMut {
-            buf: &mut self.buf[y * stride..][..len],
+            buf: &mut self.buf[off..off + len],
             stride: self.stride,
         }
+    }
+
+    /// Splits a writable span cut for width `>= W` and height `>= H` into the first
+    /// `H - 1` writable rows and the `H - 1`-th writable row when `W > 0`, `H > 0`,
+    /// and `stride >= W`, folding away all per-row bounds checks and integer divisions.
+    #[inline(always)]
+    pub fn split_rows_mut<const W: usize, const H: usize>(
+        &mut self,
+    ) -> Option<(impl Iterator<Item = &mut [u8; W]>, &mut [u8; W])> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let s = (self.stride as usize).checked_sub(W)? + W;
+        let s_nz = s.max(W).max(1);
+        let raw_s = self.stride as usize;
+        let hm1 = H - 1;
+        let buf = self.buf.get_mut(..hm1 * raw_s + W)?;
+        let (head, tail) = buf.split_at_mut(hm1 * raw_s);
+        let last = tail.first_chunk_mut::<W>()?;
+        Some((head.chunks_exact_mut(s_nz).map(plane_row_mut::<W>), last))
     }
 }
 
@@ -1146,10 +1445,24 @@ impl PlaneSamples for PlaneCursorMut<'_> {
         dx0: isize,
         rows: &[[u8; W]; H],
     ) {
-        let mut span = self.span_mut::<W, H>(dy0, dx0);
-        for (y, r) in rows.iter().enumerate() {
-            *span.row_mut::<W>(y, 0) = *r;
+        if W == 0 || H == 0 {
+            return;
         }
+        if H == 1 {
+            self.set_row_n::<W>(dy0, dx0, &rows[0]);
+            return;
+        }
+        let Some((last_row, head_rows)) = rows.split_last() else {
+            return;
+        };
+        let mut span = self.span_mut::<W, H>(dy0, dx0);
+        let (head, tail) = span
+            .split_rows_mut::<W, H>()
+            .expect("multi-row block write requires stride >= width");
+        for (dst_row, r) in head.zip(head_rows) {
+            *dst_row = *r;
+        }
+        *tail = *last_row;
     }
 }
 
@@ -1413,5 +1726,15 @@ mod tests {
         let buf = [7u8; 64];
         let c = PlaneCursor::new(&buf, 0, 8);
         assert_eq!(c.row_windows::<4>(0, 0, 0).count(), 0);
+    }
+
+    #[test]
+    fn set_block_zero_dimensions_is_a_noop() {
+        let mut buf = [0x5Au8; 64];
+        let mut c = PlaneCursorMut::new(&mut buf, 0, 8);
+        c.set_block::<4, 0>(0, 0, &[]);
+        c.set_block::<0, 4>(0, 0, &[[]; 4]);
+        c.set_block::<0, 0>(0, 0, &[]);
+        assert_eq!(buf, [0x5Au8; 64]);
     }
 }

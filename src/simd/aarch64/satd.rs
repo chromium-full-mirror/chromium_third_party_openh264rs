@@ -23,12 +23,14 @@
 //!
 //! Each operand is cut once into a `RefSamples::span`, so a block pays one bounds check
 //! per operand rather than two per row.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld8, ld16};
+use super::neon_token;
 use crate::safe::plane::{BlockRows, RefSamples};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 /// Rows `0..4` of a 4-wide block as `([row0 | row1], [row2 | row3])`.
 #[inline]
@@ -42,37 +44,42 @@ fn rows4x4<S: RefSamples>(c: &S) -> (uint8x8_t, uint8x8_t) {
     (ld8(&a[..8]), ld8(&a[8..]))
 }
 
-/// `WelsSampleSatd4x4_AArch64_neon`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn satd_4x4_neon<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    let (a01, a23) = rows4x4(c1);
-    let (b01, b23) = rows4x4(c2);
-    let d01 = vreinterpretq_s16_u16(vsubl_u8(a01, b01));
-    let d23 = vreinterpretq_s16_u16(vsubl_u8(a23, b23));
+simd_entry! {
+    /// `WelsSampleSatd4x4_AArch64_neon`.
+    #[target_feature(enable = "neon")]
+    fn satd_4x4_neon<A: RefSamples + Copy, B: RefSamples + Copy>(
+        c1: &A,
+        c2: &B,
+        _token: NeonToken,
+    ) -> i32 {
+        let (a01, a23) = rows4x4(c1);
+        let (b01, b23) = rows4x4(c2);
+        let d01 = vreinterpretq_s16_u16(vsubl_u8(a01, b01));
+        let d23 = vreinterpretq_s16_u16(vsubl_u8(a23, b23));
 
-    // The vertical transform: `[r0+r2 | r1+r3]`, `[r0-r2 | r1-r3]`, then the halves
-    // swapped so the second stage is lane-wise.
-    let s = vaddq_s16(d01, d23);
-    let d = vsubq_s16(d01, d23);
-    let (s64, d64) = (vreinterpretq_s64_s16(s), vreinterpretq_s64_s16(d));
-    let x = vreinterpretq_s16_s64(vzip1q_s64(s64, d64));
-    let y = vreinterpretq_s16_s64(vzip2q_s64(s64, d64));
-    let v4 = vaddq_s16(x, y);
-    let v5 = vsubq_s16(x, y);
+        // The vertical transform: `[r0+r2 | r1+r3]`, `[r0-r2 | r1-r3]`, then the halves
+        // swapped so the second stage is lane-wise.
+        let s = vaddq_s16(d01, d23);
+        let d = vsubq_s16(d01, d23);
+        let (s64, d64) = (vreinterpretq_s64_s16(s), vreinterpretq_s64_s16(d));
+        let x = vreinterpretq_s16_s64(vzip1q_s64(s64, d64));
+        let y = vreinterpretq_s16_s64(vzip2q_s64(s64, d64));
+        let v4 = vaddq_s16(x, y);
+        let v5 = vsubq_s16(x, y);
 
-    // The horizontal transform.
-    let (v4s, v5s) = (vreinterpretq_s32_s16(v4), vreinterpretq_s32_s16(v5));
-    let t1 = vreinterpretq_s16_s32(vtrn1q_s32(v4s, v5s));
-    let t2 = vreinterpretq_s16_s32(vtrn2q_s32(v4s, v5s));
-    let v4 = vaddq_s16(t1, t2);
-    let v5 = vsubq_s16(t1, t2);
-    let u1 = vtrn1q_s16(v4, v5);
-    let u2 = vtrn2q_s16(v4, v5);
-    let acc = vabsq_s16(vaddq_s16(u1, u2));
-    let acc = vabaq_s16(acc, u1, u2);
-    let sum = vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32;
-    (sum + 1) >> 1
+        // The horizontal transform.
+        let (v4s, v5s) = (vreinterpretq_s32_s16(v4), vreinterpretq_s32_s16(v5));
+        let t1 = vreinterpretq_s16_s32(vtrn1q_s32(v4s, v5s));
+        let t2 = vreinterpretq_s16_s32(vtrn2q_s32(v4s, v5s));
+        let v4 = vaddq_s16(t1, t2);
+        let v5 = vsubq_s16(t1, t2);
+        let u1 = vtrn1q_s16(v4, v5);
+        let u2 = vtrn2q_s16(v4, v5);
+        let acc = vabsq_s16(vaddq_s16(u1, u2));
+        let acc = vabaq_s16(acc, u1, u2);
+        let sum = vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32;
+        (sum + 1) >> 1
+    }
 }
 
 /// `SATD_8x4` on four rows of eight differences: the vertical butterflies, then the
@@ -110,49 +117,57 @@ fn group8(d0: int16x8_t, d1: int16x8_t, d2: int16x8_t, d3: int16x8_t) -> int16x8
     vaddq_s16(vmaxq_s16(v4, v5), vmaxq_s16(v6, v7))
 }
 
-/// `WelsSampleSatd8x8_AArch64_neon` and `8x16`: `H / 4` groups of `SATD_8x4`,
-/// accumulated and reduced once.
-#[inline]
-#[target_feature(enable = "neon")]
-fn satd_8w<A: RefSamples + Copy, B: RefSamples + Copy, const H: usize>(c1: &A, c2: &B) -> i32 {
-    const { assert!(H % 4 == 0, "SATD groups are four rows tall") };
-    let (s1, s2) = (c1.span::<8, H>(0, 0), c2.span::<8, H>(0, 0));
-    let mut acc = vdupq_n_s16(0);
-    for g in 0..H / 4 {
-        // One four-row window per group: only a constant row offset inside a span folds.
-        let (w1, w2) = (s1.window::<8>(4 * g, 4), s2.window::<8>(4 * g, 4));
-        let mut d = [vdupq_n_s16(0); 4];
-        for (i, row) in d.iter_mut().enumerate() {
-            *row =
-                vreinterpretq_s16_u16(vsubl_u8(ld8(&w1.row::<8>(i, 0)), ld8(&w2.row::<8>(i, 0))));
+simd_entry! {
+    /// `WelsSampleSatd8x8_AArch64_neon` and `8x16`: `H / 4` groups of `SATD_8x4`,
+    /// accumulated and reduced once.
+    #[target_feature(enable = "neon")]
+    fn satd_8w<A: RefSamples + Copy, B: RefSamples + Copy, const H: usize>(
+        c1: &A,
+        c2: &B,
+        _token: NeonToken,
+    ) -> i32 {
+        const { assert!(H % 4 == 0, "SATD groups are four rows tall") };
+        let (s1, s2) = (c1.span::<8, H>(0, 0), c2.span::<8, H>(0, 0));
+        let mut acc = vdupq_n_s16(0);
+        for g in 0..H / 4 {
+            // One four-row window per group: only a constant row offset inside a span folds.
+            let (w1, w2) = (s1.window::<8>(4 * g, 4), s2.window::<8>(4 * g, 4));
+            let mut d = [vdupq_n_s16(0); 4];
+            for (i, row) in d.iter_mut().enumerate() {
+                *row =
+                    vreinterpretq_s16_u16(vsubl_u8(ld8(&w1.row::<8>(i, 0)), ld8(&w2.row::<8>(i, 0))));
+            }
+            acc = vaddq_s16(acc, group8(d[0], d[1], d[2], d[3]));
         }
-        acc = vaddq_s16(acc, group8(d[0], d[1], d[2], d[3]));
+        vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32
     }
-    vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32
-}
 
-/// `WelsSampleSatd16x16_AArch64_neon` and `16x8`: `SATD_16x4` is `SATD_8x4` on the
-/// low and high halves of each row.
-#[inline]
-#[target_feature(enable = "neon")]
-fn satd_16w<A: RefSamples + Copy, B: RefSamples + Copy, const H: usize>(c1: &A, c2: &B) -> i32 {
-    const { assert!(H % 4 == 0, "SATD groups are four rows tall") };
-    let (s1, s2) = (c1.span::<16, H>(0, 0), c2.span::<16, H>(0, 0));
-    let mut acc = vdupq_n_s16(0);
-    for g in 0..H / 4 {
-        let (w1, w2) = (s1.window::<16>(4 * g, 4), s2.window::<16>(4 * g, 4));
-        let mut lo = [vdupq_n_s16(0); 4];
-        let mut hi = [vdupq_n_s16(0); 4];
-        for i in 0..4 {
-            let a = ld16(&w1.row::<16>(i, 0));
-            let b = ld16(&w2.row::<16>(i, 0));
-            lo[i] = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(a), vget_low_u8(b)));
-            hi[i] = vreinterpretq_s16_u16(vsubl_high_u8(a, b));
+    /// `WelsSampleSatd16x16_AArch64_neon` and `16x8`: `SATD_16x4` is `SATD_8x4` on the
+    /// low and high halves of each row.
+    #[target_feature(enable = "neon")]
+    fn satd_16w<A: RefSamples + Copy, B: RefSamples + Copy, const H: usize>(
+        c1: &A,
+        c2: &B,
+        _token: NeonToken,
+    ) -> i32 {
+        const { assert!(H % 4 == 0, "SATD groups are four rows tall") };
+        let (s1, s2) = (c1.span::<16, H>(0, 0), c2.span::<16, H>(0, 0));
+        let mut acc = vdupq_n_s16(0);
+        for g in 0..H / 4 {
+            let (w1, w2) = (s1.window::<16>(4 * g, 4), s2.window::<16>(4 * g, 4));
+            let mut lo = [vdupq_n_s16(0); 4];
+            let mut hi = [vdupq_n_s16(0); 4];
+            for i in 0..4 {
+                let a = ld16(&w1.row::<16>(i, 0));
+                let b = ld16(&w2.row::<16>(i, 0));
+                lo[i] = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(a), vget_low_u8(b)));
+                hi[i] = vreinterpretq_s16_u16(vsubl_high_u8(a, b));
+            }
+            acc = vaddq_s16(acc, group8(lo[0], lo[1], lo[2], lo[3]));
+            acc = vaddq_s16(acc, group8(hi[0], hi[1], hi[2], hi[3]));
         }
-        acc = vaddq_s16(acc, group8(lo[0], lo[1], lo[2], lo[3]));
-        acc = vaddq_s16(acc, group8(hi[0], hi[1], hi[2], hi[3]));
+        vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32
     }
-    vaddlvq_u16(vreinterpretq_u16_s16(acc)) as i32
 }
 
 // ============================================================================
@@ -162,14 +177,13 @@ fn satd_16w<A: RefSamples + Copy, B: RefSamples + Copy, const H: usize>(c1: &A, 
 /// `WelsSampleSatd4x4_AArch64_neon`.
 #[inline]
 pub fn satd_4x4<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { satd_4x4_neon(c1, c2) }
+    satd_4x4_neon(c1, c2, neon_token())
 }
 
 /// One `SATD_8x4` group.
 #[inline]
 pub fn satd_8x4<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    unsafe { satd_8w::<A, B, 4>(c1, c2) }
+    satd_8w::<A, B, 4>(c1, c2, neon_token())
 }
 
 /// Two 4x4 blocks, top then bottom.
@@ -181,25 +195,25 @@ pub fn satd_4x8<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i
 /// `WelsSampleSatd8x8_AArch64_neon`.
 #[inline]
 pub fn satd_8x8<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    unsafe { satd_8w::<A, B, 8>(c1, c2) }
+    satd_8w::<A, B, 8>(c1, c2, neon_token())
 }
 
 /// `WelsSampleSatd16x8_AArch64_neon`.
 #[inline]
 pub fn satd_16x8<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    unsafe { satd_16w::<A, B, 8>(c1, c2) }
+    satd_16w::<A, B, 8>(c1, c2, neon_token())
 }
 
 /// `WelsSampleSatd8x16_AArch64_neon`.
 #[inline]
 pub fn satd_8x16<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    unsafe { satd_8w::<A, B, 16>(c1, c2) }
+    satd_8w::<A, B, 16>(c1, c2, neon_token())
 }
 
 /// `WelsSampleSatd16x16_AArch64_neon`.
 #[inline]
 pub fn satd_16x16<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i32 {
-    unsafe { satd_16w::<A, B, 16>(c1, c2) }
+    satd_16w::<A, B, 16>(c1, c2, neon_token())
 }
 
 // ============================================================================

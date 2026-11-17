@@ -299,24 +299,6 @@ impl<'a> RecCursor<'a> {
             .filter_map(|r| r.first_chunk::<N>())
     }
 
-    /// The `w`-wide, `h`-tall block at `(dx0, dy0)` as **one** slice, alongside
-    /// the stride to walk it by — the same span [`row_windows`](Self::row_windows)
-    /// carves up, handed over whole.
-    ///
-    /// For a kernel that does its own address arithmetic, where `row_windows` re-slices
-    /// per row. The returned slice is exactly `(h - 1) * stride + w` bytes, so row `y`
-    /// column `x` is at `y * stride + x` for every `y < h` and `x < w`, and that is the
-    /// invariant an `unsafe` caller may rely on.
-    ///
-    /// # Panics
-    /// If the block leaves the buffer.
-    #[inline(always)]
-    pub fn block_span(&self, dy0: isize, dx0: isize, w: usize, h: usize) -> &'a [Cell<u8>] {
-        let start = idx(self.center, dx0, dy0, self.stride);
-        let span = if h == 0 { 0 } else { (h - 1) * self.stride + w };
-        &self.cells[start..][..span]
-    }
-
     /// Writes `N` samples into row `dy` starting at `dx0` — **one store, not `N`**.
     ///
     /// `Cell::set` is a plain write and the row's length is a constant, so the `N`
@@ -335,7 +317,8 @@ impl<'a> RecCursor<'a> {
     pub fn write_row<const N: usize>(&self, dy: isize, dx0: isize, src: &[u8; N]) {
         let start = idx(self.center, dx0, dy, self.stride);
         let row = &self.cells[start..][..N];
-        for (c, &v) in row.iter().zip(src.iter()) {
+        let vals = *src;
+        for (c, v) in row.iter().zip(vals) {
             c.set(v);
         }
     }
@@ -378,8 +361,8 @@ impl<'a> RecCursor<'a> {
 /// [`RefSamples::Span`](crate::safe::plane::RefSamples::Span) for the shared view: a
 /// block's cells and the stride to walk them by.
 ///
-/// `cells` is exactly what [`RecCursor::block_span`] cut — `(h - 1) * stride + w`
-/// entries — and that exactness is what lets the per-row slicing below fold away. See
+/// `cells` holds `(h - 1) * stride + w` entries, and that exactness is what lets the
+/// per-row slicing below fold away. See
 /// [`RefSamples::span`](crate::safe::plane::RefSamples::span).
 #[derive(Clone, Copy, Debug)]
 pub struct CellSpan<'a> {
@@ -416,6 +399,17 @@ impl<'a> CellSpan<'a> {
     }
 }
 
+#[inline(always)]
+fn cell_row_ref<const W: usize>(r: &[Cell<u8>]) -> &[Cell<u8>; W] {
+    r.first_chunk::<W>().expect("validated cell span row")
+}
+
+#[inline(always)]
+fn cell_row_val<const W: usize>(r: &[Cell<u8>]) -> [u8; W] {
+    let c = r.first_chunk::<W>().expect("validated cell span row");
+    std::array::from_fn(|i| c[i].get())
+}
+
 impl<'a> CellSpan<'a> {
     /// The `W` **cells** of row `y` — [`BlockRows::row`]'s writable twin.
     ///
@@ -430,33 +424,157 @@ impl<'a> CellSpan<'a> {
             .get(y * self.stride as usize..)
             .and_then(|s| s.first_chunk::<W>())
     }
+
+    /// Writes `W` bytes into row `y` of this span.
+    #[inline(always)]
+    pub(crate) fn set_row<const W: usize>(&self, y: usize, src: &[u8; W]) {
+        let off = y * (self.stride as usize);
+        let row = &self.cells[off..off + W];
+        let vals = *src;
+        for (c, v) in row.iter().zip(vals) {
+            c.set(v);
+        }
+    }
+
+    /// Splits this span into the first `H - 1` writable cell rows and the `H - 1`-th
+    /// cell row when `W > 0`, `H > 0`, and `stride >= W`, eliminating all per-row
+    /// bounds checks and integer divisions.
+    #[inline(always)]
+    pub(crate) fn split_cell_rows<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = &'a [Cell<u8>; W]>, &'a [Cell<u8>; W])> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let raw_s = self.stride as usize;
+        if raw_s < W {
+            return None;
+        }
+        let s_nz = raw_s.max(W).max(1);
+        let hm1 = H - 1;
+        let cells = self.cells.get(..hm1 * raw_s + W)?;
+        let (head, tail) = cells.split_at(hm1 * raw_s);
+        let last = tail.first_chunk::<W>()?;
+        Some((head.chunks_exact(s_nz).map(cell_row_ref::<W>), last))
+    }
 }
 
 impl crate::safe::plane::sealed::Sealed for CellSpan<'_> {}
 
 impl crate::safe::plane::BlockRows for CellSpan<'_> {
+    type View<'b, const W: usize>
+        = &'b [Cell<u8>; W]
+    where
+        Self: 'b;
+
+    type RawSlice<'b>
+        = &'b [Cell<u8>]
+    where
+        Self: 'b;
+
+    #[inline(always)]
+    fn raw_parts(&self) -> (&[Cell<u8>], u32) {
+        (self.cells, self.stride)
+    }
+
     /// Cells cannot be `copy_from_slice`d, so the row is read entry by entry; over a
     /// slice the compiler knows to be `W` long that is `W` byte loads it coalesces
     /// into one vector load, not `W` bounds checks.
     #[inline(always)]
     fn row<const W: usize>(&self, y: usize, x: usize) -> [u8; W] {
-        let row = &self.cells[y * self.stride as usize + x..][..W];
+        let off = y * (self.stride as usize) + x;
+        let row = &self.cells[off..off + W];
         std::array::from_fn(|i| row[i].get())
     }
 
     #[inline(always)]
     fn window<const W: usize>(&self, y: usize, h: usize) -> Self {
         let stride = self.stride as usize;
+        let off = y * stride;
         let len = if h == 0 { 0 } else { (h - 1) * stride + W };
         Self {
-            cells: &self.cells[y * stride..][..len],
+            cells: &self.cells[off..off + len],
             stride: self.stride,
         }
     }
 
     #[inline(always)]
-    fn as_ptr_and_stride(&self) -> (*const u8, usize) {
-        (self.cells.as_ptr() as *const u8, self.stride as usize)
+    fn slice_prefix<'b>(b: &'b [Cell<u8>], len: usize) -> &'b [Cell<u8>]
+    where
+        Self: 'b,
+    {
+        &b[..len]
+    }
+
+    #[inline(always)]
+    fn split_suffix<'b>(b: &'b [Cell<u8>], mid: usize) -> &'b [Cell<u8>]
+    where
+        Self: 'b,
+    {
+        b.split_at(mid).1
+    }
+
+    #[inline(always)]
+    fn read_head<'b, const W: usize>(b: &'b [Cell<u8>]) -> [u8; W]
+    where
+        Self: 'b,
+    {
+        cell_row_val::<W>(b)
+    }
+
+    #[inline(always)]
+    fn read_head3<'b, const W: usize, const SW: usize>(
+        b: &'b [Cell<u8>],
+    ) -> ([u8; W], [u8; W], [u8; W])
+    where
+        Self: 'b,
+    {
+        const { assert!(SW == W + 2, "SW must equal W + 2") };
+        let c = b
+            .first_chunk::<SW>()
+            .expect("validated 3-probe cell span row");
+        let c0 = c[..W].first_chunk::<W>().unwrap();
+        let c1 = c[1..1 + W].first_chunk::<W>().unwrap();
+        let c2 = c[2..2 + W].first_chunk::<W>().unwrap();
+        (
+            std::array::from_fn(|i| c0[i].get()),
+            std::array::from_fn(|i| c1[i].get()),
+            std::array::from_fn(|i| c2[i].get()),
+        )
+    }
+
+    #[inline(always)]
+    fn all_1_quad<const W: usize>(&self) -> (&[Cell<u8>], usize) {
+        let s = self.stride as usize;
+        (&self.cells[..3 * s + W], s)
+    }
+
+    #[inline(always)]
+    fn split_views<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = &[Cell<u8>; W]>, &[Cell<u8>; W])> {
+        self.split_cell_rows::<W, H>()
+    }
+
+    #[inline(always)]
+    fn split_rows<const W: usize, const H: usize>(
+        &self,
+    ) -> Option<(impl Iterator<Item = [u8; W]>, impl FnOnce() -> [u8; W])> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let raw_s = self.stride as usize;
+        if raw_s < W {
+            return None;
+        }
+        let s_nz = raw_s.max(W).max(1);
+        let hm1 = H - 1;
+        let cells = self.cells.get(..hm1 * raw_s + W)?;
+        let (head, tail) = cells.split_at(hm1 * raw_s);
+        let last = tail.first_chunk::<W>()?;
+        Some((head.chunks_exact(s_nz).map(cell_row_val::<W>), move || {
+            std::array::from_fn(|i| last[i].get())
+        }))
     }
 }
 
@@ -490,13 +608,29 @@ impl crate::safe::plane::PlaneSamples for RecCursor<'_> {
         dx0: isize,
         rows: &[[u8; W]; H],
     ) {
+        if W == 0 || H == 0 {
+            return;
+        }
+        if H == 1 {
+            self.set_row_n::<W>(dy0, dx0, &rows[0]);
+            return;
+        }
+        let Some((last_row, head_rows)) = rows.split_last() else {
+            return;
+        };
         let span = crate::safe::plane::RefSamples::span::<W, H>(self, dy0, dx0);
-        for (y, r) in rows.iter().enumerate() {
-            if let Some(cells_row) = span.row_cells::<W>(y) {
-                for (c, &v) in cells_row.iter().zip(r.iter()) {
-                    c.set(v);
-                }
+        let (head, tail) = span
+            .split_cell_rows::<W, H>()
+            .expect("multi-row block write requires stride >= width");
+        for (cells_row, r) in head.zip(head_rows) {
+            let vals = *r;
+            for (c, v) in cells_row.iter().zip(vals) {
+                c.set(v);
             }
+        }
+        let vals = *last_row;
+        for (c, v) in tail.iter().zip(vals) {
+            c.set(v);
         }
     }
 }
@@ -585,7 +719,8 @@ impl crate::safe::plane::RefSamples for RecCursor<'_> {
 ///
 /// The height is a const parameter and both operands are cut **once**: `W * H` bytes
 /// of the source, and `(H - 1) * stride + W` cells of the destination through
-/// [`RecCursor::block_span`]. Inside, row `y` is at `y * W` and `y * stride`, and with
+/// [`RefSamples::span`](crate::safe::plane::RefSamples::span). Inside, row `y` is at
+/// `y * W` and `y * stride`, and with
 /// the destination stride narrowed to a `u32` — a cursor invariant, asserted where a
 /// cursor is made — the compiler places every one of those rows inside its cut and
 /// drops the per-row checks.
@@ -593,7 +728,7 @@ impl crate::safe::plane::RefSamples for RecCursor<'_> {
 /// # Panics
 /// If `src` is shorter than `W * H`, or the block runs off the plane. Both are
 /// geometry bugs in the caller.
-#[inline]
+#[inline(always)]
 pub fn copy_block_to_view<const W: usize, const H: usize>(src: &[u8], dst: &RecCursor<'_>) {
     match (W, H) {
         (16, 16) => crate::simd::kernels::copy::copy_16x16_slice(dst, src),
@@ -607,7 +742,8 @@ pub fn copy_block_to_view<const W: usize, const H: usize>(src: &[u8], dst: &RecC
                     block.get(y * W..).and_then(|s| s.first_chunk::<W>()),
                     cells.row_cells::<W>(y),
                 ) {
-                    for (c, &v) in cells_row.iter().zip(row.iter()) {
+                    let vals = *row;
+                    for (c, v) in cells_row.iter().zip(vals) {
                         c.set(v);
                     }
                 }
@@ -1150,5 +1286,20 @@ mod tests {
             cells: SharedCells::empty(),
         };
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn rec_cursor_set_block_zero_dimensions_is_a_noop() {
+        use crate::safe::plane::PlaneSamples;
+
+        let mut p = PaddedPlane::new(16, 16, 8, 32);
+        p.as_mut_slice().fill(0xA5);
+        let expected = p.as_slice().to_vec();
+        let v = view_of(&mut p);
+        let mut c = v.cursor(0, 0);
+        c.set_block::<4, 0>(0, 0, &[]);
+        c.set_block::<0, 4>(0, 0, &[[]; 4]);
+        c.set_block::<0, 0>(0, 0, &[]);
+        assert_eq!(p.as_slice(), expected.as_slice());
     }
 }

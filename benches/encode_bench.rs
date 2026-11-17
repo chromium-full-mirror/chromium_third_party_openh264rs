@@ -14,6 +14,8 @@
 //!
 //! | variable | effect |
 //! |---|---|
+//! | `OPENH264_CPP_LIB` | path to C++ `libopenh264.{so,dylib}` for side-by-side comparison |
+//! | `BENCH_CPP_FIRST=0\|1` | run order per configuration when `OPENH264_CPP_LIB` is set (default `1`) |
 //! | `FFMPEG` | path to the ffmpeg binary (default: `ffmpeg` on `PATH`) |
 //! | `BENCH_REQUIRE_FFMPEG=1` | abort rather than fall back to the synthetic pattern |
 //! | `BENCH_FRAMES=<n>` | cap every configuration's frame count at `n` |
@@ -290,12 +292,13 @@ unsafe fn run_encoder(
 
     let mut bs_info = SFrameBSInfo::default();
 
-    // Warmup outside the timed loop: primes caches and thread pools, then
-    // re-initializes the encoder so the timed run starts from frame 0 with clean
-    // GOP/IDR phase and rate-control state.
+    // Warmup outside the timed loop: warms code and pixel caches, then uninitializes
+    // and re-initializes the encoder (recreating its session state and thread pool) so
+    // the timed run starts from frame 0 with clean GOP/IDR phase and rate-control state.
     for pic in pics.iter().take(3) {
         let _ = unsafe { (vtbl.EncodeFrame)(enc, black_box(pic), black_box(&mut bs_info)) };
     }
+    unsafe { (vtbl.Uninitialize)(enc) };
     let reinit_ret = unsafe { (vtbl.InitializeExt)(enc, &param) };
     assert_eq!(
         reinit_ret,
@@ -310,10 +313,27 @@ unsafe fn run_encoder(
         let enc_ret = unsafe { (vtbl.EncodeFrame)(enc, black_box(pic), black_box(&mut bs_info)) };
         black_box(enc_ret);
 
-        let out_len = bs_info.iFrameSizeInBytes as usize;
-        let p_buf = bs_info.sLayerInfo[0].bs_buf_ptr();
-        if !p_buf.is_null() && out_len > 0 {
-            full_bitstream.extend_from_slice(unsafe { std::slice::from_raw_parts(p_buf, out_len) });
+        if bs_info.eFrameType != EVideoFrameType::videoFrameTypeSkip
+            && bs_info.eFrameType != EVideoFrameType::videoFrameTypeInvalid
+        {
+            let layer_count = (bs_info.iLayerNum.max(0) as usize).min(bs_info.sLayerInfo.len());
+            for layer in &bs_info.sLayerInfo[..layer_count] {
+                if layer.iNalCount > 0
+                    && !layer.nal_lengths_ptr().is_null()
+                    && !layer.bs_buf_ptr().is_null()
+                {
+                    let nal_lens = unsafe {
+                        std::slice::from_raw_parts(
+                            layer.nal_lengths_ptr(),
+                            layer.iNalCount as usize,
+                        )
+                    };
+                    let len: usize = nal_lens.iter().map(|&n| n.max(0) as usize).sum();
+                    full_bitstream.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(layer.bs_buf_ptr(), len)
+                    });
+                }
+            }
         }
     }
     let elapsed = start.elapsed();
@@ -326,6 +346,151 @@ unsafe fn run_encoder(
         latency_ms: (total_secs * 1_000.0) / (pics.len() as f64),
         bytes: full_bitstream.len(),
         sha1: compute_sha1(&full_bitstream),
+    }
+}
+
+#[cfg(unix)]
+mod cpp_dlopen {
+    use super::*;
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlerror() -> *const c_char;
+    }
+
+    const RTLD_NOW: c_int = 2;
+    #[cfg(target_vendor = "apple")]
+    const RTLD_LOCAL: c_int = 4;
+    #[cfg(not(target_vendor = "apple"))]
+    const RTLD_LOCAL: c_int = 0;
+    #[cfg(target_os = "linux")]
+    const RTLD_DEEPBIND: c_int = 8;
+    #[cfg(not(target_os = "linux"))]
+    const RTLD_DEEPBIND: c_int = 0;
+
+    type CreateEncoderFn = unsafe extern "C" fn(*mut *mut ISVCEncoder) -> c_int;
+    type DestroyEncoderFn = unsafe extern "C" fn(*mut ISVCEncoder);
+    type GetCodecVersionExFn = unsafe extern "C" fn(*mut OpenH264Version);
+
+    pub struct CppEncoderLib {
+        handle: *mut c_void,
+        create: CreateEncoderFn,
+        destroy: DestroyEncoderFn,
+    }
+
+    impl CppEncoderLib {
+        pub fn load(path: &str) -> Self {
+            let c_path = CString::new(path).expect("C++ library path contains interior NUL");
+            let create_sym = CString::new("WelsCreateSVCEncoder").unwrap();
+            let destroy_sym = CString::new("WelsDestroySVCEncoder").unwrap();
+            let version_sym = CString::new("WelsGetCodecVersionEx").unwrap();
+
+            unsafe {
+                let last_dlerror = || -> String {
+                    let err = dlerror();
+                    if err.is_null() {
+                        "unknown dlerror".to_string()
+                    } else {
+                        CStr::from_ptr(err).to_string_lossy().into_owned()
+                    }
+                };
+
+                let _ = dlerror();
+                let handle = dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+                assert!(
+                    !handle.is_null(),
+                    "dlopen failed for {path}: {}",
+                    last_dlerror()
+                );
+
+                let _ = dlerror();
+                let create_ptr = dlsym(handle, create_sym.as_ptr());
+                assert!(
+                    !create_ptr.is_null(),
+                    "dlsym(WelsCreateSVCEncoder) failed for {path}: {}",
+                    last_dlerror()
+                );
+
+                let _ = dlerror();
+                let destroy_ptr = dlsym(handle, destroy_sym.as_ptr());
+                assert!(
+                    !destroy_ptr.is_null(),
+                    "dlsym(WelsDestroySVCEncoder) failed for {path}: {}",
+                    last_dlerror()
+                );
+
+                let _ = dlerror();
+                let version_ptr = dlsym(handle, version_sym.as_ptr());
+                assert!(
+                    !version_ptr.is_null(),
+                    "dlsym(WelsGetCodecVersionEx) failed for {path}: {}",
+                    last_dlerror()
+                );
+
+                assert_ne!(
+                    create_ptr as usize, WelsCreateSVCEncoder as *const () as usize,
+                    "dlsym resolved Rust WelsCreateSVCEncoder instead of C++ library {path}"
+                );
+
+                let get_version =
+                    std::mem::transmute::<*mut c_void, GetCodecVersionExFn>(version_ptr);
+                let mut ver = OpenH264Version::default();
+                get_version(&mut ver);
+                assert!(
+                    (ver.uMajor, ver.uMinor) >= (2, 6),
+                    "C++ OpenH264 library {path} is {}.{}.{}, but SFrameBSInfo/SLayerBSInfo ABI requires >= 2.6.0",
+                    ver.uMajor,
+                    ver.uMinor,
+                    ver.uRevision
+                );
+
+                Self {
+                    handle,
+                    create: std::mem::transmute::<*mut c_void, CreateEncoderFn>(create_ptr),
+                    destroy: std::mem::transmute::<*mut c_void, DestroyEncoderFn>(destroy_ptr),
+                }
+            }
+        }
+
+        pub fn run(
+            &self,
+            width: i32,
+            height: i32,
+            threads: u16,
+            slice: SliceSpec,
+            load_balancing: Option<bool>,
+            usage: EUsageType,
+            pics: &[SSourcePicture],
+        ) -> RunResult {
+            unsafe {
+                let mut enc: *mut ISVCEncoder = ptr::null_mut();
+                assert_eq!((self.create)(&mut enc), CM_RESULT_SUCCESS);
+                assert!(!enc.is_null());
+                let result = run_encoder(
+                    enc,
+                    width,
+                    height,
+                    threads,
+                    slice,
+                    load_balancing,
+                    usage,
+                    pics,
+                );
+                (self.destroy)(enc);
+                result
+            }
+        }
+    }
+
+    impl Drop for CppEncoderLib {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = dlclose(self.handle);
+            }
+        }
     }
 }
 
@@ -452,7 +617,20 @@ fn main() {
         println!(" Usage type: SCREEN_CONTENT_REAL_TIME");
     }
 
+    #[cfg(unix)]
+    let cpp_lib = std::env::var("OPENH264_CPP_LIB")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            println!(" C++ library: {p}");
+            cpp_dlopen::CppEncoderLib::load(&p)
+        });
+    let cpp_first = std::env::var("BENCH_CPP_FIRST")
+        .ok()
+        .is_none_or(|v| v.trim() != "0");
+
     let mut synthetic_used = false;
+    let mut sha_mismatches = 0usize;
 
     for (pattern, label, w, h, nominal_frames) in test_inputs {
         let frames = frame_cap.map_or(nominal_frames, |c| c.min(nominal_frames));
@@ -509,6 +687,59 @@ fn main() {
                 } else {
                     format!("{threads:1} thread{usage_tag}")
                 };
+                #[cfg(unix)]
+                if let Some(ref cpp_lib) = cpp_lib {
+                    let (cpp, rust) = if cpp_first {
+                        let c = cpp_lib.run(w, h, threads, spec, load_balancing, usage, &src_pics);
+                        let r = run_rust_library_encoder(
+                            w,
+                            h,
+                            threads,
+                            spec,
+                            load_balancing,
+                            usage,
+                            &src_pics,
+                        );
+                        (c, r)
+                    } else {
+                        let r = run_rust_library_encoder(
+                            w,
+                            h,
+                            threads,
+                            spec,
+                            load_balancing,
+                            usage,
+                            &src_pics,
+                        );
+                        let c = cpp_lib.run(w, h, threads, spec, load_balancing, usage, &src_pics);
+                        (c, r)
+                    };
+                    let ratio = rust.fps / cpp.fps;
+                    let matched = cpp.sha1 == rust.sha1 && cpp.bytes == rust.bytes;
+                    if !matched {
+                        sha_mismatches += 1;
+                    }
+                    println!(
+                        "  [{}] C++ : {:8.2} fps ({:6.3} ms) | {} bytes | SHA-1 {}",
+                        row,
+                        cpp.fps,
+                        cpp.latency_ms,
+                        cpp.bytes,
+                        &cpp.sha1[..16]
+                    );
+                    println!(
+                        "  [{}] Rust: {:8.2} fps ({:6.3} ms) | {} bytes | SHA-1 {} | {:+.2}%{}",
+                        row,
+                        rust.fps,
+                        rust.latency_ms,
+                        rust.bytes,
+                        &rust.sha1[..16],
+                        (ratio - 1.0) * 100.0,
+                        if matched { "" } else { " MISMATCH" }
+                    );
+                    continue;
+                }
+                let _ = (cpp_first, &mut sha_mismatches);
                 let rust =
                     run_rust_library_encoder(w, h, threads, spec, load_balancing, usage, &src_pics);
                 println!(
@@ -536,5 +767,10 @@ fn main() {
         println!(
             "       representative throughput. BENCH_REQUIRE_FFMPEG=1 turns the fallback into an error."
         );
+    }
+
+    if sha_mismatches > 0 {
+        eprintln!("ERROR: {sha_mismatches} configuration(s) disagreed in bitstream SHA-1 or size.");
+        std::process::exit(1);
     }
 }

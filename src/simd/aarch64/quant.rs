@@ -18,11 +18,13 @@
 //! The sign is restored where `coef < 0`, not where `coef <= 0`. The two differ only
 //! when `coef == 0` and `(ff * mf) >> 16` is non-zero, which no table in the codec
 //! produces, the dead-zone offset being a fraction of a quantiser step.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld4_i16, ld8_i16, st8_i16};
+use super::neon_token;
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // Forward quantisation
@@ -56,77 +58,80 @@ fn ld8_u16(r: &[i16]) -> uint16x8_t {
     vreinterpretq_u16_s16(ld8_i16(r))
 }
 
-/// `WelsQuant4x4_AArch64_neon`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn quant_4x4_neon(dct: &mut [i16; 16], ff: &[i16; 8], mf: &[i16; 8]) {
-    let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
-    let q0 = quant_8(ld8_i16(&dct[..8]), vff, vmf);
-    let q1 = quant_8(ld8_i16(&dct[8..]), vff, vmf);
-    st8_i16(&mut dct[..8], q0);
-    st8_i16(&mut dct[8..], q1);
-}
-
-/// `WelsQuant4x4Dc_AArch64_neon`: the same with `dup`ped factors.
-#[inline]
-#[target_feature(enable = "neon")]
-fn quant_4x4_dc_neon(dct: &mut [i16; 16], ff: i16, mf: i16) {
-    let (vff, vmf) = (vdupq_n_u16(ff as u16), vdupq_n_u16(mf as u16));
-    let q0 = quant_8(ld8_i16(&dct[..8]), vff, vmf);
-    let q1 = quant_8(ld8_i16(&dct[8..]), vff, vmf);
-    st8_i16(&mut dct[..8], q0);
-    st8_i16(&mut dct[8..], q1);
-}
-
-/// `WelsQuantFour4x4_AArch64_neon`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn quant_four_4x4_neon(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8]) {
-    let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
-    for chunk in dct.as_chunks_mut::<8>().0 {
-        let q = quant_8(ld8_i16(chunk), vff, vmf);
-        st8_i16(chunk, q);
+simd_entry! {
+    /// `WelsQuant4x4_AArch64_neon`.
+    #[target_feature(enable = "neon")]
+    fn quant_4x4_neon(dct: &mut [i16; 16], ff: &[i16; 8], mf: &[i16; 8], _token: NeonToken) {
+        let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
+        let q0 = quant_8(ld8_i16(&dct[..8]), vff, vmf);
+        let q1 = quant_8(ld8_i16(&dct[8..]), vff, vmf);
+        st8_i16(&mut dct[..8], q0);
+        st8_i16(&mut dct[8..], q1);
     }
-}
 
-/// `WelsQuantFour4x4Max_AArch64_neon`: `SELECT_MAX_IN_ABS_COEF` is `umax` of the
-/// two magnitude vectors of a block and `umaxv` across the lanes.
-#[inline]
-#[target_feature(enable = "neon")]
-fn quant_four_4x4_max_neon(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8], max: &mut [i16; 4]) {
-    let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
-    for (k, block) in dct.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-        let (q0, mag0) = quant_8_with_mag(ld8_i16(&block[..8]), vff, vmf);
-        let (q1, mag1) = quant_8_with_mag(ld8_i16(&block[8..]), vff, vmf);
-        st8_i16(&mut block[..8], q0);
-        st8_i16(&mut block[8..], q1);
-        max[k] = vmaxvq_u16(vmaxq_u16(mag0, mag1)) as i16;
+    /// `WelsQuant4x4Dc_AArch64_neon`: the same with `dup`ped factors.
+    #[target_feature(enable = "neon")]
+    fn quant_4x4_dc_neon(dct: &mut [i16; 16], ff: i16, mf: i16, _token: NeonToken) {
+        let (vff, vmf) = (vdupq_n_u16(ff as u16), vdupq_n_u16(mf as u16));
+        let q0 = quant_8(ld8_i16(&dct[..8]), vff, vmf);
+        let q1 = quant_8(ld8_i16(&dct[8..]), vff, vmf);
+        st8_i16(&mut dct[..8], q0);
+        st8_i16(&mut dct[8..], q1);
+    }
+
+    /// `WelsQuantFour4x4_AArch64_neon`.
+    #[target_feature(enable = "neon")]
+    fn quant_four_4x4_neon(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8], _token: NeonToken) {
+        let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
+        for chunk in dct.as_chunks_mut::<8>().0 {
+            let q = quant_8(ld8_i16(chunk), vff, vmf);
+            st8_i16(chunk, q);
+        }
+    }
+
+    /// `WelsQuantFour4x4Max_AArch64_neon`: `SELECT_MAX_IN_ABS_COEF` is `umax` of the
+    /// two magnitude vectors of a block and `umaxv` across the lanes.
+    #[target_feature(enable = "neon")]
+    fn quant_four_4x4_max_neon(
+        dct: &mut [i16; 64],
+        ff: &[i16; 8],
+        mf: &[i16; 8],
+        max: &mut [i16; 4],
+        _token: NeonToken,
+    ) {
+        let (vff, vmf) = (ld8_u16(ff), ld8_u16(mf));
+        for (k, block) in dct.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            let (q0, mag0) = quant_8_with_mag(ld8_i16(&block[..8]), vff, vmf);
+            let (q1, mag1) = quant_8_with_mag(ld8_i16(&block[8..]), vff, vmf);
+            st8_i16(&mut block[..8], q0);
+            st8_i16(&mut block[8..], q1);
+            max[k] = vmaxvq_u16(vmaxq_u16(mag0, mag1)) as i16;
+        }
     }
 }
 
 /// `WelsQuant4x4_AArch64_neon`.
 #[inline]
 pub fn quant_4x4(dct: &mut [i16; 16], ff: &[i16; 8], mf: &[i16; 8]) {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { quant_4x4_neon(dct, ff, mf) }
+    quant_4x4_neon(dct, ff, mf, neon_token())
 }
 
 /// `WelsQuant4x4Dc_AArch64_neon`.
 #[inline]
 pub fn quant_4x4_dc(dct: &mut [i16; 16], ff: i16, mf: i16) {
-    unsafe { quant_4x4_dc_neon(dct, ff, mf) }
+    quant_4x4_dc_neon(dct, ff, mf, neon_token())
 }
 
 /// `WelsQuantFour4x4_AArch64_neon`.
 #[inline]
 pub fn quant_four_4x4(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8]) {
-    unsafe { quant_four_4x4_neon(dct, ff, mf) }
+    quant_four_4x4_neon(dct, ff, mf, neon_token())
 }
 
 /// `WelsQuantFour4x4Max_AArch64_neon`.
 #[inline]
 pub fn quant_four_4x4_max(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8], max: &mut [i16; 4]) {
-    unsafe { quant_four_4x4_max_neon(dct, ff, mf, max) }
+    quant_four_4x4_max_neon(dct, ff, mf, max, neon_token())
 }
 
 // ============================================================================
@@ -136,134 +141,135 @@ pub fn quant_four_4x4_max(dct: &mut [i16; 64], ff: &[i16; 8], mf: &[i16; 8], max
 #[inline]
 #[target_feature(enable = "neon")]
 fn ld8_mf(mf: &[u16; 8]) -> int16x8_t {
-    let mf: [i16; 8] = mf.map(|m| m as i16);
-    ld8_i16(&mf)
+    vreinterpretq_s16_u16(super::lanes::ld8_u16(mf))
 }
 
-/// `WelsDequant4x4_AArch64_neon`: `mul .8h`, wrapping like the scalar's `wrapping_mul`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn dequant_4x4_neon(res: &mut [i16; 16], mf: &[u16; 8]) {
-    let vmf = ld8_mf(mf);
-    let r0 = vmulq_s16(ld8_i16(&res[..8]), vmf);
-    let r1 = vmulq_s16(ld8_i16(&res[8..]), vmf);
-    st8_i16(&mut res[..8], r0);
-    st8_i16(&mut res[8..], r1);
-}
+simd_entry! {
+    /// `WelsDequant4x4_AArch64_neon`: `mul .8h`, wrapping like the scalar's `wrapping_mul`.
+    #[target_feature(enable = "neon")]
+    fn dequant_4x4_neon(res: &mut [i16; 16], mf: &[u16; 8], _token: NeonToken) {
+        let vmf = ld8_mf(mf);
+        let r0 = vmulq_s16(ld8_i16(&res[..8]), vmf);
+        let r1 = vmulq_s16(ld8_i16(&res[8..]), vmf);
+        st8_i16(&mut res[..8], r0);
+        st8_i16(&mut res[8..], r1);
+    }
 
-/// `WelsDequantFour4x4_AArch64_neon`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn dequant_four_4x4_neon(res: &mut [i16; 64], mf: &[u16; 8]) {
-    let vmf = ld8_mf(mf);
-    for chunk in res.as_chunks_mut::<8>().0 {
-        let r = vmulq_s16(ld8_i16(chunk), vmf);
-        st8_i16(chunk, r);
+    /// `WelsDequantFour4x4_AArch64_neon`.
+    #[target_feature(enable = "neon")]
+    fn dequant_four_4x4_neon(res: &mut [i16; 64], mf: &[u16; 8], _token: NeonToken) {
+        let vmf = ld8_mf(mf);
+        for chunk in res.as_chunks_mut::<8>().0 {
+            let r = vmulq_s16(ld8_i16(chunk), vmf);
+            st8_i16(chunk, r);
+        }
     }
 }
 
 /// `WelsDequant4x4_AArch64_neon`.
 #[inline]
 pub fn dequant_4x4(res: &mut [i16; 16], mf: &[u16; 8]) {
-    unsafe { dequant_4x4_neon(res, mf) }
+    dequant_4x4_neon(res, mf, neon_token())
 }
 
 /// `WelsDequantFour4x4_AArch64_neon`.
 #[inline]
 pub fn dequant_four_4x4(res: &mut [i16; 64], mf: &[u16; 8]) {
-    unsafe { dequant_four_4x4_neon(res, mf) }
+    dequant_four_4x4_neon(res, mf, neon_token())
 }
 
 // ============================================================================
 // Non-zero count
 // ============================================================================
 
-/// `WelsGetNoneZeroCount_AArch64_neon`: `ZERO_COUNT_IN_2_QUARWORD` — `cmeq #0` on
-/// both words vectors, `uzp1` to a byte per coefficient, `ushr #7` to a 0/1, `addv`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn get_none_zero_count_neon(level: &[i16; 16]) -> i32 {
-    let z0 = vceqzq_s16(ld8_i16(&level[..8]));
-    let z1 = vceqzq_s16(ld8_i16(&level[8..]));
-    let zero = vuzp1q_u8(vreinterpretq_u8_u16(z0), vreinterpretq_u8_u16(z1));
-    let zeros = vaddvq_u8(vshrq_n_u8::<7>(zero)) as i32;
-    16 - zeros
+simd_entry! {
+    /// `WelsGetNoneZeroCount_AArch64_neon`: `ZERO_COUNT_IN_2_QUARWORD` — `cmeq #0` on
+    /// both words vectors, `uzp1` to a byte per coefficient, `ushr #7` to a 0/1, `addv`.
+    #[target_feature(enable = "neon")]
+    fn get_none_zero_count_neon(level: &[i16; 16], _token: NeonToken) -> i32 {
+        let z0 = vceqzq_s16(ld8_i16(&level[..8]));
+        let z1 = vceqzq_s16(ld8_i16(&level[8..]));
+        let zero = vuzp1q_u8(vreinterpretq_u8_u16(z0), vreinterpretq_u8_u16(z1));
+        let zeros = vaddvq_u8(vshrq_n_u8::<7>(zero)) as i32;
+        16 - zeros
+    }
 }
 
 /// `WelsGetNoneZeroCount_AArch64_neon`.
 #[inline]
 pub fn get_none_zero_count(level: &[i16; 16]) -> i32 {
-    unsafe { get_none_zero_count_neon(level) }
+    get_none_zero_count_neon(level, neon_token())
 }
 
 // ============================================================================
 // The luma-DC Hadamard pair
 // ============================================================================
 
-/// `WelsHadamardT4Dc_AArch64_neon`.
-///
-/// # Layout
-///
-/// The sixteen DCs are gathered at a 32-byte step into four vectors, so lane `k` of
-/// vector `j` holds the `j`th input of row `k` — the row at offset
-/// `((i & 8) << 4) + ((i & 4) << 3)` for `i = 4k`, i.e. 0, 32, 128, 160. The row pass is
-/// then lane-wise in `.4s` (`saddl`/`ssubl` widen on the way in), the `uzp1`/`uzp2` pairs
-/// transpose so the column pass is lane-wise too, and `sqrshrn #1` is
-/// `((x + 1) >> 1).clamp(-32768, 32767)` in one instruction.
-#[inline]
-#[target_feature(enable = "neon")]
-fn hadamard_t4_dc_neon(luma_dc: &mut [i16; 16], dct: &[i16; 241]) {
-    // Lane k = row k. Within a row: A = dct[idx], B = dct[idx + 16],
-    // C = dct[idx + 64], D = dct[idx + 80].
-    let va = ld4_i16(&[dct[0], dct[32], dct[128], dct[160]]);
-    let vb = ld4_i16(&[dct[16], dct[48], dct[144], dct[176]]);
-    let vc = ld4_i16(&[dct[64], dct[96], dct[192], dct[224]]);
-    let vd = ld4_i16(&[dct[80], dct[112], dct[208], dct[240]]);
+simd_entry! {
+    /// `WelsHadamardT4Dc_AArch64_neon`.
+    ///
+    /// # Layout
+    ///
+    /// The sixteen DCs are gathered at a 32-byte step into four vectors, so lane `k` of
+    /// vector `j` holds the `j`th input of row `k` — the row at offset
+    /// `((i & 8) << 4) + ((i & 4) << 3)` for `i = 4k`, i.e. 0, 32, 128, 160. The row pass is
+    /// then lane-wise in `.4s` (`saddl`/`ssubl` widen on the way in), the `uzp1`/`uzp2` pairs
+    /// transpose so the column pass is lane-wise too, and `sqrshrn #1` is
+    /// `((x + 1) >> 1).clamp(-32768, 32767)` in one instruction.
+    #[target_feature(enable = "neon")]
+    fn hadamard_t4_dc_neon(luma_dc: &mut [i16; 16], dct: &[i16; 241], _token: NeonToken) {
+        // Lane k = row k. Within a row: A = dct[idx], B = dct[idx + 16],
+        // C = dct[idx + 64], D = dct[idx + 80].
+        let va = ld4_i16(&[dct[0], dct[32], dct[128], dct[160]]);
+        let vb = ld4_i16(&[dct[16], dct[48], dct[144], dct[176]]);
+        let vc = ld4_i16(&[dct[64], dct[96], dct[192], dct[224]]);
+        let vd = ld4_i16(&[dct[80], dct[112], dct[208], dct[240]]);
 
-    // ROW_TRANSFORM_0_STEP + TRANSFORM_4BYTES: `pj` holds `p[4k + j]` in lane `k`.
-    let s0 = vaddl_s16(va, vd);
-    let s3 = vsubl_s16(va, vd);
-    let s1 = vaddl_s16(vb, vc);
-    let s2 = vsubl_s16(vb, vc);
-    let p0 = vaddq_s32(s0, s1);
-    let p1 = vaddq_s32(s3, s2);
-    let p2 = vsubq_s32(s0, s1);
-    let p3 = vsubq_s32(s3, s2);
+        // ROW_TRANSFORM_0_STEP + TRANSFORM_4BYTES: `pj` holds `p[4k + j]` in lane `k`.
+        let s0 = vaddl_s16(va, vd);
+        let s3 = vsubl_s16(va, vd);
+        let s1 = vaddl_s16(vb, vc);
+        let s2 = vsubl_s16(vb, vc);
+        let p0 = vaddq_s32(s0, s1);
+        let p1 = vaddq_s32(s3, s2);
+        let p2 = vsubq_s32(s0, s1);
+        let p3 = vsubq_s32(s3, s2);
 
-    // The `uzp` transpose: `rj` now holds `p[4j + i]` in lane `i`.
-    let v4 = vuzp1q_s32(p0, p1);
-    let v5 = vuzp2q_s32(p0, p1);
-    let v6 = vuzp1q_s32(p2, p3);
-    let v7 = vuzp2q_s32(p2, p3);
-    let r0 = vuzp1q_s32(v4, v6);
-    let r2 = vuzp2q_s32(v4, v6);
-    let r1 = vuzp1q_s32(v5, v7);
-    let r3 = vuzp2q_s32(v5, v7);
+        // The `uzp` transpose: `rj` now holds `p[4j + i]` in lane `i`.
+        let v4 = vuzp1q_s32(p0, p1);
+        let v5 = vuzp2q_s32(p0, p1);
+        let v6 = vuzp1q_s32(p2, p3);
+        let v7 = vuzp2q_s32(p2, p3);
+        let r0 = vuzp1q_s32(v4, v6);
+        let r2 = vuzp2q_s32(v4, v6);
+        let r1 = vuzp1q_s32(v5, v7);
+        let r3 = vuzp2q_s32(v5, v7);
 
-    // COL_TRANSFORM_0_STEP + TRANSFORM_4BYTES.
-    let t0 = vaddq_s32(r0, r3);
-    let t3 = vsubq_s32(r0, r3);
-    let t1 = vaddq_s32(r1, r2);
-    let t2 = vsubq_s32(r1, r2);
-    let o0 = vaddq_s32(t0, t1);
-    let o1 = vaddq_s32(t3, t2);
-    let o2 = vsubq_s32(t0, t1);
-    let o3 = vsubq_s32(t3, t2);
+        // COL_TRANSFORM_0_STEP + TRANSFORM_4BYTES.
+        let t0 = vaddq_s32(r0, r3);
+        let t3 = vsubq_s32(r0, r3);
+        let t1 = vaddq_s32(r1, r2);
+        let t2 = vsubq_s32(r1, r2);
+        let o0 = vaddq_s32(t0, t1);
+        let o1 = vaddq_s32(t3, t2);
+        let o2 = vsubq_s32(t0, t1);
+        let o3 = vsubq_s32(t3, t2);
 
-    st8_i16(
-        &mut luma_dc[..8],
-        vqrshrn_high_n_s32::<1>(vqrshrn_n_s32::<1>(o0), o1),
-    );
-    st8_i16(
-        &mut luma_dc[8..],
-        vqrshrn_high_n_s32::<1>(vqrshrn_n_s32::<1>(o2), o3),
-    );
+        st8_i16(
+            &mut luma_dc[..8],
+            vqrshrn_high_n_s32::<1>(vqrshrn_n_s32::<1>(o0), o1),
+        );
+        st8_i16(
+            &mut luma_dc[8..],
+            vqrshrn_high_n_s32::<1>(vqrshrn_n_s32::<1>(o2), o3),
+        );
+    }
 }
 
 /// `WelsHadamardT4Dc_AArch64_neon`.
 #[inline]
 pub fn hadamard_t4_dc(luma_dc: &mut [i16; 16], dct: &[i16; 241]) {
-    unsafe { hadamard_t4_dc_neon(luma_dc, dct) }
+    hadamard_t4_dc_neon(luma_dc, dct, neon_token())
 }
 
 /// `IHDM_4x4_TOTAL_16BITS`: the inverse-Hadamard butterfly on each of the two rows a
@@ -309,26 +315,27 @@ fn transpose_2x8(v0: int16x8_t, v1: int16x8_t) -> (int16x8_t, int16x8_t) {
     )
 }
 
-/// `WelsDequantIHadamard4x4_AArch64_neon`: rows, transpose, columns scaled by `mf`,
-/// transpose back. The multiply sits after the second pass.
-#[inline]
-#[target_feature(enable = "neon")]
-fn dequant_ihadamard_4x4_neon(res: &mut [i16; 16], mf: u16) {
-    let v0 = ihdm_rows(ld8_i16(&res[..8]));
-    let v1 = ihdm_rows(ld8_i16(&res[8..]));
-    let (v0, v1) = transpose_2x8(v0, v1);
-    let mfv = vdupq_n_s16(mf as i16);
-    let v0 = vmulq_s16(ihdm_rows(v0), mfv);
-    let v1 = vmulq_s16(ihdm_rows(v1), mfv);
-    let (v0, v1) = transpose_2x8(v0, v1);
-    st8_i16(&mut res[..8], v0);
-    st8_i16(&mut res[8..], v1);
+simd_entry! {
+    /// `WelsDequantIHadamard4x4_AArch64_neon`: rows, transpose, columns scaled by `mf`,
+    /// transpose back. The multiply sits after the second pass.
+    #[target_feature(enable = "neon")]
+    fn dequant_ihadamard_4x4_neon(res: &mut [i16; 16], mf: u16, _token: NeonToken) {
+        let v0 = ihdm_rows(ld8_i16(&res[..8]));
+        let v1 = ihdm_rows(ld8_i16(&res[8..]));
+        let (v0, v1) = transpose_2x8(v0, v1);
+        let mfv = vdupq_n_s16(mf as i16);
+        let v0 = vmulq_s16(ihdm_rows(v0), mfv);
+        let v1 = vmulq_s16(ihdm_rows(v1), mfv);
+        let (v0, v1) = transpose_2x8(v0, v1);
+        st8_i16(&mut res[..8], v0);
+        st8_i16(&mut res[8..], v1);
+    }
 }
 
 /// `WelsDequantIHadamard4x4_AArch64_neon`.
 #[inline]
 pub fn dequant_ihadamard_4x4(res: &mut [i16; 16], mf: u16) {
-    unsafe { dequant_ihadamard_4x4_neon(res, mf) }
+    dequant_ihadamard_4x4_neon(res, mf, neon_token())
 }
 
 #[inline(always)]

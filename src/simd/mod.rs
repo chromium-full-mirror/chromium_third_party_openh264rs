@@ -73,6 +73,8 @@ pub fn detect_cpu_features() -> u32 {
 #[inline(never)]
 fn latch_cpu_features() -> u32 {
     let flags = arch_cpu_features();
+    #[cfg(target_arch = "x86_64")]
+    tokens::warm_x86_feats();
     // Racing callers compute the same word from the same inputs, so both stores are
     // idempotent and neither needs a compare-exchange. The word goes first and the flag
     // second, under `Release`, so no reader can see the flag without the word.
@@ -172,7 +174,279 @@ static CPU_FEATURES_READY: AtomicBool = AtomicBool::new(false);
 /// codegen is `#[target_feature(enable = "avx2")]`, which `sad_16x_avx2` carries.
 #[inline(always)]
 pub fn has_avx2() -> bool {
-    cfg!(target_feature = "avx2") || (detect_cpu_features() & WELS_CPU_AVX2) != 0
+    !cfg!(feature = "scalar")
+        && (cfg!(target_feature = "avx2") || (detect_cpu_features() & WELS_CPU_AVX2) != 0)
+}
+
+#[allow(dead_code)]
+pub mod tokens {
+    #[cfg(target_arch = "x86_64")]
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[cfg(target_arch = "x86_64")]
+    const FEAT_SSSE3: u8 = 1 << 0;
+    #[cfg(target_arch = "x86_64")]
+    const FEAT_AVX2: u8 = 1 << 1;
+    #[cfg(target_arch = "x86_64")]
+    const FEAT_READY: u8 = 1 << 7;
+
+    /// Single-byte hardware feature cache: `0` before first probe, `FEAT_READY | bits`
+    /// afterward so a present feature is verified by a single `testb` + `jne` (separate
+    /// from `CPU_FEATURES`, which zeros all flags under `--features scalar` and uses a
+    /// second atomic ready flag).
+    #[cfg(target_arch = "x86_64")]
+    static X86_FEATS: AtomicU8 = AtomicU8::new(0);
+
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    #[inline(never)]
+    fn latch_x86_feats() -> u8 {
+        let mut f = FEAT_READY;
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            f |= FEAT_SSSE3;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            f |= FEAT_AVX2;
+        }
+        X86_FEATS.store(f, Ordering::Relaxed);
+        f
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(super) fn warm_x86_feats() {
+        let _ = latch_x86_feats();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    #[inline(never)]
+    fn has_x86_feat_slow(f: u8, bit: u8) -> bool {
+        if (f & FEAT_READY) != 0 {
+            return false;
+        }
+        (latch_x86_feats() & bit) != 0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn has_x86_feat(bit: u8) -> bool {
+        let f = X86_FEATS.load(Ordering::Relaxed);
+        if (f & bit) != 0 {
+            return true;
+        }
+        has_x86_feat_slow(f, bit)
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct NeonToken(());
+    impl NeonToken {
+        #[inline(always)]
+        pub fn try_new() -> Option<Self> {
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            {
+                Some(Self(()))
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "neon")))]
+            {
+                std::arch::is_aarch64_feature_detected!("neon").then_some(Self(()))
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                None
+            }
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct Sse2Token(());
+    impl Sse2Token {
+        #[inline(always)]
+        pub fn try_new() -> Option<Self> {
+            #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+            {
+                Some(Self(()))
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
+            {
+                std::arch::is_x86_feature_detected!("sse2").then_some(Self(()))
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                None
+            }
+        }
+    }
+
+    macro_rules! def_x86_token {
+        ($name:ident, $feat:tt, $bit:ident) => {
+            #[derive(Copy, Clone)]
+            pub struct $name(());
+            impl $name {
+                /// Single-load fast check against the latched feature byte (zero calls).
+                /// Returns `None` if unlatched or if `$feat` is absent.
+                #[inline(always)]
+                pub fn try_fast() -> Option<Self> {
+                    #[cfg(all(target_arch = "x86_64", target_feature = $feat))]
+                    {
+                        Some(Self(()))
+                    }
+                    #[cfg(all(target_arch = "x86_64", not(target_feature = $feat)))]
+                    {
+                        ((X86_FEATS.load(Ordering::Relaxed) & $bit) != 0).then_some(Self(()))
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        None
+                    }
+                }
+
+                /// Fast dispatch check: returns `None` under `--features scalar`, if
+                /// unlatched, or if `$feat` is absent (zero calls).
+                #[inline(always)]
+                pub fn try_fast_enabled() -> Option<Self> {
+                    if cfg!(feature = "scalar") {
+                        None
+                    } else {
+                        Self::try_fast()
+                    }
+                }
+
+                /// Hardware capability check (ignores `--features scalar` so unit tests
+                /// can still verify SIMD kernel parity under `--features scalar`).
+                #[inline(always)]
+                pub fn try_new() -> Option<Self> {
+                    #[cfg(all(target_arch = "x86_64", target_feature = $feat))]
+                    {
+                        Some(Self(()))
+                    }
+                    #[cfg(all(target_arch = "x86_64", not(target_feature = $feat)))]
+                    {
+                        has_x86_feat($bit).then_some(Self(()))
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        None
+                    }
+                }
+
+                /// Dispatch capability check: returns `None` when `--features scalar`
+                /// is enabled, even on CPUs (or `-C target-feature` builds) with `$feat`.
+                #[inline(always)]
+                pub fn try_new_enabled() -> Option<Self> {
+                    if cfg!(feature = "scalar") {
+                        None
+                    } else {
+                        Self::try_new()
+                    }
+                }
+            }
+        };
+    }
+
+    def_x86_token!(Ssse3Token, "ssse3", FEAT_SSSE3);
+    def_x86_token!(Avx2Token, "avx2", FEAT_AVX2);
+
+    #[cfg(target_arch = "x86_64")]
+    impl Avx2Token {
+        /// Reifies a stateless [`super::Avx2RecSadKernel`] into a plain function pointer,
+        /// amortizing the capability check across `SWelsSampleDealingFunc::pfSampleSad`.
+        ///
+        /// Sound because `self` witnesses that AVX2 is supported on the host CPU for the
+        /// lifetime of the process.
+        #[inline]
+        pub(crate) fn into_rec_sad_fn<K: super::Avx2RecSadKernel>(
+            self,
+        ) -> fn(
+            &crate::encoder::rec_view::RecCursor<'_>,
+            &crate::encoder::rec_view::RecCursor<'_>,
+        ) -> i32 {
+            fn call<K: super::Avx2RecSadKernel>(
+                a: &crate::encoder::rec_view::RecCursor<'_>,
+                b: &crate::encoder::rec_view::RecCursor<'_>,
+            ) -> i32 {
+                K::run(a, b, Avx2Token(()))
+            }
+            let _ = self;
+            call::<K>
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn neon_token() -> NeonToken {
+        NeonToken::try_new().expect("NEON is baseline on aarch64")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn sse2_token() -> Sse2Token {
+        Sse2Token::try_new().expect("SSE2 is baseline on x86_64")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn ssse3_token() -> Ssse3Token {
+        #[cold]
+        #[inline(never)]
+        fn slow() -> Ssse3Token {
+            Ssse3Token::try_new().expect("SSSE3 required on x86_64")
+        }
+        match Ssse3Token::try_fast() {
+            Some(t) => t,
+            None => slow(),
+        }
+    }
+}
+
+/// Wraps a `#[target_feature]` function whose **last** parameter is the matching
+/// capability token (`NeonToken`, `Sse2Token`, `Ssse3Token`, or `Avx2Token`) into a
+/// safe outer function + a `#[target_feature]` inner function where SIMD intrinsics are
+/// safe. Compile-time type checking rejects missing or mismatched capability tokens.
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(miri))))]
+macro_rules! simd_entry {
+    (@id $kw:ident $id:ident) => { $id };
+    (@id $id:ident) => { $id };
+    (@last $p1:ident $($p2:ident)?) => { simd_entry!(@id $p1 $($p2)?) };
+    (@last $p1:ident $($p2:ident)?, $($rest:tt)+) => { simd_entry!(@last $($rest)+) };
+    (@token "neon") => { $crate::simd::tokens::NeonToken };
+    (@token "sse2") => { $crate::simd::tokens::Sse2Token };
+    (@token "ssse3") => { $crate::simd::tokens::Ssse3Token };
+    (@token "avx2") => { $crate::simd::tokens::Avx2Token };
+    ($(
+        $(#[doc = $doc:expr])*
+        $(#[allow($allow:meta)])*
+        #[target_feature(enable = $feat:tt)]
+        $vis:vis fn $name:ident $(< $( $g1:ident $($g2:ident)? $(: $gb:ident $(+ $gb2:ident)*)? ),+ $(,)? >)?
+        ( $($p1:ident $($p2:ident)? : $pty:ty),+ $(,)? ) $(-> $ret:ty)? $body:block
+    )+) => {$(
+        $(#[doc = $doc])*
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments $(, $allow)*)]
+        $vis fn $name $(< $( $g1 $($g2)? $(: $gb $(+ $gb2)*)? ),+ >)? ( $(simd_entry!(@id $p1 $($p2)?) : $pty),+ ) $(-> $ret)? {
+            let _: simd_entry!(@token $feat) = simd_entry!(@last $($p1 $($p2)?),+);
+            #[target_feature(enable = $feat)]
+            #[inline]
+            #[allow(clippy::too_many_arguments $(, $allow)*)]
+            fn inner $(< $( $g1 $($g2)? $(: $gb $(+ $gb2)*)? ),+ >)? ( $($p1 $($p2)? : $pty),+ ) $(-> $ret)? $body
+            #[allow(unsafe_code)]
+            unsafe { inner $(::<$(simd_entry!(@id $g1 $($g2)?)),+>)? ( $(simd_entry!(@id $p1 $($p2)?)),+ ) }
+        }
+    )+};
+}
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", not(miri))))]
+pub(crate) use simd_entry;
+
+/// Stateless two-cursor AVX2 SAD kernel that can be reified into a higher-ranked
+/// `fn(&RecCursor<'_>, &RecCursor<'_>) -> i32` pointer once an
+/// [`Avx2Token`](tokens::Avx2Token) has been witnessed at table-init time.
+#[cfg(target_arch = "x86_64")]
+pub(crate) trait Avx2RecSadKernel {
+    fn run(
+        a: &crate::encoder::rec_view::RecCursor<'_>,
+        b: &crate::encoder::rec_view::RecCursor<'_>,
+        token: tokens::Avx2Token,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -239,27 +513,10 @@ mod tests {
         out
     }
 
-    /// Kernels internal to a module, which no dispatch site names: the generic workers
-    /// the shaped entry points instantiate (`sad_16x` and friends), the 16-sample inner
-    /// loops of the deblocking filters, and the `#[target_feature]` body `satd_4x4`
-    /// delegates to.
-    ///
-    /// Maintained by hand; it fails closed — an unlisted kernel that nothing dispatches
-    /// makes the test fail.
-    const INTERNAL: &[&str] = &[
-        "deblock_chroma_eq4_16",
-        "deblock_chroma_lt4_16",
-        "deblock_luma_eq4_16",
-        "deblock_luma_lt4_16",
-        "sad_16x",
-        "sad_16x_avx2",
-        "sad_4x",
-        "sad_8x",
-        "sample_sad_four_16x",
-        "sample_sad_four_4x",
-        "sample_sad_four_8x",
-        "satd_4x4_sse2_impl",
-    ];
+    /// Kernels internal to a module that are nonetheless `pub` (currently empty — all
+    /// module-internal helpers are private `fn`). Maintained by hand; it fails closed —
+    /// an unlisted `pub` kernel that nothing dispatches makes the test fail.
+    const INTERNAL: &[&str] = &[];
 
     /// Every kernel entry point is either named somewhere outside `src/simd/` or listed
     /// in [`INTERNAL`]. A slot left holding the scalar passes every parity and

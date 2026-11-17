@@ -933,7 +933,7 @@ pub fn WelsMdI16x16FromLayer(
         .sSampleDealingFuncs
         .md_cost(BLOCK_16x16)
         .unwrap_or(|a, b| crate::common::sad_common::sample_sad::<16, 16, _>(a, b));
-    let bMdUsingSad = pFunc.sSampleDealingFuncs.pfMdCost == crate::encoder::md::CostFamily::Sad;
+    let bMdUsingSad = pFunc.sSampleDealingFuncs.pfMdCost != crate::encoder::md::CostFamily::Satd;
     WelsMdI16x16(
         pfMdCost16x16,
         &cRecLuma,
@@ -982,12 +982,15 @@ pub fn WelsMdI16x16(
     let iAvailCount = g_kiIntra16AvaliMode[iOffset][4] as usize;
     let kpAvailMode = &g_kiIntra16AvaliMode[iOffset];
 
-    if bMdUsingSad && iAvailCount >= 3 {
+    if iAvailCount >= 3 {
         let Some(pred0) = pMbCache.sMemPredMb.first_chunk_mut::<256>() else {
             return i32::MAX;
         };
-        let (mut iBestMode, mut iBestCost) =
-            kernels::intra_pred::intra_16x16_combined3_sad(pred0, cRecLuma, cEncLuma, iLambda);
+        let (mut iBestMode, mut iBestCost) = if bMdUsingSad {
+            kernels::intra_pred::intra_16x16_combined3_sad(pred0, cRecLuma, cEncLuma, iLambda)
+        } else {
+            kernels::intra_pred::intra_16x16_combined3_satd(pred0, cRecLuma, cEncLuma, iLambda)
+        };
         let mut iIdx = 0usize;
 
         if iAvailCount > 3 {

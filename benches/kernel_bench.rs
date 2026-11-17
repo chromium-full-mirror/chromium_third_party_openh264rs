@@ -928,18 +928,54 @@ fn quant_rows(rows: &mut Vec<Row>) {
     );
     row!(
         *rows,
+        "quant 4x4 dc",
+        |c| {
+            let mut d = black_box(in16);
+            enc_aux::quant_4x4_dc(&mut d, black_box(ff[0] << 1), black_box(mf[0] >> 1));
+            sum16(&d, c)
+        },
+        |c| {
+            let mut d = black_box(in16);
+            isa::quant::quant_4x4_dc(&mut d, black_box(ff[0] << 1), black_box(mf[0] >> 1));
+            sum16(&d, c)
+        }
+    );
+    row!(
+        *rows,
+        "quant four 4x4",
+        |c| {
+            let mut d = black_box(in64);
+            enc_aux::quant_four_4x4(&mut d, black_box(&ff), black_box(&mf));
+            sum64(&d, c)
+        },
+        |c| {
+            let mut d = black_box(in64);
+            isa::quant::quant_four_4x4(&mut d, black_box(&ff), black_box(&mf));
+            sum64(&d, c)
+        }
+    );
+    row!(
+        *rows,
         "quant four 4x4 max",
         |c| {
             let mut d = black_box(in64);
             let mut m = [0; 4];
             enc_aux::quant_four_4x4_max(&mut d, black_box(&ff), black_box(&mf), &mut m);
-            sum64(&d, c) ^ m[0] as u64
+            if c {
+                sum64(&d, true) ^ fnv16(&m)
+            } else {
+                sum64(&d, false) ^ m[0] as u64
+            }
         },
         |c| {
             let mut d = black_box(in64);
             let mut m = [0; 4];
             isa::quant::quant_four_4x4_max(&mut d, black_box(&ff), black_box(&mf), &mut m);
-            sum64(&d, c) ^ m[0] as u64
+            if c {
+                sum64(&d, true) ^ fnv16(&m)
+            } else {
+                sum64(&d, false) ^ m[0] as u64
+            }
         }
     );
     let dq: [u16; 8] = [10, 13, 16, 13, 10, 13, 16, 13];
@@ -1004,6 +1040,81 @@ fn quant_rows(rows: &mut Vec<Row>) {
         "calculate_single_ctr 4x4",
         |_| enc_aux::calculate_single_ctr_4x4(black_box(&sparse)) as u64,
         |_| isa::score::calculate_single_ctr_4x4(black_box(&sparse)) as u64
+    );
+
+    let mut dense = [0i16; 16];
+    for (i, v) in dense.iter_mut().enumerate() {
+        if i != 3 && i != 9 && i != 14 {
+            *v = ((i as i16) * 7 - 40) | 1;
+        }
+    }
+    let cavlc_sum = |tz: i32, tc: i32, run: &[u8; 16], lvl: &[i16; 16], c: bool| -> u64 {
+        if c {
+            let n = tc as usize;
+            fnv(&run[..n]) ^ fnv16(&lvl[..n]) ^ ((tz as u64) << 32) ^ (tc as u64)
+        } else {
+            (tz as u64) ^ ((tc as u64) << 8) ^ (lvl[0] as u16 as u64) ^ ((run[0] as u64) << 16)
+        }
+    };
+    row!(
+        *rows,
+        "cavlc_param_cal sparse",
+        |c| {
+            let mut run = [0u8; 16];
+            let mut lvl = [0i16; 16];
+            let mut tc = 0i32;
+            let tz = openh264rs::encoder::svc_set_mb_syn_cavlc::CavlcParamCal_c(
+                black_box(&sparse),
+                &mut run,
+                &mut lvl,
+                &mut tc,
+                black_box(15),
+            );
+            cavlc_sum(tz, tc, &run, &lvl, c)
+        },
+        |c| {
+            let mut run = [0u8; 16];
+            let mut lvl = [0i16; 16];
+            let mut tc = 0i32;
+            let tz = isa::quant::cavlc_param_cal(
+                black_box(&sparse),
+                &mut run,
+                &mut lvl,
+                &mut tc,
+                black_box(15),
+            );
+            cavlc_sum(tz, tc, &run, &lvl, c)
+        }
+    );
+    row!(
+        *rows,
+        "cavlc_param_cal dense",
+        |c| {
+            let mut run = [0u8; 16];
+            let mut lvl = [0i16; 16];
+            let mut tc = 0i32;
+            let tz = openh264rs::encoder::svc_set_mb_syn_cavlc::CavlcParamCal_c(
+                black_box(&dense),
+                &mut run,
+                &mut lvl,
+                &mut tc,
+                black_box(15),
+            );
+            cavlc_sum(tz, tc, &run, &lvl, c)
+        },
+        |c| {
+            let mut run = [0u8; 16];
+            let mut lvl = [0i16; 16];
+            let mut tc = 0i32;
+            let tz = isa::quant::cavlc_param_cal(
+                black_box(&dense),
+                &mut run,
+                &mut lvl,
+                &mut tc,
+                black_box(15),
+            );
+            cavlc_sum(tz, tc, &run, &lvl, c)
+        }
     );
 }
 
@@ -1102,6 +1213,112 @@ fn intra_rows(rows: &mut Vec<Row>) {
         (best_mode, best_cost)
     };
 
+    let mut plane_cr = noise(STRIDE * ROWS, 53);
+    let mut plane_enc_cr = noise(STRIDE * ROWS, 67);
+    let rec_cr = RecCursor::over_owned(&mut plane_cr, ANCHOR, STRIDE);
+    let enc_cr = RecCursor::over_owned(&mut plane_enc_cr, ANCHOR, STRIDE);
+
+    let scalar_16x16_combined3_satd = |pred: &mut [u8; 256],
+                                       rec: &RecCursor<'_>,
+                                       enc: &RecCursor<'_>,
+                                       lambda: i32|
+     -> (u8, i32) {
+        let mut pred_v = [0u8; 256];
+        let mut pred_h = [0u8; 256];
+        let mut pred_dc = [0u8; 256];
+        ipred::WelsI16x16LumaPredV_c(&mut pred_v, rec);
+        ipred::WelsI16x16LumaPredH_c(&mut pred_h, rec);
+        ipred::WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
+        let cost_v = satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_v, 0, 16), enc) + lambda;
+        let cost_h =
+            satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_h, 0, 16), enc) + lambda * 3;
+        let cost_dc =
+            satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_dc, 0, 16), enc) + lambda * 3;
+        if cost_dc < cost_h && cost_dc < cost_v {
+            *pred = pred_dc;
+            (2, cost_dc)
+        } else if cost_h < cost_v {
+            *pred = pred_h;
+            (1, cost_h)
+        } else {
+            *pred = pred_v;
+            (0, cost_v)
+        }
+    };
+
+    let scalar_4x4_combined3_satd = |pred: &mut [u8; 16],
+                                     rec: &RecCursor<'_>,
+                                     enc: &RecCursor<'_>,
+                                     ldc: i32,
+                                     lh: i32,
+                                     lv: i32|
+     -> (i8, i32) {
+        let mut pdc = [0u8; 16];
+        let mut ph = [0u8; 16];
+        let mut pv = [0u8; 16];
+        ipred::WelsI4x4LumaPredDc_c(&mut pdc, rec);
+        ipred::WelsI4x4LumaPredH_c(&mut ph, rec);
+        ipred::WelsI4x4LumaPredV_c(&mut pv, rec);
+        let cdc = satd_ref::satd_4x4(&RecCursor::over_owned(&mut pdc, 0, 4), enc) + ldc;
+        let ch = satd_ref::satd_4x4(&RecCursor::over_owned(&mut ph, 0, 4), enc) + lh;
+        let cv = satd_ref::satd_4x4(&RecCursor::over_owned(&mut pv, 0, 4), enc) + lv;
+        if cdc <= ch && cdc <= cv {
+            *pred = pdc;
+            (2, cdc)
+        } else if ch <= cv {
+            *pred = ph;
+            (1, ch)
+        } else {
+            *pred = pv;
+            (0, cv)
+        }
+    };
+
+    let scalar_chroma_combined3 = |pred: &mut [u8; 128],
+                                   rec_cb: &RecCursor<'_>,
+                                   enc_cb: &RecCursor<'_>,
+                                   rec_cr: &RecCursor<'_>,
+                                   enc_cr: &RecCursor<'_>,
+                                   lambda: i32,
+                                   use_satd: bool|
+     -> (u8, i32) {
+        let mut best_m = 2u8;
+        let mut best_c = i32::MAX;
+        for (m, bits) in [(2u8, 3), (1u8, 3), (0u8, 1)] {
+            let mut cb = [0u8; 64];
+            let mut cr = [0u8; 64];
+            match m {
+                2 => {
+                    ipred::WelsIChromaPredV_c(&mut cb, rec_cb);
+                    ipred::WelsIChromaPredV_c(&mut cr, rec_cr);
+                }
+                1 => {
+                    ipred::WelsIChromaPredH_c(&mut cb, rec_cb);
+                    ipred::WelsIChromaPredH_c(&mut cr, rec_cr);
+                }
+                _ => {
+                    ipred::WelsIChromaPredDc_c(&mut cb, rec_cb);
+                    ipred::WelsIChromaPredDc_c(&mut cr, rec_cr);
+                }
+            }
+            let c1 = RecCursor::over_owned(&mut cb, 0, 8);
+            let c2 = RecCursor::over_owned(&mut cr, 0, 8);
+            let dist = if use_satd {
+                satd_ref::satd_8x8(&c1, enc_cb) + satd_ref::satd_8x8(&c2, enc_cr)
+            } else {
+                sample_sad::<8, 8, _>(&c1, enc_cb) + sample_sad::<8, 8, _>(&c2, enc_cr)
+            };
+            let cur = dist + lambda * bits;
+            if cur < best_c {
+                best_m = m;
+                best_c = cur;
+                pred[..64].copy_from_slice(&cb);
+                pred[64..].copy_from_slice(&cr);
+            }
+        }
+        (best_m, best_c)
+    };
+
     row!(
         *rows,
         "intra 16x16 combined3 sad",
@@ -1126,6 +1343,138 @@ fn intra_rows(rows: &mut Vec<Row>) {
                 fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
             } else {
                 cost as u64
+            }
+        }
+    );
+    row!(
+        *rows,
+        "intra 16x16 combined3 satd",
+        |c| {
+            let mut p = [0u8; 256];
+            let (mode, cost) =
+                scalar_16x16_combined3_satd(&mut p, black_box(&rec), black_box(&enc), 10);
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64)
+            }
+        },
+        |c| {
+            let mut p = [0u8; 256];
+            let (mode, cost) = isa::intra_pred::intra_16x16_combined3_satd(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                10,
+            );
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64)
+            }
+        }
+    );
+    row!(
+        *rows,
+        "intra 4x4 combined3 satd",
+        |c| {
+            let mut p = [0u8; 16];
+            let (mode, cost) =
+                scalar_4x4_combined3_satd(&mut p, black_box(&rec), black_box(&enc), 10, 40, 40);
+            if c {
+                fnv(&p) ^ (mode as u8 as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64)
+            }
+        },
+        |c| {
+            let mut p = [0u8; 16];
+            let (mode, cost) = isa::intra_pred::intra_4x4_combined3_satd(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                10,
+                40,
+                40,
+            );
+            if c {
+                fnv(&p) ^ (mode as u8 as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64)
+            }
+        }
+    );
+    row!(
+        *rows,
+        "intra chroma 8x8 combined3 sad",
+        |c| {
+            let mut p = [0u8; 128];
+            let (mode, cost) = scalar_chroma_combined3(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                black_box(&rec_cr),
+                black_box(&enc_cr),
+                10,
+                false,
+            );
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64) ^ (p[64] as u64)
+            }
+        },
+        |c| {
+            let mut p = [0u8; 128];
+            let (mode, cost) = isa::intra_pred::intra_chroma_8x8_combined3_sad(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                black_box(&rec_cr),
+                black_box(&enc_cr),
+                10,
+            );
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64) ^ (p[64] as u64)
+            }
+        }
+    );
+    row!(
+        *rows,
+        "intra chroma 8x8 combined3 satd",
+        |c| {
+            let mut p = [0u8; 128];
+            let (mode, cost) = scalar_chroma_combined3(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                black_box(&rec_cr),
+                black_box(&enc_cr),
+                10,
+                true,
+            );
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64) ^ (p[64] as u64)
+            }
+        },
+        |c| {
+            let mut p = [0u8; 128];
+            let (mode, cost) = isa::intra_pred::intra_chroma_8x8_combined3_satd(
+                &mut p,
+                black_box(&rec),
+                black_box(&enc),
+                black_box(&rec_cr),
+                black_box(&enc_cr),
+                10,
+            );
+            if c {
+                fnv(&p) ^ (mode as u64) ^ ((cost as u64) << 16)
+            } else {
+                (cost as u64) ^ (p[0] as u64) ^ (p[64] as u64)
             }
         }
     );

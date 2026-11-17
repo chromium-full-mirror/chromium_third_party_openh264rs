@@ -30,13 +30,15 @@
 //! destination: a plane cursor pair, one cursor in place, a `RecCursor` with an arena
 //! prediction, or a `RecCursor` in place. The arithmetic exists twice, once per
 //! width, and each wrapper is the load/add/`sqxtun`/store around it.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld8, ld8_i16, ld16, st4_i16, st8, st16, to8, to16};
+use super::neon_token;
 use crate::encoder::rec_view::RecCursor;
 use crate::safe::plane::{PlaneCursor, PlaneCursorMut, SampleCursor};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // Forward 4x4 integer DCT
@@ -129,87 +131,96 @@ fn transpose8(
     )
 }
 
-/// `WelsDctT4_AArch64_neon`.
-///
-/// The residual's sixteen bytes are `usubl`ed into `[row0 | row1]` and
-/// `[row2 | row3]`, and the `uzp1`/`uzp2` pairs turn those into four column vectors
-/// — lane `i` of vector `j` is `data[i][j]` — so the first `DCT_ROW_TRANSFORM` is the
-/// scalar's row pass on all four rows at once. A transpose makes them row vectors and
-/// the same butterfly is the column pass; the outputs are the four rows in order.
-#[inline]
-#[target_feature(enable = "neon")]
-fn dct_4x4_neon<A: SampleCursor, B: SampleCursor>(dct: &mut [i16; 16], pix1: &A, pix2: &B) {
-    let mut a = [0u8; 16];
-    let mut b = [0u8; 16];
-    for y in 0..4 {
-        a[y * 4..][..4].copy_from_slice(&pix1.row_n::<4>(y as isize, 0));
-        b[y * 4..][..4].copy_from_slice(&pix2.row_n::<4>(y as isize, 0));
-    }
-    let (va, vb) = (ld16(&a), ld16(&b));
-    let d01 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(va), vget_low_u8(vb)));
-    let d23 = vreinterpretq_s16_u16(vsubl_high_u8(va, vb));
-
-    let even = vuzp1q_s16(d01, d23);
-    let odd = vuzp2q_s16(d01, d23);
-    let c02 = vuzp1q_s16(even, odd); // s[0, 4, 8, 12] [1, 5, 9, 13]
-    let c13 = vuzp2q_s16(even, odd); // s[2, 6, 10, 14] [3, 7, 11, 15]
-    let (c0, c1) = (vget_low_s16(c02), vget_high_s16(c02));
-    let (c2, c3) = (vget_low_s16(c13), vget_high_s16(c13));
-
-    let (r0, r1, r2, r3) = dct_pass4(c0, c1, c2, c3);
-    let (t0, t1, t2, t3) = transpose4(r0, r1, r2, r3);
-    let (o0, o1, o2, o3) = dct_pass4(t0, t1, t2, t3);
-
-    st4_i16(&mut dct[0..], o0);
-    st4_i16(&mut dct[4..], o1);
-    st4_i16(&mut dct[8..], o2);
-    st4_i16(&mut dct[12..], o3);
-}
-
-/// `WelsDctFourT4_AArch64_neon`: the 8x8 quadrant as two passes of four eight-wide
-/// rows, each holding the left and right 4x4 side by side. Transpose, row pass,
-/// transpose, column pass — the asm's order — then the low halves are the left block
-/// and the high halves the right one.
-#[inline]
-#[target_feature(enable = "neon")]
-fn dct_four_4x4_neon<A: SampleCursor, B: SampleCursor>(dct: &mut [i16; 64], pix1: &A, pix2: &B) {
-    for k in 0..2usize {
-        let mut d = [vdupq_n_s16(0); 4];
-        for (j, row) in d.iter_mut().enumerate() {
-            let y = (4 * k + j) as isize;
-            let a = ld8(&pix1.row_n::<8>(y, 0));
-            let b = ld8(&pix2.row_n::<8>(y, 0));
-            *row = vreinterpretq_s16_u16(vsubl_u8(a, b));
+simd_entry! {
+    /// `WelsDctT4_AArch64_neon`.
+    ///
+    /// The residual's sixteen bytes are `usubl`ed into `[row0 | row1]` and
+    /// `[row2 | row3]`, and the `uzp1`/`uzp2` pairs turn those into four column vectors
+    /// — lane `i` of vector `j` is `data[i][j]` — so the first `DCT_ROW_TRANSFORM` is the
+    /// scalar's row pass on all four rows at once. A transpose makes them row vectors and
+    /// the same butterfly is the column pass; the outputs are the four rows in order.
+    #[target_feature(enable = "neon")]
+    fn dct_4x4_neon<A: SampleCursor, B: SampleCursor>(
+        dct: &mut [i16; 16],
+        pix1: &A,
+        pix2: &B,
+        _token: NeonToken,
+    ) {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        for y in 0..4 {
+            a[y * 4..][..4].copy_from_slice(&pix1.row_n::<4>(y as isize, 0));
+            b[y * 4..][..4].copy_from_slice(&pix2.row_n::<4>(y as isize, 0));
         }
-        let (c0, c1, c2, c3) = transpose8(d[0], d[1], d[2], d[3]);
-        let (r0, r1, r2, r3) = dct_pass8(c0, c1, c2, c3);
-        let (t0, t1, t2, t3) = transpose8(r0, r1, r2, r3);
-        let (o0, o1, o2, o3) = dct_pass8(t0, t1, t2, t3);
+        let (va, vb) = (ld16(&a), ld16(&b));
+        let d01 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(va), vget_low_u8(vb)));
+        let d23 = vreinterpretq_s16_u16(vsubl_high_u8(va, vb));
 
-        let left = &mut dct[k * 32..][..16];
-        st4_i16(&mut left[0..], vget_low_s16(o0));
-        st4_i16(&mut left[4..], vget_low_s16(o1));
-        st4_i16(&mut left[8..], vget_low_s16(o2));
-        st4_i16(&mut left[12..], vget_low_s16(o3));
-        let right = &mut dct[k * 32 + 16..][..16];
-        st4_i16(&mut right[0..], vget_high_s16(o0));
-        st4_i16(&mut right[4..], vget_high_s16(o1));
-        st4_i16(&mut right[8..], vget_high_s16(o2));
-        st4_i16(&mut right[12..], vget_high_s16(o3));
+        let even = vuzp1q_s16(d01, d23);
+        let odd = vuzp2q_s16(d01, d23);
+        let c02 = vuzp1q_s16(even, odd); // s[0, 4, 8, 12] [1, 5, 9, 13]
+        let c13 = vuzp2q_s16(even, odd); // s[2, 6, 10, 14] [3, 7, 11, 15]
+        let (c0, c1) = (vget_low_s16(c02), vget_high_s16(c02));
+        let (c2, c3) = (vget_low_s16(c13), vget_high_s16(c13));
+
+        let (r0, r1, r2, r3) = dct_pass4(c0, c1, c2, c3);
+        let (t0, t1, t2, t3) = transpose4(r0, r1, r2, r3);
+        let (o0, o1, o2, o3) = dct_pass4(t0, t1, t2, t3);
+
+        st4_i16(&mut dct[0..], o0);
+        st4_i16(&mut dct[4..], o1);
+        st4_i16(&mut dct[8..], o2);
+        st4_i16(&mut dct[12..], o3);
+    }
+
+    /// `WelsDctFourT4_AArch64_neon`: the 8x8 quadrant as two passes of four eight-wide
+    /// rows, each holding the left and right 4x4 side by side. Transpose, row pass,
+    /// transpose, column pass — the asm's order — then the low halves are the left block
+    /// and the high halves the right one.
+    #[target_feature(enable = "neon")]
+    fn dct_four_4x4_neon<A: SampleCursor, B: SampleCursor>(
+        dct: &mut [i16; 64],
+        pix1: &A,
+        pix2: &B,
+        _token: NeonToken,
+    ) {
+        for k in 0..2usize {
+            let mut d = [vdupq_n_s16(0); 4];
+            for (j, row) in d.iter_mut().enumerate() {
+                let y = (4 * k + j) as isize;
+                let a = ld8(&pix1.row_n::<8>(y, 0));
+                let b = ld8(&pix2.row_n::<8>(y, 0));
+                *row = vreinterpretq_s16_u16(vsubl_u8(a, b));
+            }
+            let (c0, c1, c2, c3) = transpose8(d[0], d[1], d[2], d[3]);
+            let (r0, r1, r2, r3) = dct_pass8(c0, c1, c2, c3);
+            let (t0, t1, t2, t3) = transpose8(r0, r1, r2, r3);
+            let (o0, o1, o2, o3) = dct_pass8(t0, t1, t2, t3);
+
+            let left = &mut dct[k * 32..][..16];
+            st4_i16(&mut left[0..], vget_low_s16(o0));
+            st4_i16(&mut left[4..], vget_low_s16(o1));
+            st4_i16(&mut left[8..], vget_low_s16(o2));
+            st4_i16(&mut left[12..], vget_low_s16(o3));
+            let right = &mut dct[k * 32 + 16..][..16];
+            st4_i16(&mut right[0..], vget_high_s16(o0));
+            st4_i16(&mut right[4..], vget_high_s16(o1));
+            st4_i16(&mut right[8..], vget_high_s16(o2));
+            st4_i16(&mut right[12..], vget_high_s16(o3));
+        }
     }
 }
 
 /// `WelsDctT4_AArch64_neon`.
 #[inline]
 pub fn dct_4x4<A: SampleCursor, B: SampleCursor>(dct: &mut [i16; 16], pix1: &A, pix2: &B) {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { dct_4x4_neon(dct, pix1, pix2) }
+    dct_4x4_neon(dct, pix1, pix2, neon_token())
 }
 
 /// `WelsDctFourT4_AArch64_neon`.
 #[inline]
 pub fn dct_four_4x4<A: SampleCursor, B: SampleCursor>(dct: &mut [i16; 64], pix1: &A, pix2: &B) {
-    unsafe { dct_four_4x4_neon(dct, pix1, pix2) }
+    dct_four_4x4_neon(dct, pix1, pix2, neon_token())
 }
 
 // ============================================================================
@@ -301,9 +312,15 @@ fn round_pairs(
 #[inline]
 #[target_feature(enable = "neon")]
 fn residual4(dct: &[i16; 16]) -> (int16x8_t, int16x8_t) {
-    // SAFETY: sixteen coefficients, which is what `ld4 {v.4h}` de-interleaves.
-    let c = unsafe { vld4_s16(dct.as_ptr()) };
-    let (f0, f1, f2, f3) = idct_row_pass4(c.0, c.1, c.2, c.3);
+    let d01 = ld8_i16(&dct[..8]);
+    let d23 = ld8_i16(&dct[8..]);
+    let (c0, c1, c2, c3) = transpose4(
+        vget_low_s16(d01),
+        vget_high_s16(d01),
+        vget_low_s16(d23),
+        vget_high_s16(d23),
+    );
+    let (f0, f1, f2, f3) = idct_row_pass4(c0, c1, c2, c3);
     let (g0, g1, g2, g3) = transpose4(f0, f1, f2, f3);
     let (r0, r1, r2, r3) = idct_col_pass4(g0, g1, g2, g3);
     round_pairs(r0, r1, r2, r3)
@@ -315,9 +332,19 @@ fn residual4(dct: &[i16; 16]) -> (int16x8_t, int16x8_t) {
 #[inline]
 #[target_feature(enable = "neon")]
 fn residual8(dct: &[i16; 32]) -> [int16x8_t; 4] {
-    // SAFETY: thirty-two coefficients, which is what `ld4 {v.8h}` de-interleaves.
-    let c = unsafe { vld4q_s16(dct.as_ptr()) };
-    let (f0, f1, f2, f3) = idct_row_pass8(c.0, c.1, c.2, c.3);
+    let q0 = ld8_i16(&dct[0..8]);
+    let q1 = ld8_i16(&dct[8..16]);
+    let q2 = ld8_i16(&dct[16..24]);
+    let q3 = ld8_i16(&dct[24..32]);
+    let u0 = vuzp1q_s16(q0, q1);
+    let u1 = vuzp2q_s16(q0, q1);
+    let u2 = vuzp1q_s16(q2, q3);
+    let u3 = vuzp2q_s16(q2, q3);
+    let c0 = vuzp1q_s16(u0, u2);
+    let c2 = vuzp2q_s16(u0, u2);
+    let c1 = vuzp1q_s16(u1, u3);
+    let c3 = vuzp2q_s16(u1, u3);
+    let (f0, f1, f2, f3) = idct_row_pass8(c0, c1, c2, c3);
     let (g0, g1, g2, g3) = transpose8(f0, f1, f2, f3);
     let (l0, l1, l2, l3) = idct_col_pass4(
         vget_low_s16(g0),
@@ -356,124 +383,143 @@ fn pair4(a: &[u8], b: &[u8]) -> uint8x8_t {
     ld8(&t)
 }
 
-/// `IdctResAddPred_AArch64_neon`: in place on `pred`, rows read before they are written.
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_res_add_pred_neon(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 16]) {
-    let (r01, r23) = residual4(rs);
-    let p01 = pair4(pred.row(0, 0, 4), pred.row(1, 0, 4));
-    let p23 = pair4(pred.row(2, 0, 4), pred.row(3, 0, 4));
-    let o01 = to8(add_clip8(p01, r01));
-    let o23 = to8(add_clip8(p23, r23));
-    pred.row_mut(0, 0, 4).copy_from_slice(&o01[..4]);
-    pred.row_mut(1, 0, 4).copy_from_slice(&o01[4..]);
-    pred.row_mut(2, 0, 4).copy_from_slice(&o23[..4]);
-    pred.row_mut(3, 0, 4).copy_from_slice(&o23[4..]);
-}
+simd_entry! {
+    /// `IdctResAddPred_AArch64_neon`: in place on `pred`, rows read before they are written.
+    #[target_feature(enable = "neon")]
+    fn idct_res_add_pred_neon(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 16], _token: NeonToken) {
+        let (r01, r23) = residual4(rs);
+        let p01 = pair4(pred.row(0, 0, 4), pred.row(1, 0, 4));
+        let p23 = pair4(pred.row(2, 0, 4), pred.row(3, 0, 4));
+        let o01 = to8(add_clip8(p01, r01));
+        let o23 = to8(add_clip8(p23, r23));
+        pred.row_mut(0, 0, 4).copy_from_slice(&o01[..4]);
+        pred.row_mut(1, 0, 4).copy_from_slice(&o01[4..]);
+        pred.row_mut(2, 0, 4).copy_from_slice(&o23[..4]);
+        pred.row_mut(3, 0, 4).copy_from_slice(&o23[4..]);
+    }
 
-/// `WelsIDctT4Rec_AArch64_neon`: prediction from one cursor, reconstruction to another.
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_t4_rec_neon(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dct: &[i16; 16]) {
-    let (r01, r23) = residual4(dct);
-    let p01 = pair4(pred.row(0, 0, 4), pred.row(1, 0, 4));
-    let p23 = pair4(pred.row(2, 0, 4), pred.row(3, 0, 4));
-    let o01 = to8(add_clip8(p01, r01));
-    let o23 = to8(add_clip8(p23, r23));
-    rec.row_mut(0, 0, 4).copy_from_slice(&o01[..4]);
-    rec.row_mut(1, 0, 4).copy_from_slice(&o01[4..]);
-    rec.row_mut(2, 0, 4).copy_from_slice(&o23[..4]);
-    rec.row_mut(3, 0, 4).copy_from_slice(&o23[4..]);
-}
+    /// `WelsIDctT4Rec_AArch64_neon`: prediction from one cursor, reconstruction to another.
+    #[target_feature(enable = "neon")]
+    fn idct_t4_rec_neon(
+        rec: &mut PlaneCursorMut<'_>,
+        pred: &PlaneCursor<'_>,
+        dct: &[i16; 16],
+        _token: NeonToken,
+    ) {
+        let (r01, r23) = residual4(dct);
+        let p01 = pair4(pred.row(0, 0, 4), pred.row(1, 0, 4));
+        let p23 = pair4(pred.row(2, 0, 4), pred.row(3, 0, 4));
+        let o01 = to8(add_clip8(p01, r01));
+        let o23 = to8(add_clip8(p23, r23));
+        rec.row_mut(0, 0, 4).copy_from_slice(&o01[..4]);
+        rec.row_mut(1, 0, 4).copy_from_slice(&o01[4..]);
+        rec.row_mut(2, 0, 4).copy_from_slice(&o23[..4]);
+        rec.row_mut(3, 0, 4).copy_from_slice(&o23[4..]);
+    }
 
-/// `WelsIDctFourT4Rec_AArch64_neon`: two `ld4 {v.8h}` passes, four eight-byte rows each.
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_four_t4_rec_neon(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dct: &[i16; 64]) {
-    for k in 0..2usize {
-        let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
-        let rows = residual8(sub);
-        for (j, res) in rows.into_iter().enumerate() {
-            let y = (4 * k + j) as isize;
-            let out = add_clip8(ld8(pred.row(y, 0, 8)), res);
-            st8(rec.row_mut(y, 0, 8), out);
+    /// `WelsIDctFourT4Rec_AArch64_neon`: two `ld4 {v.8h}` passes, four eight-byte rows each.
+    #[target_feature(enable = "neon")]
+    fn idct_four_t4_rec_neon(
+        rec: &mut PlaneCursorMut<'_>,
+        pred: &PlaneCursor<'_>,
+        dct: &[i16; 64],
+        _token: NeonToken,
+    ) {
+        for k in 0..2usize {
+            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
+            let rows = residual8(sub);
+            for (j, res) in rows.into_iter().enumerate() {
+                let y = (4 * k + j) as isize;
+                let out = add_clip8(ld8(pred.row(y, 0, 8)), res);
+                st8(rec.row_mut(y, 0, 8), out);
+            }
         }
     }
-}
 
-/// The in-place form of [`idct_four_t4_rec_neon`].
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_four_t4_rec_in_place_neon(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 64]) {
-    for k in 0..2usize {
-        let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
-        let rows = residual8(sub);
-        for (j, res) in rows.into_iter().enumerate() {
-            let y = (4 * k + j) as isize;
-            let out = add_clip8(ld8(rec.row(y, 0, 8)), res);
-            st8(rec.row_mut(y, 0, 8), out);
+    /// The in-place form of [`idct_four_t4_rec_neon`].
+    #[target_feature(enable = "neon")]
+    fn idct_four_t4_rec_in_place_neon(
+        rec: &mut PlaneCursorMut<'_>,
+        dct: &[i16; 64],
+        _token: NeonToken,
+    ) {
+        for k in 0..2usize {
+            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
+            let rows = residual8(sub);
+            for (j, res) in rows.into_iter().enumerate() {
+                let y = (4 * k + j) as isize;
+                let out = add_clip8(ld8(rec.row(y, 0, 8)), res);
+                st8(rec.row_mut(y, 0, 8), out);
+            }
         }
     }
-}
 
-/// The seam form: an arena prediction at `pred_stride`, written through `write_row`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_t4_rec_to_view_neon(rec: &RecCursor<'_>, pred: &[u8], pred_stride: usize, dct: &[i16; 16]) {
-    let (r01, r23) = residual4(dct);
-    let p01 = pair4(pred, &pred[pred_stride..]);
-    let p23 = pair4(&pred[2 * pred_stride..], &pred[3 * pred_stride..]);
-    let o01 = to8(add_clip8(p01, r01));
-    let o23 = to8(add_clip8(p23, r23));
-    rec.write_row::<4>(0, 0, o01[..4].try_into().expect("row"));
-    rec.write_row::<4>(1, 0, o01[4..].try_into().expect("row"));
-    rec.write_row::<4>(2, 0, o23[..4].try_into().expect("row"));
-    rec.write_row::<4>(3, 0, o23[4..].try_into().expect("row"));
-}
+    /// The seam form: an arena prediction at `pred_stride`, written through `write_row`.
+    #[target_feature(enable = "neon")]
+    fn idct_t4_rec_to_view_neon(
+        rec: &RecCursor<'_>,
+        pred: &[u8],
+        pred_stride: usize,
+        dct: &[i16; 16],
+        _token: NeonToken,
+    ) {
+        let (r01, r23) = residual4(dct);
+        let p01 = pair4(pred, &pred[pred_stride..]);
+        let p23 = pair4(&pred[2 * pred_stride..], &pred[3 * pred_stride..]);
+        let o01 = to8(add_clip8(p01, r01));
+        let o23 = to8(add_clip8(p23, r23));
+        rec.write_row::<4>(0, 0, o01[..4].try_into().expect("row"));
+        rec.write_row::<4>(1, 0, o01[4..].try_into().expect("row"));
+        rec.write_row::<4>(2, 0, o23[..4].try_into().expect("row"));
+        rec.write_row::<4>(3, 0, o23[4..].try_into().expect("row"));
+    }
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_four_t4_rec_to_view_neon(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 64],
-) {
-    for k in 0..2usize {
-        let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
-        let rows = residual8(sub);
-        for (j, res) in rows.into_iter().enumerate() {
-            let y = 4 * k + j;
-            let out = add_clip8(ld8(&pred[y * pred_stride..]), res);
-            rec.write_row::<8>(y as isize, 0, &to8(out));
+    #[target_feature(enable = "neon")]
+    fn idct_four_t4_rec_to_view_neon(
+        rec: &RecCursor<'_>,
+        pred: &[u8],
+        pred_stride: usize,
+        dct: &[i16; 64],
+        _token: NeonToken,
+    ) {
+        for k in 0..2usize {
+            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
+            let rows = residual8(sub);
+            for (j, res) in rows.into_iter().enumerate() {
+                let y = 4 * k + j;
+                let out = add_clip8(ld8(&pred[y * pred_stride..]), res);
+                rec.write_row::<8>(y as isize, 0, &to8(out));
+            }
         }
     }
-}
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_t4_rec_in_place_view_neon(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    let (r01, r23) = residual4(dct);
-    let p01 = pair4(&rec.row::<4>(0, 0), &rec.row::<4>(1, 0));
-    let p23 = pair4(&rec.row::<4>(2, 0), &rec.row::<4>(3, 0));
-    let o01 = to8(add_clip8(p01, r01));
-    let o23 = to8(add_clip8(p23, r23));
-    rec.write_row::<4>(0, 0, o01[..4].try_into().expect("row"));
-    rec.write_row::<4>(1, 0, o01[4..].try_into().expect("row"));
-    rec.write_row::<4>(2, 0, o23[..4].try_into().expect("row"));
-    rec.write_row::<4>(3, 0, o23[4..].try_into().expect("row"));
-}
+    #[target_feature(enable = "neon")]
+    fn idct_t4_rec_in_place_view_neon(rec: &RecCursor<'_>, dct: &[i16; 16], _token: NeonToken) {
+        let (r01, r23) = residual4(dct);
+        let p01 = pair4(&rec.row::<4>(0, 0), &rec.row::<4>(1, 0));
+        let p23 = pair4(&rec.row::<4>(2, 0), &rec.row::<4>(3, 0));
+        let o01 = to8(add_clip8(p01, r01));
+        let o23 = to8(add_clip8(p23, r23));
+        rec.write_row::<4>(0, 0, o01[..4].try_into().expect("row"));
+        rec.write_row::<4>(1, 0, o01[4..].try_into().expect("row"));
+        rec.write_row::<4>(2, 0, o23[..4].try_into().expect("row"));
+        rec.write_row::<4>(3, 0, o23[4..].try_into().expect("row"));
+    }
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_four_t4_rec_in_place_view_neon(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    for k in 0..2usize {
-        let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
-        let rows = residual8(sub);
-        for (j, res) in rows.into_iter().enumerate() {
-            let y = (4 * k + j) as isize;
-            let out = add_clip8(ld8(&rec.row::<8>(y, 0)), res);
-            rec.write_row::<8>(y, 0, &to8(out));
+    #[target_feature(enable = "neon")]
+    fn idct_four_t4_rec_in_place_view_neon(
+        rec: &RecCursor<'_>,
+        dct: &[i16; 64],
+        _token: NeonToken,
+    ) {
+        for k in 0..2usize {
+            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().expect("two blocks");
+            let rows = residual8(sub);
+            for (j, res) in rows.into_iter().enumerate() {
+                let y = (4 * k + j) as isize;
+                let out = add_clip8(ld8(&rec.row::<8>(y, 0)), res);
+                rec.write_row::<8>(y, 0, &to8(out));
+            }
         }
     }
 }
@@ -499,38 +545,44 @@ fn rounded_dc(dc: &[i16; 16]) -> [i16; 16] {
     out
 }
 
-/// `WelsIDctRecI16x16Dc_AArch64_neon`.
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_rec_i16x16_dc_neon(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dc: &[i16; 16]) {
-    let d = rounded_dc(dc);
-    for g in 0..4usize {
-        let lo = vcombine_s16(vdup_n_s16(d[4 * g]), vdup_n_s16(d[4 * g + 1]));
-        let hi = vcombine_s16(vdup_n_s16(d[4 * g + 2]), vdup_n_s16(d[4 * g + 3]));
-        for j in 0..4 {
-            let y = (4 * g + j) as isize;
-            let out = dc_row(ld16(pred.row(y, 0, 16)), lo, hi);
-            st16(rec.row_mut(y, 0, 16), out);
+simd_entry! {
+    /// `WelsIDctRecI16x16Dc_AArch64_neon`.
+    #[target_feature(enable = "neon")]
+    fn idct_rec_i16x16_dc_neon(
+        rec: &mut PlaneCursorMut<'_>,
+        pred: &PlaneCursor<'_>,
+        dc: &[i16; 16],
+        _token: NeonToken,
+    ) {
+        let d = rounded_dc(dc);
+        for g in 0..4usize {
+            let lo = vcombine_s16(vdup_n_s16(d[4 * g]), vdup_n_s16(d[4 * g + 1]));
+            let hi = vcombine_s16(vdup_n_s16(d[4 * g + 2]), vdup_n_s16(d[4 * g + 3]));
+            for j in 0..4 {
+                let y = (4 * g + j) as isize;
+                let out = dc_row(ld16(pred.row(y, 0, 16)), lo, hi);
+                st16(rec.row_mut(y, 0, 16), out);
+            }
         }
     }
-}
 
-#[inline]
-#[target_feature(enable = "neon")]
-fn idct_rec_i16x16_dc_to_view_neon(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dc: &[i16; 16],
-) {
-    let d = rounded_dc(dc);
-    for g in 0..4usize {
-        let lo = vcombine_s16(vdup_n_s16(d[4 * g]), vdup_n_s16(d[4 * g + 1]));
-        let hi = vcombine_s16(vdup_n_s16(d[4 * g + 2]), vdup_n_s16(d[4 * g + 3]));
-        for j in 0..4 {
-            let y = 4 * g + j;
-            let out = dc_row(ld16(&pred[y * pred_stride..]), lo, hi);
-            rec.write_row::<16>(y as isize, 0, &to16(out));
+    #[target_feature(enable = "neon")]
+    fn idct_rec_i16x16_dc_to_view_neon(
+        rec: &RecCursor<'_>,
+        pred: &[u8],
+        pred_stride: usize,
+        dc: &[i16; 16],
+        _token: NeonToken,
+    ) {
+        let d = rounded_dc(dc);
+        for g in 0..4usize {
+            let lo = vcombine_s16(vdup_n_s16(d[4 * g]), vdup_n_s16(d[4 * g + 1]));
+            let hi = vcombine_s16(vdup_n_s16(d[4 * g + 2]), vdup_n_s16(d[4 * g + 3]));
+            for j in 0..4 {
+                let y = 4 * g + j;
+                let out = dc_row(ld16(&pred[y * pred_stride..]), lo, hi);
+                rec.write_row::<16>(y as isize, 0, &to16(out));
+            }
         }
     }
 }
@@ -542,38 +594,37 @@ fn idct_rec_i16x16_dc_to_view_neon(
 /// `IdctResAddPred_AArch64_neon`, with the widths the header explains.
 #[inline]
 pub fn idct_res_add_pred(pred: &mut PlaneCursorMut<'_>, rs: &[i16; 16]) {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { idct_res_add_pred_neon(pred, rs) }
+    idct_res_add_pred_neon(pred, rs, neon_token())
 }
 
 /// `WelsIDctT4Rec_AArch64_neon`, with the widths the header explains.
 #[inline]
 pub fn idct_t4_rec(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dct: &[i16; 16]) {
-    unsafe { idct_t4_rec_neon(rec, pred, dct) }
+    idct_t4_rec_neon(rec, pred, dct, neon_token())
 }
 
 /// [`idct_t4_rec`] in place on `rec`.
 #[inline]
 pub fn idct_t4_rec_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 16]) {
-    unsafe { idct_res_add_pred_neon(rec, dct) }
+    idct_res_add_pred_neon(rec, dct, neon_token())
 }
 
 /// `WelsIDctFourT4Rec_AArch64_neon`.
 #[inline]
 pub fn idct_four_t4_rec(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dct: &[i16; 64]) {
-    unsafe { idct_four_t4_rec_neon(rec, pred, dct) }
+    idct_four_t4_rec_neon(rec, pred, dct, neon_token())
 }
 
 /// [`idct_t4_rec_in_place`] over four 4x4 blocks forming an 8x8 quadrant.
 #[inline]
 pub fn idct_four_t4_rec_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 64]) {
-    unsafe { idct_four_t4_rec_in_place_neon(rec, dct) }
+    idct_four_t4_rec_in_place_neon(rec, dct, neon_token())
 }
 
 /// [`idct_t4_rec`]'s seam flavour.
 #[inline]
 pub fn idct_t4_rec_to_view(rec: &RecCursor<'_>, pred: &[u8], pred_stride: usize, dct: &[i16; 16]) {
-    unsafe { idct_t4_rec_to_view_neon(rec, pred, pred_stride, dct) }
+    idct_t4_rec_to_view_neon(rec, pred, pred_stride, dct, neon_token())
 }
 
 /// [`idct_four_t4_rec`]'s seam flavour.
@@ -584,19 +635,19 @@ pub fn idct_four_t4_rec_to_view(
     pred_stride: usize,
     dct: &[i16; 64],
 ) {
-    unsafe { idct_four_t4_rec_to_view_neon(rec, pred, pred_stride, dct) }
+    idct_four_t4_rec_to_view_neon(rec, pred, pred_stride, dct, neon_token())
 }
 
 /// [`idct_t4_rec_in_place`]'s seam flavour.
 #[inline]
 pub fn idct_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    unsafe { idct_t4_rec_in_place_view_neon(rec, dct) }
+    idct_t4_rec_in_place_view_neon(rec, dct, neon_token())
 }
 
 /// [`idct_four_t4_rec_in_place`]'s seam flavour.
 #[inline]
 pub fn idct_four_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    unsafe { idct_four_t4_rec_in_place_view_neon(rec, dct) }
+    idct_four_t4_rec_in_place_view_neon(rec, dct, neon_token())
 }
 
 /// The 16x16 luma inter reconstruction: four quadrants of [`idct_four_t4_rec_in_place_view`].
@@ -605,14 +656,14 @@ pub fn idct_t4_rec_on_mb_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 256]) {
     const QUADS: [(isize, isize); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for (k, &(dx, dy)) in QUADS.iter().enumerate() {
         let sub: &[i16; 64] = (&dct[k << 6..][..64]).try_into().expect("quadrant");
-        unsafe { idct_four_t4_rec_in_place_view_neon(&rec.advance(dx, dy), sub) }
+        idct_four_t4_rec_in_place_view_neon(&rec.advance(dx, dy), sub, neon_token());
     }
 }
 
 /// `WelsIDctRecI16x16Dc_AArch64_neon`.
 #[inline]
 pub fn idct_rec_i16x16_dc(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dc: &[i16; 16]) {
-    unsafe { idct_rec_i16x16_dc_neon(rec, pred, dc) }
+    idct_rec_i16x16_dc_neon(rec, pred, dc, neon_token())
 }
 
 /// [`idct_rec_i16x16_dc`]'s seam flavour.
@@ -623,7 +674,7 @@ pub fn idct_rec_i16x16_dc_to_view(
     pred_stride: usize,
     dc: &[i16; 16],
 ) {
-    unsafe { idct_rec_i16x16_dc_to_view_neon(rec, pred, pred_stride, dc) }
+    idct_rec_i16x16_dc_to_view_neon(rec, pred, pred_stride, dc, neon_token())
 }
 
 // ============================================================================

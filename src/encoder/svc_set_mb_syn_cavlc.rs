@@ -46,7 +46,7 @@ pub use crate::encoder::svc_encode_slice::SSlice;
 pub use crate::encoder::svc_encode_slice::SSliceHeader;
 pub use crate::encoder::svc_encode_slice::SSliceHeaderExt;
 pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
-use crate::safe::bits::BsWriter;
+use crate::safe::bits::{BsWriter, LocalBsWriter};
 
 // ============================================================================
 // Macroblock Type & Sub-MB Type Constants
@@ -147,7 +147,6 @@ pub use crate::encoder::vlc_encoder::g_kuiEncNcMapTable;
 // ============================================================================
 
 // One writer family, `vlc_encoder.rs`'s — `codec/common/inc/golomb_common.h`.
-use crate::encoder::md::MB_BLOCK4x4_NUM;
 use crate::encoder::svc_encode_slice::{SDynamicSlicingStack, current_layer_expect, layer_pps_ref};
 use crate::encoder::vlc_encoder::{
     BsGetBitsPos, g_kuiVlcCoeffToken, g_kuiVlcRunBefore, g_kuiVlcTotalZeros,
@@ -219,34 +218,35 @@ pub fn CavlcParamCal_c(
     iTotalZeros
 }
 
-/// Serializes transform coefficient block residuals into the CAVLC bitstream.
-pub fn WriteBlockResidualCavlc(
-    pFuncList: &SWelsFuncPtrList,
+#[inline(always)]
+fn write_empty_cavlc_block(iNC: i8, buf: &mut [u8], lbs: &mut LocalBsWriter) {
+    let nc_idx = g_kuiEncNcMapTable[iNC.clamp(0, 17) as usize] as usize;
+    let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][0][0];
+    lbs.write(buf, upCoeffToken[1] as i32, upCoeffToken[0] as u32);
+}
+
+fn write_nonzero_cavlc_block(
     pCoffLevel: &[i16],
     iEndIdx: i32,
-    iCalRunLevelFlag: i32,
     iResidualProperty: i32,
     iNC: i8,
     buf: &mut [u8],
-    pBs: &mut BsWriter,
+    lbs_out: &mut LocalBsWriter,
 ) -> i32 {
+    let max_end_idx = if CHROMA_DC == iResidualProperty {
+        3
+    } else {
+        15
+    };
+    assert!(
+        (0..=max_end_idx).contains(&iEndIdx),
+        "iEndIdx ({iEndIdx}) out of 0..={max_end_idx} for residual property {iResidualProperty}"
+    );
     let nc_idx = g_kuiEncNcMapTable[iNC.clamp(0, 17) as usize] as usize;
-    if iCalRunLevelFlag == 0 {
-        let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][0][0];
-        BsWriteBits(
-            buf,
-            &mut *pBs,
-            upCoeffToken[1] as i32,
-            upCoeffToken[0] as u32,
-        );
-        return ENC_RETURN_SUCCESS;
-    }
-
     let mut iLevel = [0i16; 16];
     let mut uiRun = [0u8; 16];
     let mut iTotalCoeffs = 0i32;
 
-    let _ = pFuncList;
     let iTotalZeros = crate::simd::kernels::quant::cavlc_param_cal(
         pCoffLevel,
         &mut uiRun,
@@ -255,57 +255,53 @@ pub fn WriteBlockResidualCavlc(
         iEndIdx,
     );
 
-    if iTotalCoeffs == 0 {
+    if iTotalCoeffs <= 0 {
         let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][0][0];
-        BsWriteBits(
-            buf,
-            &mut *pBs,
-            upCoeffToken[1] as i32,
-            upCoeffToken[0] as u32,
-        );
+        lbs_out.write(buf, upCoeffToken[1] as i32, upCoeffToken[0] as u32);
         return ENC_RETURN_SUCCESS;
     }
 
+    let total_coeffs_idx = (iTotalCoeffs as usize).min(16);
+    let levels = &iLevel[..total_coeffs_idx];
+    let runs = &uiRun[..total_coeffs_idx.saturating_sub(1)];
+
     let mut iTrailingOnes = 0i32;
     let mut uiSign = 0u32;
-    let iCount = if iTotalCoeffs > 3 { 3 } else { iTotalCoeffs };
-    for i in 0..iCount {
-        let lv = iLevel[i as usize];
-        if lv.abs() == 1 {
+    for &lv in &levels[..levels.len().min(3)] {
+        if lv.unsigned_abs() == 1 {
             iTrailingOnes += 1;
-            uiSign = (uiSign << 1) | ((lv < 0) as u32);
+            uiSign = (uiSign << 1) | u32::from(lv < 0);
         } else {
             break;
         }
     }
 
-    let total_coeffs_idx = (iTotalCoeffs as usize).min(16);
-    let trailing_ones_idx = (iTrailingOnes as usize).min(3);
+    let trailing_ones_idx = (iTrailingOnes as usize) & 3;
 
-    // Coeff token
+    let mut lbs = *lbs_out;
+
+    // Coeff token + trailing ones sign bits
     let upCoeffToken = g_kuiVlcCoeffToken[nc_idx][total_coeffs_idx][trailing_ones_idx];
-    let mut iValue = upCoeffToken[0] as u32;
-    let mut n = upCoeffToken[1] as i32;
-
-    // Trailing ones sign bits
-    n += iTrailingOnes;
-    iValue = (iValue << iTrailingOnes) + uiSign;
-    BsWriteBits(buf, &mut *pBs, n, iValue);
+    let mut iValue = ((upCoeffToken[0] as u32) << iTrailingOnes) + uiSign;
+    let mut n = (upCoeffToken[1] as i32) + iTrailingOnes;
+    lbs.write(buf, n, iValue);
 
     // Levels
-    let mut uiSuffixLength = if iTotalCoeffs > 10 && iTrailingOnes < 3 {
+    let mut uiSuffixLength = if total_coeffs_idx > 10 && trailing_ones_idx < 3 {
         1i32
     } else {
         0i32
     };
 
-    for i in iTrailingOnes..iTotalCoeffs {
-        let iVal = iLevel[i as usize] as i32;
+    let mut is_first_after_t1 = trailing_ones_idx < 3;
+    for &lv in &levels[trailing_ones_idx.min(levels.len())..] {
+        let iVal = lv as i32;
         let mut iLevelCode = (iVal - 1) * 2;
         let sign = (iLevelCode >> 31) as u32;
         iLevelCode = (iLevelCode ^ (sign as i32)) + ((sign as i32) << 1);
-        if i == iTrailingOnes && iTrailingOnes < 3 {
+        if is_first_after_t1 {
             iLevelCode -= 2;
+            is_first_after_t1 = false;
         }
 
         let mut iLevelPrefix = iLevelCode >> uiSuffixLength;
@@ -330,7 +326,7 @@ pub fn WriteBlockResidualCavlc(
 
         n = iLevelPrefix + 1 + iLevelSuffixSize;
         iValue = (1u32 << iLevelSuffixSize) | (iLevelSuffix as u32);
-        BsWriteBits(buf, &mut *pBs, n, iValue);
+        lbs.write(buf, n, iValue);
 
         if uiSuffixLength == 0 {
             uiSuffixLength += 1;
@@ -343,39 +339,59 @@ pub fn WriteBlockResidualCavlc(
 
     // Total zeros
     if iTotalCoeffs < iEndIdx + 1 {
-        if CHROMA_DC != iResidualProperty {
-            let upTotalZeros =
-                g_kuiVlcTotalZeros[(iTotalCoeffs as usize).min(15)][(iTotalZeros as usize).min(15)];
-            n = upTotalZeros[1] as i32;
-            iValue = upTotalZeros[0] as u32;
-            BsWriteBits(buf, &mut *pBs, n, iValue);
+        let upTotalZeros = if CHROMA_DC != iResidualProperty {
+            g_kuiVlcTotalZeros[(iTotalCoeffs as usize) & 15][(iTotalZeros as usize) & 15]
         } else {
-            let upTotalZeros = g_kuiVlcTotalZerosChromaDc[(iTotalCoeffs as usize).min(3)]
-                [(iTotalZeros as usize).min(3)];
-            n = upTotalZeros[1] as i32;
-            iValue = upTotalZeros[0] as u32;
-            BsWriteBits(buf, &mut *pBs, n, iValue);
-        }
+            g_kuiVlcTotalZerosChromaDc[(iTotalCoeffs as usize) & 3][(iTotalZeros as usize) & 3]
+        };
+        lbs.write(buf, upTotalZeros[1] as i32, upTotalZeros[0] as u32);
     }
 
     // Run before
     let mut iZerosLeft = iTotalZeros;
-    let mut i = 0i32;
-    while i + 1 < iTotalCoeffs && iZerosLeft > 0 {
-        let uirun = uiRun[i as usize] as usize;
+    for &run_val in runs {
+        if iZerosLeft <= 0 {
+            break;
+        }
+        let uirun = run_val as usize;
         // `set_mb_syn_cavlc.cpp:223` — `g_kuiZeroLeftMap[iZerosLeft]`, i.e.
         // saturate at 7.
         let iZeroLeft =
-            crate::encoder::vlc_encoder::g_kuiZeroLeftMap[(iZerosLeft as usize).min(15)] as usize;
-        let upRunBefore = g_kuiVlcRunBefore[iZeroLeft][uirun.min(14)];
-        n = upRunBefore[1] as i32;
-        iValue = upRunBefore[0] as u32;
-        BsWriteBits(buf, &mut *pBs, n, iValue);
+            crate::encoder::vlc_encoder::g_kuiZeroLeftMap[(iZerosLeft as usize) & 15] as usize;
+        let upRunBefore = g_kuiVlcRunBefore[iZeroLeft & 7][uirun.min(14)];
+        lbs.write(buf, upRunBefore[1] as i32, upRunBefore[0] as u32);
         iZerosLeft -= uirun as i32;
-        i += 1;
     }
 
+    *lbs_out = lbs;
     ENC_RETURN_SUCCESS
+}
+
+/// Serializes transform coefficient block residuals into the CAVLC bitstream.
+pub fn WriteBlockResidualCavlc(
+    pFuncList: &SWelsFuncPtrList,
+    pCoffLevel: &[i16],
+    iEndIdx: i32,
+    iCalRunLevelFlag: i32,
+    iResidualProperty: i32,
+    iNC: i8,
+    buf: &mut [u8],
+    pBs: &mut BsWriter,
+) -> i32 {
+    let _ = pFuncList;
+    if iCalRunLevelFlag == 0 {
+        let mut lbs = pBs.begin_local();
+        write_empty_cavlc_block(iNC, buf, &mut lbs);
+        pBs.end_local(lbs);
+        return ENC_RETURN_SUCCESS;
+    }
+
+    let mut lbs = pBs.begin_local();
+    let ret = write_nonzero_cavlc_block(pCoffLevel, iEndIdx, iResidualProperty, iNC, buf, &mut lbs);
+    if ret == ENC_RETURN_SUCCESS {
+        pBs.end_local(lbs);
+    }
+    ret
 }
 
 // ============================================================================
@@ -410,27 +426,25 @@ pub fn WelsSpatialWriteMbPred(
     };
 
     let mut sMvd: [SMVUnitXY; 2] = [SMVUnitXY::default(), SMVUnitXY::default()];
+    let mut lbs = pBs.begin_local();
 
     match uiMbType {
         MB_TYPE_INTRA4x4 => {
-            BsWriteUE(buf, &mut *pBs, (iMbOffset + 0) as u32);
+            lbs.write_ue(buf, (iMbOffset + 0) as u32);
 
-            for iMode in 0..MB_BLOCK4x4_NUM {
-                let flag = pMbCache.bPrevIntra4x4PredModeFlag[iMode];
-                BsWriteOneBit(buf, &mut *pBs, if flag { 1 } else { 0 });
+            for (&flag, &rem) in pMbCache
+                .bPrevIntra4x4PredModeFlag
+                .iter()
+                .zip(&pMbCache.iRemIntra4x4PredModeFlag)
+            {
+                lbs.write_one_bit(buf, u32::from(flag));
                 if !flag {
-                    BsWriteBits(
-                        buf,
-                        &mut *pBs,
-                        3,
-                        pMbCache.iRemIntra4x4PredModeFlag[iMode] as u32,
-                    );
+                    lbs.write(buf, 3, rem as u32);
                 }
             }
 
-            BsWriteUE(
+            lbs.write_ue(
                 buf,
-                &mut *pBs,
                 g_kiMapModeIntraChroma[pMbCache.uiChmaI8x8Mode as usize] as u32,
             );
         }
@@ -441,86 +455,62 @@ pub fn WelsSpatialWriteMbPred(
                 + (g_kiMapModeI16x16[pMbCache.uiLumaI16x16Mode as usize] as i32)
                 + (iCbpChroma << 2)
                 + (if iCbpLuma == 0 { 0 } else { 12 });
-            BsWriteUE(buf, &mut *pBs, val as u32);
+            lbs.write_ue(buf, val as u32);
 
-            BsWriteUE(
+            lbs.write_ue(
                 buf,
-                &mut *pBs,
                 g_kiMapModeIntraChroma[pMbCache.uiChmaI8x8Mode as usize] as u32,
             );
         }
 
         MB_TYPE_16x16 => {
-            BsWriteUE(buf, &mut *pBs, 0);
+            lbs.write_ue(buf, 0);
             sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
 
             if iNumRefIdxl0ActiveMinus1 > 0 {
-                BsWriteTE(
-                    buf,
-                    &mut *pBs,
-                    iNumRefIdxl0ActiveMinus1,
-                    pCurMb.iRefIndex[0] as u32,
-                );
+                lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[0] as u32);
             }
 
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
+            lbs.write_se(buf, sMvd[0].iMvX as i32);
+            lbs.write_se(buf, sMvd[0].iMvY as i32);
         }
 
         MB_TYPE_16x8 => {
-            BsWriteUE(buf, &mut *pBs, 1);
+            lbs.write_ue(buf, 1);
 
             sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
             sMvd[1].sDeltaMv(pCurMb.sMv[8], pMbCache.sMbMvp[1]);
 
             if iNumRefIdxl0ActiveMinus1 > 0 {
-                BsWriteTE(
-                    buf,
-                    &mut *pBs,
-                    iNumRefIdxl0ActiveMinus1,
-                    pCurMb.iRefIndex[0] as u32,
-                );
-                BsWriteTE(
-                    buf,
-                    &mut *pBs,
-                    iNumRefIdxl0ActiveMinus1,
-                    pCurMb.iRefIndex[2] as u32,
-                );
+                lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[0] as u32);
+                lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[2] as u32);
             }
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvX as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvY as i32);
+            lbs.write_se(buf, sMvd[0].iMvX as i32);
+            lbs.write_se(buf, sMvd[0].iMvY as i32);
+            lbs.write_se(buf, sMvd[1].iMvX as i32);
+            lbs.write_se(buf, sMvd[1].iMvY as i32);
         }
 
         MB_TYPE_8x16 => {
-            BsWriteUE(buf, &mut *pBs, 2);
+            lbs.write_ue(buf, 2);
 
             sMvd[0].sDeltaMv(pCurMb.sMv[0], pMbCache.sMbMvp[0]);
             sMvd[1].sDeltaMv(pCurMb.sMv[2], pMbCache.sMbMvp[1]);
 
             if iNumRefIdxl0ActiveMinus1 > 0 {
-                BsWriteTE(
-                    buf,
-                    &mut *pBs,
-                    iNumRefIdxl0ActiveMinus1,
-                    pCurMb.iRefIndex[0] as u32,
-                );
-                BsWriteTE(
-                    buf,
-                    &mut *pBs,
-                    iNumRefIdxl0ActiveMinus1,
-                    pCurMb.iRefIndex[1] as u32,
-                );
+                lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[0] as u32);
+                lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[1] as u32);
             }
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvX as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[0].iMvY as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvX as i32);
-            BsWriteSE(buf, &mut *pBs, sMvd[1].iMvY as i32);
+            lbs.write_se(buf, sMvd[0].iMvX as i32);
+            lbs.write_se(buf, sMvd[0].iMvY as i32);
+            lbs.write_se(buf, sMvd[1].iMvX as i32);
+            lbs.write_se(buf, sMvd[1].iMvY as i32);
         }
 
         _ => {}
     }
+
+    pBs.end_local(lbs);
 }
 
 /// Encodes 8x8 sub-macroblock prediction headers for CAVLC.
@@ -542,14 +532,15 @@ pub fn WelsSpatialWriteSubMbPred(
 
     let bSubRef0: bool;
     let mut kpScan4_idx = 0usize;
+    let mut lbs = pBs.begin_local();
 
     // `LD32 (pCurMb->pRefIndex)` — the four 8x8 reference indices as one word.
     let ref_idx_u32 = u32::from_ne_bytes(pCurMb.iRefIndex.map(|r| r as u8));
     if ref_idx_u32 == 0 {
-        BsWriteUE(buf, &mut *pBs, 4);
+        lbs.write_ue(buf, 4);
         bSubRef0 = false;
     } else {
-        BsWriteUE(buf, &mut *pBs, 3);
+        lbs.write_ue(buf, 3);
         bSubRef0 = true;
     }
 
@@ -557,7 +548,7 @@ pub fn WelsSpatialWriteSubMbPred(
     for i in 0..4 {
         match pCurMb.uiSubMbType[i] as u32 {
             SUB_MB_TYPE_8x8 => {
-                BsWriteUE(buf, &mut *pBs, 0);
+                lbs.write_ue(buf, 0);
             }
             // Every writer of `uiSubMbType` in this encoder sets `SUB_MB_TYPE_8x8`,
             // and upstream's only other writers are inside `#if 0` at
@@ -574,30 +565,10 @@ pub fn WelsSpatialWriteSubMbPred(
 
     // Get and write uiRefIndex and sMvd
     if iNumRefIdxl0ActiveMinus1 > 0 && bSubRef0 {
-        BsWriteTE(
-            buf,
-            &mut *pBs,
-            iNumRefIdxl0ActiveMinus1,
-            pCurMb.iRefIndex[0] as u32,
-        );
-        BsWriteTE(
-            buf,
-            &mut *pBs,
-            iNumRefIdxl0ActiveMinus1,
-            pCurMb.iRefIndex[1] as u32,
-        );
-        BsWriteTE(
-            buf,
-            &mut *pBs,
-            iNumRefIdxl0ActiveMinus1,
-            pCurMb.iRefIndex[2] as u32,
-        );
-        BsWriteTE(
-            buf,
-            &mut *pBs,
-            iNumRefIdxl0ActiveMinus1,
-            pCurMb.iRefIndex[3] as u32,
-        );
+        lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[0] as u32);
+        lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[1] as u32);
+        lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[2] as u32);
+        lbs.write_te(buf, iNumRefIdxl0ActiveMinus1, pCurMb.iRefIndex[3] as u32);
     }
 
     // Write sMvd
@@ -608,16 +579,8 @@ pub fn WelsSpatialWriteSubMbPred(
         let cur_mv = &pCurMb.sMv;
 
         if SUB_MB_TYPE_8x8 == uiSubMbType {
-            BsWriteSE(
-                buf,
-                &mut *pBs,
-                (cur_mv[s0].iMvX - pMbCache.sMbMvp[s0].iMvX) as i32,
-            );
-            BsWriteSE(
-                buf,
-                &mut *pBs,
-                (cur_mv[s0].iMvY - pMbCache.sMbMvp[s0].iMvY) as i32,
-            );
+            lbs.write_se(buf, (cur_mv[s0].iMvX - pMbCache.sMbMvp[s0].iMvX) as i32);
+            lbs.write_se(buf, (cur_mv[s0].iMvY - pMbCache.sMbMvp[s0].iMvY) as i32);
         } else {
             // See the `sub_mb_type` match above for the reachability argument.
             debug_assert_eq!(
@@ -628,6 +591,8 @@ pub fn WelsSpatialWriteSubMbPred(
         }
         kpScan4_idx += 4;
     }
+
+    pBs.end_local(lbs);
 }
 
 /// Checks bitstream buffer safety threshold.
@@ -765,6 +730,24 @@ pub fn WelsSpatialWriteMbSyn(
     }
 }
 
+#[inline(always)]
+fn write_cavlc_block(
+    pCoffLevel: &[i16],
+    iEndIdx: i32,
+    has_coeffs: bool,
+    iResidualProperty: i32,
+    iNC: i8,
+    buf: &mut [u8],
+    lbs: &mut LocalBsWriter,
+) -> i32 {
+    if !has_coeffs {
+        write_empty_cavlc_block(iNC, buf, lbs);
+        ENC_RETURN_SUCCESS
+    } else {
+        write_nonzero_cavlc_block(pCoffLevel, iEndIdx, iResidualProperty, iNC, buf, lbs)
+    }
+}
+
 /// Serializes all macroblock quantized transform coefficient residuals using CAVLC.
 ///
 /// Matches `int32_t WelsWriteMbResidual (SWelsFuncPtrList* pFuncList, SMbCache* sMbCacheInfo, SMB* pCurMb, SBitStringAux* pBs)`
@@ -775,6 +758,7 @@ pub fn WelsWriteMbResidual(
     buf: &mut [u8],
     pBs: &mut BsWriter,
 ) -> i32 {
+    let _ = pFuncList;
     let uiMbType = pCurMb.uiMbType;
     let kiCbpChroma = (pCurMb.uiCbp >> 4) as i32;
     let kiCbpLuma = (pCurMb.uiCbp & 0x0F) as i32;
@@ -784,21 +768,20 @@ pub fn WelsWriteMbResidual(
     let mut iA: i8;
     let mut iB: i8;
     let mut iC: i8;
+    let mut lbs = pBs.begin_local();
 
     if IS_INTRA16x16(uiMbType) {
         // DC luma
         iA = sMbCacheInfo.iNonZeroCoeffCount[8];
         iB = sMbCacheInfo.iNonZeroCoeffCount[1];
         iC = wels_non_zero_count_average(iA, iB);
-        if WriteBlockResidualCavlc(
-            pFuncList,
+        if write_nonzero_cavlc_block(
             &sMbCacheInfo.sDct.iLumaI16x16Dc[..],
             15,
-            1,
             LUMA_4x4,
             iC,
             buf,
-            pBs,
+            &mut lbs,
         ) != 0
         {
             return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -811,19 +794,14 @@ pub fn WelsWriteMbResidual(
                 iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
                 iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
                 iC = wels_non_zero_count_average(iA, iB);
-                if WriteBlockResidualCavlc(
-                    pFuncList,
+                if write_cavlc_block(
                     &sMbCacheInfo.sDct.iLumaBlock[i][..],
                     14,
-                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
-                        1
-                    } else {
-                        0
-                    },
+                    sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0,
                     LUMA_AC,
                     iC,
                     buf,
-                    pBs,
+                    &mut lbs,
                 ) != 0
                 {
                     return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -845,15 +823,14 @@ pub fn WelsWriteMbResidual(
                     iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
                     iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
                     iC = wels_non_zero_count_average(iA, iB);
-                    if WriteBlockResidualCavlc(
-                        pFuncList,
+                    if write_cavlc_block(
                         &sMbCacheInfo.sDct.iLumaBlock[i][..],
                         15,
-                        if kiA > 0 { 1 } else { 0 },
+                        kiA > 0,
                         LUMA_4x4,
                         iC,
                         buf,
-                        pBs,
+                        &mut lbs,
                     ) != 0
                     {
                         return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -862,15 +839,14 @@ pub fn WelsWriteMbResidual(
                     iA = kiA;
                     iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 7];
                     iC = wels_non_zero_count_average(iA, iB);
-                    if WriteBlockResidualCavlc(
-                        pFuncList,
+                    if write_cavlc_block(
                         &sMbCacheInfo.sDct.iLumaBlock[i + 1][..],
                         15,
-                        if kiB > 0 { 1 } else { 0 },
+                        kiB > 0,
                         LUMA_4x4,
                         iC,
                         buf,
-                        pBs,
+                        &mut lbs,
                     ) != 0
                     {
                         return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -879,15 +855,14 @@ pub fn WelsWriteMbResidual(
                     iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx + 7];
                     iB = kiA;
                     iC = wels_non_zero_count_average(iA, iB);
-                    if WriteBlockResidualCavlc(
-                        pFuncList,
+                    if write_cavlc_block(
                         &sMbCacheInfo.sDct.iLumaBlock[i + 2][..],
                         15,
-                        if kiC_val > 0 { 1 } else { 0 },
+                        kiC_val > 0,
                         LUMA_4x4,
                         iC,
                         buf,
-                        pBs,
+                        &mut lbs,
                     ) != 0
                     {
                         return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -896,15 +871,14 @@ pub fn WelsWriteMbResidual(
                     iA = kiC_val;
                     iB = kiB;
                     iC = wels_non_zero_count_average(iA, iB);
-                    if WriteBlockResidualCavlc(
-                        pFuncList,
+                    if write_cavlc_block(
                         &sMbCacheInfo.sDct.iLumaBlock[i + 3][..],
                         15,
-                        if kiD > 0 { 1 } else { 0 },
+                        kiD > 0,
                         LUMA_4x4,
                         iC,
                         buf,
-                        pBs,
+                        &mut lbs,
                     ) != 0
                     {
                         return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -919,29 +893,25 @@ pub fn WelsWriteMbResidual(
         // Chroma DC residual present
         // Each row is four coefficients and `iEndIdx` is 3, so the slice is the
         // exact extent.
-        if WriteBlockResidualCavlc(
-            pFuncList,
+        if write_nonzero_cavlc_block(
             &sMbCacheInfo.sDct.iChromaDc[0][..],
             3,
-            1,
             CHROMA_DC,
             CHROMA_DC_NC_OFFSET,
             buf,
-            pBs,
+            &mut lbs,
         ) != 0
         {
             return ENC_RETURN_VLCOVERFLOWFOUND;
         }
 
-        if WriteBlockResidualCavlc(
-            pFuncList,
+        if write_nonzero_cavlc_block(
             &sMbCacheInfo.sDct.iChromaDc[1][..],
             3,
-            1,
             CHROMA_DC,
             CHROMA_DC_NC_OFFSET,
             buf,
-            pBs,
+            &mut lbs,
         ) != 0
         {
             return ENC_RETURN_VLCOVERFLOWFOUND;
@@ -951,56 +921,30 @@ pub fn WelsWriteMbResidual(
         if (kiCbpChroma & 0x02) != 0 {
             let kCache48CountScan4Idx16base = &g_kuiCache48CountScan4Idx[16..];
             // Blocks 0..4 are Cb, 4..8 are Cr.
-            for i in 0..4 {
-                let iIdx = kCache48CountScan4Idx16base[i] as usize;
-                iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
-                iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
-                iC = wels_non_zero_count_average(iA, iB);
-                if WriteBlockResidualCavlc(
-                    pFuncList,
-                    &sMbCacheInfo.sDct.iChromaBlock[i][..],
-                    14,
-                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
-                        1
-                    } else {
-                        0
-                    },
-                    CHROMA_AC,
-                    iC,
-                    buf,
-                    pBs,
-                ) != 0
-                {
-                    return ENC_RETURN_VLCOVERFLOWFOUND;
-                }
-            }
-
-            // The Cr half.
-            for i in 0..4 {
-                let iIdx = 24 + (kCache48CountScan4Idx16base[i] as usize);
-                iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
-                iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
-                iC = wels_non_zero_count_average(iA, iB);
-                if WriteBlockResidualCavlc(
-                    pFuncList,
-                    &sMbCacheInfo.sDct.iChromaBlock[4 + i][..],
-                    14,
-                    if sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0 {
-                        1
-                    } else {
-                        0
-                    },
-                    CHROMA_AC,
-                    iC,
-                    buf,
-                    pBs,
-                ) != 0
-                {
-                    return ENC_RETURN_VLCOVERFLOWFOUND;
+            for (plane_idx, cache_offset) in [(0usize, 0usize), (4usize, 24usize)] {
+                for i in 0..4 {
+                    let iIdx = cache_offset + (kCache48CountScan4Idx16base[i] as usize);
+                    iA = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 1];
+                    iB = sMbCacheInfo.iNonZeroCoeffCount[iIdx - 8];
+                    iC = wels_non_zero_count_average(iA, iB);
+                    if write_cavlc_block(
+                        &sMbCacheInfo.sDct.iChromaBlock[plane_idx + i][..],
+                        14,
+                        sMbCacheInfo.iNonZeroCoeffCount[iIdx] > 0,
+                        CHROMA_AC,
+                        iC,
+                        buf,
+                        &mut lbs,
+                    ) != 0
+                    {
+                        return ENC_RETURN_VLCOVERFLOWFOUND;
+                    }
                 }
             }
         }
     }
+
+    pBs.end_local(lbs);
     0
 }
 
@@ -1143,5 +1087,86 @@ mod tests {
         let total_zeros = CavlcParamCal_c(&coeffs[..], &mut run, &mut level, &mut total_coeffs, 15);
         assert_eq!(total_coeffs, 3);
         assert_eq!(total_zeros, 1);
+    }
+
+    #[test]
+    fn test_write_block_residual_cavlc_empty_and_nonzero_blocks() {
+        let func_list = SWelsFuncPtrList::default();
+        let mut buf = [0u8; 64];
+        let mut bs = BsWriter::new();
+
+        // Empty flag: writes coeff_token(nc=0, total_coeff=0, t1=0) = 1 bit '1'.
+        let coeffs_empty = [0i16; 16];
+        let ret = WriteBlockResidualCavlc(
+            &func_list,
+            &coeffs_empty,
+            15,
+            0,
+            LUMA_4x4,
+            0,
+            &mut buf,
+            &mut bs,
+        );
+        assert_eq!(ret, ENC_RETURN_SUCCESS);
+        assert_eq!(bs.bits_pos(), 1);
+
+        // Flag 1 with all-zero coeffs: writes same 1-bit token.
+        let ret = WriteBlockResidualCavlc(
+            &func_list,
+            &coeffs_empty,
+            15,
+            1,
+            LUMA_4x4,
+            0,
+            &mut buf,
+            &mut bs,
+        );
+        assert_eq!(ret, ENC_RETURN_SUCCESS);
+        assert_eq!(bs.bits_pos(), 2);
+
+        // Non-zero Chroma DC block with trailing ones, levels, total_zeros, and run_before.
+        let chroma_dc = [4i16, 0, -1, 1];
+        let ret = WriteBlockResidualCavlc(
+            &func_list,
+            &chroma_dc,
+            3,
+            1,
+            CHROMA_DC,
+            CHROMA_DC_NC_OFFSET,
+            &mut buf,
+            &mut bs,
+        );
+        assert_eq!(ret, ENC_RETURN_SUCCESS);
+        assert!(bs.bits_pos() > 2);
+        assert!(!bs.is_overflow());
+    }
+
+    #[test]
+    fn test_write_block_residual_cavlc_vlc_overflow_leaves_writer_unchanged() {
+        let func_list = SWelsFuncPtrList::default();
+        let mut buf = [0u8; 64];
+        let mut bs = BsWriter::new();
+        bs.write_bits(&mut buf, 5, 0b10101);
+        let saved = bs;
+
+        // A single very large coefficient triggers `iLevelSuffix >> 11 != 0` -> ENC_RETURN_VLCOVERFLOWFOUND.
+        // C++ skips `CAVLC_BS_UNINIT(pBs)` on this return, so `bs` must remain untouched.
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 3000;
+        let ret =
+            WriteBlockResidualCavlc(&func_list, &coeffs, 15, 1, LUMA_4x4, 0, &mut buf, &mut bs);
+        assert_eq!(ret, ENC_RETURN_VLCOVERFLOWFOUND);
+        assert_eq!(bs, saved);
+    }
+
+    #[test]
+    #[should_panic(expected = "iEndIdx")]
+    fn test_write_block_residual_cavlc_rejects_out_of_range_end_idx() {
+        let func_list = SWelsFuncPtrList::default();
+        let mut buf = [0u8; 64];
+        let mut bs = BsWriter::new();
+        let coeffs = [1i16; 16];
+        let _ =
+            WriteBlockResidualCavlc(&func_list, &coeffs, 4, 1, CHROMA_DC, -1, &mut buf, &mut bs);
     }
 }

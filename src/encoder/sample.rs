@@ -207,8 +207,12 @@ pub fn WelsInitSampleSadFunc(pFuncList: &mut SWelsFuncPtrList, uiCpuFlag: u32) {
     // flag word would mean SIGILL on a pre-Haswell part. Asked once, when the table is
     // built, not per candidate scored.
     if (uiCpuFlag & WELS_CPU_AVX2) != 0 && crate::simd::has_avx2() {
-        sdf.pfSampleSad[BLOCK_16x16] = Some(|a, b| kernels::sad::sample_sad_16x16_avx2(a, b));
-        sdf.pfSampleSad[BLOCK_16x8] = Some(|a, b| kernels::sad::sample_sad_16x8_avx2(a, b));
+        if let Some(f) = kernels::sad::sample_sad_16x16_avx2() {
+            sdf.pfSampleSad[BLOCK_16x16] = Some(f);
+        }
+        if let Some(f) = kernels::sad::sample_sad_16x8_avx2() {
+            sdf.pfSampleSad[BLOCK_16x8] = Some(f);
+        }
     }
 }
 
@@ -274,8 +278,8 @@ mod tests {
         assert_eq!(satd_16x16(&ca, &cb), sum16x16);
     }
 
-    /// Every slot the mode-decision layer indexes must be filled, and the five
-    /// `Combined3` slots must be left `None` — `svc_base_layer_md` asserts on that.
+    /// Every slot the mode-decision layer indexes must be filled (`Combined3` intra
+    /// predictors are dispatched directly via `kernels::intra_pred`).
     #[test]
     fn init_fills_sad_and_satd_and_clears_combined3() {
         for flags in [0, WELS_CPU_SSE2, WELS_CPU_SSE2 | WELS_CPU_AVX2] {

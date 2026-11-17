@@ -13,27 +13,30 @@
 //! adding across each eight-lane half, the standard NEON movemask idiom.
 //!
 //! The result depends on `dct` only through that mask.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld8_i16, ld16};
+use super::neon_token;
 use crate::encoder::encode_mb_aux::KI_TRUN_TABLE;
+use crate::simd::{simd_entry, tokens::NeonToken};
 
-/// The 16-bit mask whose bit `i` is set when `dct[i]` is non-zero.
-#[inline]
-#[target_feature(enable = "neon")]
-fn nonzero_mask(dct: &[i16; 16]) -> u32 {
-    let z0 = vceqzq_s16(ld8_i16(&dct[..8]));
-    let z1 = vceqzq_s16(ld8_i16(&dct[8..]));
-    // `uzp1 .16b` keeps the low byte of every word lane: `0xFF` where the coefficient
-    // is zero. The compare is on the whole word, so no magnitude is lost on the way.
-    let zero = vuzp1q_u8(vreinterpretq_u8_u16(z0), vreinterpretq_u8_u16(z1));
-    let nonzero = vmvnq_u8(zero);
-    let bits = vandq_u8(nonzero, ld16(&POWERS));
-    let lo = vaddv_u8(vget_low_u8(bits)) as u32;
-    let hi = vaddv_u8(vget_high_u8(bits)) as u32;
-    lo | (hi << 8)
+simd_entry! {
+    /// The 16-bit mask whose bit `i` is set when `dct[i]` is non-zero.
+    #[target_feature(enable = "neon")]
+    fn nonzero_mask(dct: &[i16; 16], _token: NeonToken) -> u32 {
+        let z0 = vceqzq_s16(ld8_i16(&dct[..8]));
+        let z1 = vceqzq_s16(ld8_i16(&dct[8..]));
+        // `uzp1 .16b` keeps the low byte of every word lane: `0xFF` where the coefficient
+        // is zero. The compare is on the whole word, so no magnitude is lost on the way.
+        let zero = vuzp1q_u8(vreinterpretq_u8_u16(z0), vreinterpretq_u8_u16(z1));
+        let nonzero = vmvnq_u8(zero);
+        let bits = vandq_u8(nonzero, ld16(&POWERS));
+        let lo = vaddv_u8(vget_low_u8(bits)) as u32;
+        let hi = vaddv_u8(vget_high_u8(bits)) as u32;
+        lo | (hi << 8)
+    }
 }
 
 /// Bit `i & 7` set in lane `i`: the weights of the movemask reduce.
@@ -51,8 +54,7 @@ fn highest_set(m: u32) -> i32 {
 /// C++: `WelsCalculateSingleCtr4x4_c`, `codec/encoder/core/src/encode_mb_aux.cpp`.
 #[inline]
 pub fn calculate_single_ctr_4x4(dct: &[i16; 16]) -> i32 {
-    // SAFETY: NEON is baseline on aarch64.
-    let nz = unsafe { nonzero_mask(dct) };
+    let nz = nonzero_mask(dct, neon_token());
 
     let mut single_ctr: i32 = 0;
     // Skip the trailing zeros above the top coefficient.

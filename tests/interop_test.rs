@@ -26,29 +26,23 @@ fn find_cdylib() -> PathBuf {
     };
 
     let exe = std::env::current_exe().expect("failed to locate current test executable");
-    let deps_dir = exe.parent().expect("test executable has no parent dir");
-    let deps_cand = deps_dir.join(dylib_name);
-    let profile_cand = deps_dir.parent().map(|p| p.join(dylib_name));
+    // Cargo <= 1.99 places test binaries in `target/<profile>/deps/`, while Cargo >= 1.100's
+    // per-unit build-dir layout places them in `target/<profile>/build/<pkg>/<hash>/out/`.
+    // Walk ancestor directories up to `target/<profile>/` and pick the freshest `cdylib`.
+    let best = exe
+        .ancestors()
+        .skip(1)
+        .take(6)
+        .map(|dir| dir.join(dylib_name))
+        .filter(|cand| cand.exists())
+        .max_by_key(|cand| std::fs::metadata(cand).and_then(|m| m.modified()).ok());
 
-    match (deps_cand.exists(), profile_cand) {
-        (true, Some(prof)) if prof.exists() => {
-            let deps_mtime = std::fs::metadata(&deps_cand)
-                .and_then(|m| m.modified())
-                .ok();
-            let prof_mtime = std::fs::metadata(&prof).and_then(|m| m.modified()).ok();
-            if prof_mtime > deps_mtime {
-                prof
-            } else {
-                deps_cand
-            }
-        }
-        (true, _) => deps_cand,
-        (false, Some(prof)) if prof.exists() => prof,
-        _ => panic!(
-            "could not find {dylib_name} in {} or its parent directory",
-            deps_dir.display()
-        ),
-    }
+    best.unwrap_or_else(|| {
+        panic!(
+            "could not find {dylib_name} in any ancestor of {}",
+            exe.display()
+        )
+    })
 }
 
 #[cfg(any(feature = "c-api", feature = "cxx-api"))]

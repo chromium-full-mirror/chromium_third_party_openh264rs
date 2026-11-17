@@ -1327,9 +1327,26 @@ pub fn FillQpelLocationByFeatureValue_c(
     }
     let width = kiWidth as usize;
     let height = kiHeight as usize;
-    // Each value's cursor starts at its group base (`InitializeHashforFeature_c`)
-    // and is advanced once per position carrying that value, so the writes exactly
-    // fill `2 * times[value]` slots.
+    // Each value's cursor starts at its group base (`InitializeHashforFeature_c`,
+    // always even) and is advanced by 2 per position carrying that value, so the writes
+    // fill `2 * times[value]` slots. When `pFeatureValuePointerList` has the full 65536
+    // `u16` range, slicing to `[usize; 65536]` and `[u16; 2]` pairs removes two of the
+    // three per-pixel bounds checks and merges the `(qx, qy)` pair into a 32-bit store.
+    if let Some(ptrs) = pFeatureValuePointerList.first_chunk_mut::<65536>() {
+        let pairs = pLocationPointer.as_chunks_mut::<2>().0;
+        let mut iQpelY = 0u16;
+        for row in pFeatureOfBlock[..width * height].chunks_exact(width) {
+            for (x, &uiFeature) in row.iter().enumerate() {
+                let idx = uiFeature as usize;
+                let target = ptrs[idx];
+                debug_assert_eq!(target & 1, 0);
+                pairs[target >> 1] = [(x << 2) as u16, iQpelY];
+                ptrs[idx] = target + 2;
+            }
+            iQpelY = iQpelY.wrapping_add(4);
+        }
+        return;
+    }
     let mut iQpelY = 0u16;
     for row in pFeatureOfBlock[..width * height].chunks_exact(width) {
         for (x, &uiFeature) in row.iter().enumerate() {

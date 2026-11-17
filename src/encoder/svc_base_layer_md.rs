@@ -35,8 +35,8 @@
 //! `WelsMdBackgroundMbEnc`, `WelsMdInterSecondaryModesEnc`) and `svc_encode_slice.rs`
 //! (`WelsMdInterMbLoop`).
 //!
-//! The `sSampleDealingFuncs.pfIntra*Combined3` slots are never populated, so the
-//! scalar branches below are the ones that decide output bytes.
+//! The fused 3-mode `Combined3` intra kernels are dispatched directly through
+//! `kernels::intra_pred` rather than function-pointer slots on `sSampleDealingFuncs`.
 
 #![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
 #![forbid(unsafe_code)]
@@ -565,8 +565,35 @@ pub extern "C" fn WelsMdI4x4(
 
         let pfSampleSatd4x4 = pFunc.sSampleDealingFuncs.pfSampleSatd[BLOCK_4x4]
             .unwrap_or(|a, b| crate::encoder::sample::satd_4x4(a, b));
+        let cEnc = pEncPicture.plane(0).cursor(
+            kiMbOrgX + iCoordinateX as isize,
+            kiMbOrgY + iCoordinateY as isize,
+        );
 
-        for j in 0..iAvailCount {
+        let j_start = if iAvailCount >= 6 {
+            let kiBestOff = (iBestPredBufferNum << 4) as usize;
+            if let Some(pDst) = pMbCache
+                .sMemPredBlk4
+                .get_mut(kiBestOff..)
+                .and_then(|s| s.first_chunk_mut::<16>())
+            {
+                let (mode, cost) = kernels::intra_pred::intra_4x4_combined3_satd(
+                    pDst,
+                    &pCurDec,
+                    &cEnc,
+                    lambda[(iPredMode == 2) as usize],
+                    lambda[(iPredMode == 1) as usize],
+                    lambda[(iPredMode == 0) as usize],
+                );
+                iBestMode = mode as i32;
+                iBestCost = cost;
+            }
+            3
+        } else {
+            0
+        };
+
+        for j in j_start..iAvailCount {
             let iCurMode = kpAvailMode[j] as i32;
             debug_assert!((0..14).contains(&iCurMode));
 
@@ -585,15 +612,8 @@ pub extern "C" fn WelsMdI4x4(
                 pred_fn(pDst, &pCurDec);
             }
             let iCurCost = {
-                let cPred = RecCursor::over_owned(
-                    &mut pMbCache.sMemPredBlk4[((1 - iBestPredBufferNum) << 4) as usize..][..16],
-                    0,
-                    4,
-                );
-                let cEnc = pEncPicture.plane(0).cursor(
-                    kiMbOrgX + iCoordinateX as isize,
-                    kiMbOrgY + iCoordinateY as isize,
-                );
+                let cPred =
+                    RecCursor::over_owned(&mut pMbCache.sMemPredBlk4[kiDstOff..][..16], 0, 4);
                 pfSampleSatd4x4(&cPred, &cEnc)
             } + lambda
                 [(iPredMode == g_kiMapModeI4x4[iCurMode as usize] as i32) as usize];
@@ -890,13 +910,10 @@ pub extern "C" fn WelsMdIntraChroma(
     pMbCache: &mut SMbCache,
     iLambda: i32,
 ) -> i32 {
-    let mut iChmaIdx: usize = 0;
     let view = layer_rec_view_expect(pCurDqLayer);
 
-    let mut iBestCost = i32::MAX;
-
     let iOffset = (pMbCache.uiNeighborIntra & 0x07) as usize;
-    let iAvailCount = g_kiIntraChromaAvailMode[iOffset][4] as i32;
+    let iAvailCount = g_kiIntraChromaAvailMode[iOffset][4] as usize;
     let kpAvailMode = &g_kiIntraChromaAvailMode[iOffset];
 
     let pfMdCost8x8 = pFunc
@@ -907,9 +924,76 @@ pub extern "C" fn WelsMdIntraChroma(
     let (kiChrOrgX, kiChrOrgY) = pMbCache.SPicData.chroma_origin();
     let kiPredOff = mem_pred_chroma_off(pMbCache.uiMemPredLumaHalf);
 
+    let cRecCb = view.plane(1).cursor(kiChrOrgX, kiChrOrgY);
+    let cRecCr = view.plane(2).cursor(kiChrOrgX, kiChrOrgY);
+    let cEncCb = pEncPicture.plane(1).cursor(kiChrOrgX, kiChrOrgY);
+    let cEncCr = pEncPicture.plane(2).cursor(kiChrOrgX, kiChrOrgY);
+
+    if iAvailCount >= 3 {
+        let Some(pred0) = pMbCache
+            .sMemPredMb
+            .get_mut(kiPredOff..)
+            .and_then(|s| s.first_chunk_mut::<128>())
+        else {
+            return i32::MAX;
+        };
+        let bMdUsingSad =
+            pFunc.sSampleDealingFuncs.pfMdCost != crate::encoder::md::CostFamily::Satd;
+        let (mut iBestMode, mut iBestCost) = if bMdUsingSad {
+            kernels::intra_pred::intra_chroma_8x8_combined3_sad(
+                pred0, &cRecCb, &cEncCb, &cRecCr, &cEncCr, iLambda,
+            )
+        } else {
+            kernels::intra_pred::intra_chroma_8x8_combined3_satd(
+                pred0, &cRecCb, &cEncCb, &cRecCr, &cEncCr, iLambda,
+            )
+        };
+        let mut iBestHalf = 0u8;
+
+        if iAvailCount > 3 {
+            let iCurMode = kpAvailMode[3] as i32;
+            debug_assert!((0..7).contains(&iCurMode));
+            let kiDstOff = kiPredOff + 128;
+            if let Some(cb_dst) = pMbCache
+                .sMemPredMb
+                .get_mut(kiDstOff..)
+                .and_then(|s| s.first_chunk_mut::<64>())
+            {
+                ChromaPred(iCurMode, cb_dst, &cRecCb);
+            }
+            let mut iCurCost = pfMdCost8x8(
+                &RecCursor::over_owned(&mut pMbCache.sMemPredMb[kiDstOff..][..64], 0, 8),
+                &cEncCb,
+            );
+            if let Some(cr_dst) = pMbCache
+                .sMemPredMb
+                .get_mut(kiDstOff + 64..)
+                .and_then(|s| s.first_chunk_mut::<64>())
+            {
+                ChromaPred(iCurMode, cr_dst, &cRecCr);
+            }
+            iCurCost += pfMdCost8x8(
+                &RecCursor::over_owned(&mut pMbCache.sMemPredMb[kiDstOff + 64..][..64], 0, 8),
+                &cEncCr,
+            ) + iLambda
+                * BsSizeUE(g_kiMapModeIntraChroma[iCurMode as usize] as u32) as i32;
+            if iCurCost < iBestCost {
+                iBestMode = iCurMode as u8;
+                iBestCost = iCurCost;
+                iBestHalf = 1;
+            }
+        }
+
+        pMbCache.uiBestPredIntraChromaHalf = iBestHalf;
+        pMbCache.uiChmaI8x8Mode = iBestMode;
+        return iBestCost;
+    }
+
+    let mut iChmaIdx: usize = 0;
+    let mut iBestCost = i32::MAX;
     let mut iBestMode = kpAvailMode[0] as i32;
-    for i in 0..iAvailCount as usize {
-        let iCurMode = kpAvailMode[i] as i32;
+    for &mode in &kpAvailMode[..iAvailCount] {
+        let iCurMode = mode as i32;
         debug_assert!((0..7).contains(&iCurMode));
 
         // The chroma half's `iChmaIdx` 128-byte side of `sMemPredMb`; the Cr block
@@ -920,15 +1004,11 @@ pub extern "C" fn WelsMdIntraChroma(
             .get_mut(kiDstOff..)
             .and_then(|s| s.first_chunk_mut::<64>())
         {
-            ChromaPred(
-                iCurMode,
-                cb_dst,
-                &view.plane(1).cursor(kiChrOrgX, kiChrOrgY),
-            ); //Cb
+            ChromaPred(iCurMode, cb_dst, &cRecCb); //Cb
         }
         let mut iCurCost = pfMdCost8x8(
             &RecCursor::over_owned(&mut pMbCache.sMemPredMb[kiDstOff..][..64], 0, 8),
-            &pEncPicture.plane(1).cursor(kiChrOrgX, kiChrOrgY),
+            &cEncCb,
         );
 
         if let Some(cr_dst) = pMbCache
@@ -936,15 +1016,11 @@ pub extern "C" fn WelsMdIntraChroma(
             .get_mut(kiDstOff + 64..)
             .and_then(|s| s.first_chunk_mut::<64>())
         {
-            ChromaPred(
-                iCurMode,
-                cr_dst,
-                &view.plane(2).cursor(kiChrOrgX, kiChrOrgY),
-            ); //Cr
+            ChromaPred(iCurMode, cr_dst, &cRecCr); //Cr
         }
         iCurCost += pfMdCost8x8(
             &RecCursor::over_owned(&mut pMbCache.sMemPredMb[kiDstOff + 64..][..64], 0, 8),
-            &pEncPicture.plane(2).cursor(kiChrOrgX, kiChrOrgY),
+            &cEncCr,
         ) + iLambda * BsSizeUE(g_kiMapModeIntraChroma[iCurMode as usize] as u32) as i32;
         if iCurCost < iBestCost {
             iBestMode = iCurMode;

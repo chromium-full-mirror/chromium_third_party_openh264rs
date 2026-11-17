@@ -23,13 +23,15 @@
 //! four rows at `ext` offsets. Nor has it `V` predictors at any size, a `DC_128` fill,
 //! or a 4x4 `H`: those are broadcasts and fills, and
 //! `every_kernel_here_reaches_an_intrinsic` lists them as scalar by design.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
-use super::lanes::{ld8, ld8_i16, ld16, low4, to8, to16};
+use super::lanes::{ld8, ld8_i16, ld16, low4, st16, to8, to16};
+use super::neon_token;
 use crate::encoder::rec_view::RecCursor;
-use crate::safe::plane::{PlaneCursorMut, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursorMut, RefSamples};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // The enc/dec seam
@@ -116,12 +118,12 @@ fn high4(v: uint8x8_t) -> [u8; 4] {
 // 16x16 luma
 // ============================================================================
 
+simd_entry! {
 /// `WelsI16x16LumaPredDc_AArch64_neon` and its `DcTop`/`DcLeft` siblings, and the
 /// `DC_128` case: `uaddlv` over whichever edges are in scope, then the rounding the
 /// asm does with `uqrshrn`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i16x16_dc_mean<S: RefSamples>(src: &S, use_top: bool, use_left: bool) -> u8 {
+fn i16x16_dc_mean<S: RefSamples>(src: &S, use_top: bool, use_left: bool, _t: NeonToken) -> u8 {
     let sum_top = if use_top {
         vaddlvq_u8(ld16(&src.row_n::<16>(-1, 0))) as i32
     } else {
@@ -146,9 +148,8 @@ fn i16x16_dc_mean<S: RefSamples>(src: &S, use_top: bool, use_left: bool) -> u8 {
 /// by `[5, 10 .. 40]` and `saddlv`s — that is `5 * Σ (i + 1) (top[8 + i] - top[6 - i])`
 /// — and `sqrshrn #6`s it to `b`; the same down the left edge gives `c`; `a` is
 /// `(top[15] + left[15]) << 4`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i16x16_plane_coeffs<S: RefSamples>(src: &S) -> (i16, i16, i16) {
+fn i16x16_plane_coeffs<S: RefSamples>(src: &S, _t: NeonToken) -> (i16, i16, i16) {
     let top_lo = ld8(&src.row_n::<8>(-1, -1));
     let top_hi = ld8(&src.row_n::<8>(-1, 8));
     let left_lo = left8(src, -1);
@@ -166,9 +167,8 @@ fn i16x16_plane_coeffs<S: RefSamples>(src: &S) -> (i16, i16, i16) {
 
 /// The fill half: `a + b (x - 7) + c (y - 7)`, `sqrshrun #5` per row, `c` added
 /// between rows.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i16x16_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16) {
+fn i16x16_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16, _t: NeonToken) {
     let base = vdupq_n_s16(a.wrapping_sub(c.wrapping_mul(7)));
     let mut lo = vmlaq_n_s16(base, ld8_i16(&INTRA_M7_TO_0), b);
     let mut hi = vmlaq_n_s16(base, ld8_i16(&INTRA_P1_TO_8), b);
@@ -188,9 +188,8 @@ fn i16x16_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16) {
 /// `WelsIChromaPredDc_AArch64_neon`: `[top | left]` in one register, `uaddlp` twice
 /// to the four quadrant sums, `urshr` for the four means, as the two row values the
 /// top and bottom halves are filled with.
-#[inline]
 #[target_feature(enable = "neon")]
-fn chroma_dc_rows<S: RefSamples>(src: &S) -> ([u8; 8], [u8; 8]) {
+fn chroma_dc_rows<S: RefSamples>(src: &S, _t: NeonToken) -> ([u8; 8], [u8; 8]) {
     let both = vcombine_u8(ld8(&src.row_n::<8>(-1, 0)), left8(src, 0));
     let sums = vpaddlq_u16(vpaddlq_u8(both)); // [T0, T1, L0, L1]
     let tl = vadd_u32(vget_low_u32(sums), vget_high_u32(sums)); // [T0 + L0, T1 + L1]
@@ -209,9 +208,8 @@ fn chroma_dc_rows<S: RefSamples>(src: &S) -> ([u8; 8], [u8; 8]) {
 /// `WelsDecoderIChromaPredDcTop_AArch64_neon`: the neighbour row above folded to its
 /// two 4-sample means by `uaddlp` twice and `urshr #2` — the one row every line of the
 /// block is filled with.
-#[inline]
 #[target_feature(enable = "neon")]
-fn chroma_dc_top_row<S: RefSamples>(src: &S) -> [u8; 8] {
+fn chroma_dc_top_row<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 8] {
     let top = ld8(&src.row_n::<8>(-1, 0));
     let sums = vpaddl_u16(vpaddl_u8(top)); // [T0, T1]
     let means = vrshr_n_u32::<2>(sums);
@@ -225,9 +223,8 @@ fn chroma_dc_top_row<S: RefSamples>(src: &S) -> [u8; 8] {
 /// `[t2 t1 t0 t-1 | l2 l1 l0 l-1]` subtracted from `[t4 .. t7 | l4 .. l7]`,
 /// `mul` by `[17, 34, 51, 68]` twice over, `saddlp`/`addp` to `17H` and `17V`,
 /// `sqrshrn #5`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn chroma_plane_coeffs<S: RefSamples>(src: &S) -> (i16, i16, i16) {
+fn chroma_plane_coeffs<S: RefSamples>(src: &S, _t: NeonToken) -> (i16, i16, i16) {
     let t = src.row_n::<4>(-1, -1);
     let t4 = src.row_n::<4>(-1, 4);
     let inner = ld8(&[
@@ -261,9 +258,8 @@ fn chroma_plane_coeffs<S: RefSamples>(src: &S) -> (i16, i16, i16) {
 }
 
 /// The fill half: `a + b (x - 3) + c (y - 3)`, `sqrshrun #5`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn chroma_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16) {
+fn chroma_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16, _t: NeonToken) {
     let base = vdupq_n_s16(a.wrapping_sub(c.wrapping_mul(3)));
     let mut row = vmlaq_n_s16(base, ld8_i16(&INTRA_M3_TO_P4), b);
     let cv = vdupq_n_s16(c);
@@ -278,9 +274,8 @@ fn chroma_plane_fill<O: PredOut>(out: &mut O, a: i16, b: i16, c: i16) {
 // ============================================================================
 
 /// `WelsI4x4LumaPredDc_AArch64_neon`: `[top | left]`, `uaddlv`, `uqrshrn #3`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_dc<S: RefSamples>(src: &S) -> u8 {
+fn i4x4_dc<S: RefSamples>(src: &S, _t: NeonToken) -> u8 {
     let t = src.row_n::<4>(-1, 0);
     let both = ld8(&[
         t[0],
@@ -297,9 +292,8 @@ fn i4x4_dc<S: RefSamples>(src: &S) -> u8 {
 
 /// `WelsI4x4LumaPredDDL_AArch64_neon`: `t0 + 2 t1 + t2` and on, with `t7` repeated
 /// past the end, `uqrshrn #2`, rows at `ext` offsets 0 to 3.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_ddl<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_ddl<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let top = ld8(&src.row_n::<8>(-1, 0));
     let last = vdup_lane_u8::<7>(top);
     let t1 = vext_u8::<1>(top, last);
@@ -316,9 +310,8 @@ fn i4x4_ddl<S: RefSamples>(src: &S) -> [u8; 16] {
 
 /// `WelsI4x4LumaPredVL_AArch64_neon`: the two-tap and three-tap lines of the top
 /// row, rows 0 and 1 from their heads and rows 2 and 3 one lane along.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_vl<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_vl<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let top = ld8(&src.row_n::<8>(-1, 0));
     let pairs = vaddl_u8(vext_u8::<1>(top, top), top);
     let two = vqrshrn_n_u16::<1>(pairs);
@@ -333,9 +326,8 @@ fn i4x4_vl<S: RefSamples>(src: &S) -> [u8; 16] {
 }
 
 /// `WelsI4x4LumaPredVR_AArch64_neon` on the line `l2 l1 l0 lt t0 t1 t2 t3`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_vr<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_vr<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let t = src.row_n::<4>(-1, 0);
     let line = ld8(&[
         src.at(-1, 2),
@@ -358,9 +350,8 @@ fn i4x4_vr<S: RefSamples>(src: &S) -> [u8; 16] {
 }
 
 /// `WelsI4x4LumaPredHU_AArch64_neon` on the line `l3 l3 l3 l3 l0 l1 l2 l3`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_hu<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_hu<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let l3 = src.at(-1, 3);
     let line = ld8(&[
         l3,
@@ -382,9 +373,8 @@ fn i4x4_hu<S: RefSamples>(src: &S) -> [u8; 16] {
 }
 
 /// `WelsI4x4LumaPredHD_AArch64_neon` on the line `l3 l2 l1 l0 lt t0 t1 t2`.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_hd<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_hd<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let t = src.row_n::<4>(-1, 0);
     let line = ld8(&[
         src.at(-1, 3),
@@ -421,9 +411,8 @@ fn i4x4_hd<S: RefSamples>(src: &S) -> [u8; 16] {
 /// `q` register and the three taps are `ext`s of it. Reading the three taps as three
 /// overlapping eight-byte loads instead costs a store-forwarding stall apiece, enough
 /// to put the kernel level with the scalar loop.
-#[inline]
 #[target_feature(enable = "neon")]
-fn i4x4_ddr<S: RefSamples>(src: &S) -> [u8; 16] {
+fn i4x4_ddr<S: RefSamples>(src: &S, _t: NeonToken) -> [u8; 16] {
     let t = src.row_n::<4>(-1, 0);
     let line = ld16(&[
         src.at(-1, 3),
@@ -456,6 +445,7 @@ fn i4x4_ddr<S: RefSamples>(src: &S) -> [u8; 16] {
         low4(vext_u8::<1>(f, f)),
         low4(f),
     )
+}
 }
 
 /// Four packed rows into a `PredOut`.
@@ -506,29 +496,28 @@ pub fn dec_i16x16_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 /// `WelsI16x16LumaPredDc_AArch64_neon`.
 #[inline]
 pub fn enc_i16x16_luma_pred_dc(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    let mean = unsafe { i16x16_dc_mean(rec, true, true) };
+    let mean = i16x16_dc_mean(rec, true, true, neon_token());
     fill_rows(&mut Packed::<16>(pred), 16, &[mean; 16])
 }
 
 /// `WelsDecoderI16x16LumaPredDc_AArch64_neon`.
 #[inline]
 pub fn dec_i16x16_luma_pred_dc(pred: &mut PlaneCursorMut<'_>) {
-    let mean = unsafe { i16x16_dc_mean(pred, true, true) };
+    let mean = i16x16_dc_mean(pred, true, true, neon_token());
     fill_rows(pred, 16, &[mean; 16])
 }
 
 /// `WelsDecoderI16x16LumaPredDcTop_AArch64_neon`.
 #[inline]
 pub fn dec_i16x16_luma_pred_dc_top(pred: &mut PlaneCursorMut<'_>) {
-    let mean = unsafe { i16x16_dc_mean(pred, true, false) };
+    let mean = i16x16_dc_mean(pred, true, false, neon_token());
     fill_rows(pred, 16, &[mean; 16])
 }
 
 /// `WelsDecoderI16x16LumaPredDcLeft_AArch64_neon`.
 #[inline]
 pub fn dec_i16x16_luma_pred_dc_left(pred: &mut PlaneCursorMut<'_>) {
-    let mean = unsafe { i16x16_dc_mean(pred, false, true) };
+    let mean = i16x16_dc_mean(pred, false, true, neon_token());
     fill_rows(pred, 16, &[mean; 16])
 }
 
@@ -541,15 +530,17 @@ pub fn dec_i16x16_luma_pred_dc_na(pred: &mut PlaneCursorMut<'_>) {
 /// `WelsI16x16LumaPredPlane_AArch64_neon`.
 #[inline]
 pub fn enc_i16x16_luma_pred_plane(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
-    let (a, b, c) = unsafe { i16x16_plane_coeffs(rec) };
-    unsafe { i16x16_plane_fill(&mut Packed::<16>(pred), a, b, c) }
+    let tok = neon_token();
+    let (a, b, c) = i16x16_plane_coeffs(rec, tok);
+    i16x16_plane_fill(&mut Packed::<16>(pred), a, b, c, tok)
 }
 
 /// `WelsDecoderI16x16LumaPredPlane_AArch64_neon`.
 #[inline]
 pub fn dec_i16x16_luma_pred_plane(pred: &mut PlaneCursorMut<'_>) {
-    let (a, b, c) = unsafe { i16x16_plane_coeffs(pred) };
-    unsafe { i16x16_plane_fill(pred, a, b, c) }
+    let tok = neon_token();
+    let (a, b, c) = i16x16_plane_coeffs(pred, tok);
+    i16x16_plane_fill(pred, a, b, c, tok)
 }
 
 /// `WelsIChromaPredV_AArch64_neon`.
@@ -587,7 +578,7 @@ pub fn dec_chroma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 /// `WelsIChromaPredDc_AArch64_neon`.
 #[inline]
 pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
-    let (top, bot) = unsafe { chroma_dc_rows(rec) };
+    let (top, bot) = chroma_dc_rows(rec, neon_token());
     let out = &mut Packed::<8>(pred);
     for dy in 0..4 {
         out.put(dy, &top);
@@ -600,7 +591,7 @@ pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 /// `WelsDecoderIChromaPredDc_AArch64_neon`.
 #[inline]
 pub fn dec_chroma_pred_dc(pred: &mut PlaneCursorMut<'_>) {
-    let (top, bot) = unsafe { chroma_dc_rows(pred) };
+    let (top, bot) = chroma_dc_rows(pred, neon_token());
     for dy in 0..4 {
         pred.put(dy, &top);
     }
@@ -612,22 +603,24 @@ pub fn dec_chroma_pred_dc(pred: &mut PlaneCursorMut<'_>) {
 /// `WelsDecoderIChromaPredDcTop_AArch64_neon`.
 #[inline]
 pub fn dec_chroma_pred_dc_top(pred: &mut PlaneCursorMut<'_>) {
-    let row = unsafe { chroma_dc_top_row(pred) };
+    let row = chroma_dc_top_row(pred, neon_token());
     fill_rows(pred, 8, &row)
 }
 
 /// `WelsIChromaPredPlane_AArch64_neon`.
 #[inline]
 pub fn enc_chroma_pred_plane(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
-    let (a, b, c) = unsafe { chroma_plane_coeffs(rec) };
-    unsafe { chroma_plane_fill(&mut Packed::<8>(pred), a, b, c) }
+    let tok = neon_token();
+    let (a, b, c) = chroma_plane_coeffs(rec, tok);
+    chroma_plane_fill(&mut Packed::<8>(pred), a, b, c, tok)
 }
 
 /// `WelsDecoderIChromaPredPlane_AArch64_neon`.
 #[inline]
 pub fn dec_chroma_pred_plane(pred: &mut PlaneCursorMut<'_>) {
-    let (a, b, c) = unsafe { chroma_plane_coeffs(pred) };
-    unsafe { chroma_plane_fill(pred, a, b, c) }
+    let tok = neon_token();
+    let (a, b, c) = chroma_plane_coeffs(pred, tok);
+    chroma_plane_fill(pred, a, b, c, tok)
 }
 
 /// The 4x4 vertical fill, which upstream keeps in C.
@@ -665,92 +658,92 @@ pub fn dec_i4x4_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 /// `WelsI4x4LumaPredDc_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_dc(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    let mean = unsafe { i4x4_dc(rec) };
+    let mean = i4x4_dc(rec, neon_token());
     *pred = [mean; 16];
 }
 
 /// `WelsDecoderI4x4LumaPredDc_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_dc(pred: &mut PlaneCursorMut<'_>) {
-    let mean = unsafe { i4x4_dc(pred) };
+    let mean = i4x4_dc(pred, neon_token());
     fill_rows(pred, 4, &[mean; 4])
 }
 
 /// `WelsI4x4LumaPredDDL_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_ddl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_ddl(rec) };
+    *pred = i4x4_ddl(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredDDL_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_ddl(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_ddl(&*pred) };
+    let rows = i4x4_ddl(&*pred, neon_token());
     put4(pred, &rows)
 }
 
 /// Diagonal down-right; see the header.
 #[inline]
 pub fn enc_i4x4_luma_pred_ddr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_ddr(rec) };
+    *pred = i4x4_ddr(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredDDR_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_ddr(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_ddr(&*pred) };
+    let rows = i4x4_ddr(&*pred, neon_token());
     put4(pred, &rows)
 }
 
 /// `WelsI4x4LumaPredVR_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_vr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_vr(rec) };
+    *pred = i4x4_vr(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredVR_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_vr(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_vr(&*pred) };
+    let rows = i4x4_vr(&*pred, neon_token());
     put4(pred, &rows)
 }
 
 /// `WelsI4x4LumaPredHD_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_hd(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_hd(rec) };
+    *pred = i4x4_hd(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredHD_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_hd(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_hd(&*pred) };
+    let rows = i4x4_hd(&*pred, neon_token());
     put4(pred, &rows)
 }
 
 /// `WelsI4x4LumaPredVL_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_vl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_vl(rec) };
+    *pred = i4x4_vl(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredVL_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_vl(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_vl(&*pred) };
+    let rows = i4x4_vl(&*pred, neon_token());
     put4(pred, &rows)
 }
 
 /// `WelsI4x4LumaPredHU_AArch64_neon`.
 #[inline]
 pub fn enc_i4x4_luma_pred_hu(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
-    *pred = unsafe { i4x4_hu(rec) };
+    *pred = i4x4_hu(rec, neon_token());
 }
 
 /// `WelsDecoderI4x4LumaPredHU_AArch64_neon`.
 #[inline]
 pub fn dec_i4x4_luma_pred_hu(pred: &mut PlaneCursorMut<'_>) {
-    let rows = unsafe { i4x4_hu(&*pred) };
+    let rows = i4x4_hu(&*pred, neon_token());
     put4(pred, &rows)
 }
 
@@ -761,74 +754,746 @@ pub fn intra_16x16_combined3_sad(
     enc: &RecCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
-    unsafe {
-        let top = rec.row_n::<16>(-1, 0);
-        let v_vec = vld1q_u8(top.as_ptr());
-        let sum_top = vaddlvq_u8(v_vec) as i32;
+    intra_16x16_combined3_sad_neon(pred, rec, enc, lambda, neon_token())
+}
 
-        let mut left = [0u8; 16];
-        let mut sum_left: i32 = 0;
-        for y in 0..16 {
-            let val = rec.at(-1, y as isize);
-            left[y] = val;
-            sum_left += val as i32;
-        }
+simd_entry! {
+#[target_feature(enable = "neon")]
+fn intra_16x16_combined3_sad_neon(
+    pred: &mut [u8; 256],
+    rec: &RecCursor<'_>,
+    enc: &RecCursor<'_>,
+    lambda: i32,
+    _t: NeonToken,
+) -> (u8, i32) {
+    let top = rec.row_n::<16>(-1, 0);
+    let v_vec = ld16(&top);
+    let sum_top = vaddlvq_u8(v_vec) as i32;
 
-        let dc_val = ((16 + sum_top + sum_left) >> 5) as u8;
-        let dc_vec = vdupq_n_u8(dc_val);
-
-        let mut acc_v = vdupq_n_u32(0);
-        let mut acc_h = vdupq_n_u32(0);
-        let mut acc_dc = vdupq_n_u32(0);
-
-        for y in 0..16 {
-            let enc_row = enc.row_n::<16>(y as isize, 0);
-            let enc_vec = vld1q_u8(enc_row.as_ptr());
-            let h_vec = vdupq_n_u8(left[y]);
-
-            let diff_v = vabdq_u8(enc_vec, v_vec);
-            let diff_h = vabdq_u8(enc_vec, h_vec);
-            let diff_dc = vabdq_u8(enc_vec, dc_vec);
-
-            acc_v = vpadalq_u16(acc_v, vpaddlq_u8(diff_v));
-            acc_h = vpadalq_u16(acc_h, vpaddlq_u8(diff_h));
-            acc_dc = vpadalq_u16(acc_dc, vpaddlq_u8(diff_dc));
-        }
-
-        let sad_v = vaddvq_u32(acc_v) as i32;
-        let sad_h = vaddvq_u32(acc_h) as i32;
-        let sad_dc = vaddvq_u32(acc_dc) as i32;
-
-        let cost_v = sad_v + lambda * 1;
-        let cost_h = sad_h + lambda * 3;
-        let cost_dc = sad_dc + lambda * 3;
-
-        let (best_mode, best_cost) = if cost_dc < cost_h && cost_dc < cost_v {
-            (2u8, cost_dc)
-        } else if cost_h < cost_v {
-            (1u8, cost_h)
-        } else {
-            (0u8, cost_v)
-        };
-
-        match best_mode {
-            0 => {
-                for y in 0..16 {
-                    pred[y * 16..(y + 1) * 16].copy_from_slice(&top);
-                }
-            }
-            1 => {
-                for y in 0..16 {
-                    pred[y * 16..(y + 1) * 16].fill(left[y]);
-                }
-            }
-            _ => {
-                pred.fill(dc_val);
-            }
-        }
-
-        (best_mode, best_cost)
+    let mut left = [0u8; 16];
+    let mut sum_left: i32 = 0;
+    for y in 0..16 {
+        let val = rec.at(-1, y as isize);
+        left[y] = val;
+        sum_left += val as i32;
     }
+
+    let dc_val = ((16 + sum_top + sum_left) >> 5) as u8;
+    let dc_vec = vdupq_n_u8(dc_val);
+
+    let mut acc_v = vdupq_n_u32(0);
+    let mut acc_h = vdupq_n_u32(0);
+    let mut acc_dc = vdupq_n_u32(0);
+
+    for y in 0..16 {
+        let enc_row = enc.row_n::<16>(y as isize, 0);
+        let enc_vec = ld16(&enc_row);
+        let h_vec = vdupq_n_u8(left[y]);
+
+        let diff_v = vabdq_u8(enc_vec, v_vec);
+        let diff_h = vabdq_u8(enc_vec, h_vec);
+        let diff_dc = vabdq_u8(enc_vec, dc_vec);
+
+        acc_v = vpadalq_u16(acc_v, vpaddlq_u8(diff_v));
+        acc_h = vpadalq_u16(acc_h, vpaddlq_u8(diff_h));
+        acc_dc = vpadalq_u16(acc_dc, vpaddlq_u8(diff_dc));
+    }
+
+    let sad_v = vaddvq_u32(acc_v) as i32;
+    let sad_h = vaddvq_u32(acc_h) as i32;
+    let sad_dc = vaddvq_u32(acc_dc) as i32;
+
+    let cost_v = sad_v + lambda * 1;
+    let cost_h = sad_h + lambda * 3;
+    let cost_dc = sad_dc + lambda * 3;
+
+    let (best_mode, best_cost) = if cost_dc < cost_h && cost_dc < cost_v {
+        (2u8, cost_dc)
+    } else if cost_h < cost_v {
+        (1u8, cost_h)
+    } else {
+        (0u8, cost_v)
+    };
+
+    match best_mode {
+        0 => {
+            for y in 0..16 {
+                pred[y * 16..(y + 1) * 16].copy_from_slice(&top);
+            }
+        }
+        1 => {
+            for y in 0..16 {
+                pred[y * 16..(y + 1) * 16].fill(left[y]);
+            }
+        }
+        _ => {
+            pred.fill(dc_val);
+        }
+    }
+
+    (best_mode, best_cost)
+}
+}
+
+type EncSpan<'a> = <RecCursor<'a> as RefSamples>::Span<'a>;
+
+#[inline(always)]
+fn hdm4_u8x4_scaled4(x: [u8; 4]) -> (i32, [i16; 4]) {
+    let (x0, x1, x2, x3) = (x[0] as i32, x[1] as i32, x[2] as i32, x[3] as i32);
+    let p0 = x0 + x1;
+    let p1 = x2 + x3;
+    let m0 = x0 - x1;
+    let m1 = x2 - x3;
+    let sum = p0 + p1;
+    (
+        sum,
+        [
+            (sum << 2) as i16,
+            ((p0 - p1) << 2) as i16,
+            ((m0 + m1) << 2) as i16,
+            ((m0 - m1) << 2) as i16,
+        ],
+    )
+}
+
+#[inline(always)]
+fn chroma_dc_quads_from_sums(t0: i32, t1: i32, l0: i32, l1: i32) -> ([u8; 4], [u8; 8], [u8; 8]) {
+    let m0 = ((t0 + l0 + 4) >> 3) as u8;
+    let m1 = ((t1 + 2) >> 2) as u8;
+    let m2 = ((l1 + 2) >> 2) as u8;
+    let m3 = ((t1 + l1 + 4) >> 3) as u8;
+    (
+        [m0, m1, m2, m3],
+        [m0, m0, m0, m0, m1, m1, m1, m1],
+        [m2, m2, m2, m2, m3, m3, m3, m3],
+    )
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn hdm4_neon(
+    a0: int16x8_t,
+    a1: int16x8_t,
+    a2: int16x8_t,
+    a3: int16x8_t,
+) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+    let p0 = vaddq_s16(a0, a1);
+    let p1 = vaddq_s16(a2, a3);
+    let m0 = vsubq_s16(a0, a1);
+    let m1 = vsubq_s16(a2, a3);
+    (
+        vaddq_s16(p0, p1),
+        vsubq_s16(p0, p1),
+        vaddq_s16(m0, m1),
+        vsubq_s16(m0, m1),
+    )
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn transpose_4x4x2_neon(
+    v0: int16x8_t,
+    v1: int16x8_t,
+    v2: int16x8_t,
+    v3: int16x8_t,
+) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+    let t01_lo = vzip1q_s16(v0, v1);
+    let t23_lo = vzip1q_s16(v2, v3);
+    let t01_hi = vzip2q_s16(v0, v1);
+    let t23_hi = vzip2q_s16(v2, v3);
+
+    let c01_b0 = vreinterpretq_s16_s32(vzip1q_s32(
+        vreinterpretq_s32_s16(t01_lo),
+        vreinterpretq_s32_s16(t23_lo),
+    ));
+    let c23_b0 = vreinterpretq_s16_s32(vzip2q_s32(
+        vreinterpretq_s32_s16(t01_lo),
+        vreinterpretq_s32_s16(t23_lo),
+    ));
+    let c01_b1 = vreinterpretq_s16_s32(vzip1q_s32(
+        vreinterpretq_s32_s16(t01_hi),
+        vreinterpretq_s32_s16(t23_hi),
+    ));
+    let c23_b1 = vreinterpretq_s16_s32(vzip2q_s32(
+        vreinterpretq_s32_s16(t01_hi),
+        vreinterpretq_s32_s16(t23_hi),
+    ));
+
+    (
+        vreinterpretq_s16_s64(vzip1q_s64(
+            vreinterpretq_s64_s16(c01_b0),
+            vreinterpretq_s64_s16(c01_b1),
+        )),
+        vreinterpretq_s16_s64(vzip2q_s64(
+            vreinterpretq_s64_s16(c01_b0),
+            vreinterpretq_s64_s16(c01_b1),
+        )),
+        vreinterpretq_s16_s64(vzip1q_s64(
+            vreinterpretq_s64_s16(c23_b0),
+            vreinterpretq_s64_s16(c23_b1),
+        )),
+        vreinterpretq_s16_s64(vzip2q_s64(
+            vreinterpretq_s64_s16(c23_b0),
+            vreinterpretq_s64_s16(c23_b1),
+        )),
+    )
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn top_v_subs_neon(top8: uint8x8_t) -> (int16x8_t, int16x8_t, int16x8_t, int16x8_t) {
+    let top_w4 = vreinterpretq_s16_u16(vshll_n_u8::<2>(top8));
+    let zero = vdupq_n_s16(0);
+    let (c0, c1, c2, c3) = transpose_4x4x2_neon(top_w4, zero, zero, zero);
+    hdm4_neon(c0, c1, c2, c3)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn satd_strip_8x4_neon(
+    e0: &[u8],
+    e1: &[u8],
+    e2: &[u8],
+    e3: &[u8],
+    v_subs: (int16x8_t, int16x8_t, int16x8_t, int16x8_t),
+    h_vec: int16x8_t,
+    dc_vec: int16x8_t,
+) -> (uint16x8_t, uint16x8_t, uint16x8_t) {
+    let r0 = vreinterpretq_s16_u16(vmovl_u8(ld8(e0)));
+    let r1 = vreinterpretq_s16_u16(vmovl_u8(ld8(e1)));
+    let r2 = vreinterpretq_s16_u16(vmovl_u8(ld8(e2)));
+    let r3 = vreinterpretq_s16_u16(vmovl_u8(ld8(e3)));
+
+    let (v0, v1, v2, v3) = hdm4_neon(r0, r1, r2, r3);
+    let (c0, c1, c2, c3) = transpose_4x4x2_neon(v0, v1, v2, v3);
+    let (f0, f1, f2, f3) = hdm4_neon(c0, c1, c2, c3);
+
+    let dv0 = vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f0, v_subs.0)));
+    let dv1 = vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f1, v_subs.1)));
+    let dv2 = vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f2, v_subs.2)));
+    let dv3 = vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f3, v_subs.3)));
+    let strip_v = vaddq_u16(vaddq_u16(dv0, dv1), vaddq_u16(dv2, dv3));
+
+    let abs123 = vaddq_u16(
+        vreinterpretq_u16_s16(vabsq_s16(f1)),
+        vaddq_u16(
+            vreinterpretq_u16_s16(vabsq_s16(f2)),
+            vreinterpretq_u16_s16(vabsq_s16(f3)),
+        ),
+    );
+    let strip_h = vaddq_u16(
+        vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f0, h_vec))),
+        abs123,
+    );
+    let strip_dc = vaddq_u16(
+        vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f0, dc_vec))),
+        abs123,
+    );
+
+    (strip_v, strip_h, strip_dc)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn write_chroma_pred_neon(
+    dst: &mut [u8; 64],
+    mode: u8,
+    top: &[u8; 8],
+    left: &[u8; 8],
+    dc_top: &[u8; 8],
+    dc_bot: &[u8; 8],
+) {
+    match mode {
+        2 => {
+            let v = vcombine_u8(ld8(top), ld8(top));
+            for chunk in dst.as_chunks_mut::<16>().0 {
+                st16(chunk, v);
+            }
+        }
+        1 => {
+            for (step, chunk) in dst.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                let y = step * 2;
+                st16(
+                    chunk,
+                    vcombine_u8(vdup_n_u8(left[y]), vdup_n_u8(left[y + 1])),
+                );
+            }
+        }
+        _ => {
+            let vt = vcombine_u8(ld8(dc_top), ld8(dc_top));
+            let vb = vcombine_u8(ld8(dc_bot), ld8(dc_bot));
+            st16(&mut dst[..16], vt);
+            st16(&mut dst[16..32], vt);
+            st16(&mut dst[32..48], vb);
+            st16(&mut dst[48..64], vb);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn intra_4x4_combined3_satd(
+    pred: &mut [u8; 16],
+    rec: &RecCursor<'_>,
+    enc: &RecCursor<'_>,
+    lambda_dc: i32,
+    lambda_h: i32,
+    lambda_v: i32,
+) -> (i8, i32) {
+    intra_4x4_combined3_satd_neon(pred, rec, enc, lambda_dc, lambda_h, lambda_v, neon_token())
+}
+
+#[inline(always)]
+pub fn intra_16x16_combined3_satd(
+    pred: &mut [u8; 256],
+    rec: &RecCursor<'_>,
+    enc: &RecCursor<'_>,
+    lambda: i32,
+) -> (u8, i32) {
+    intra_16x16_combined3_satd_neon(pred, rec, enc, lambda, neon_token())
+}
+
+#[inline(always)]
+pub fn intra_chroma_8x8_combined3_sad(
+    pred_cb_cr: &mut [u8; 128],
+    rec_cb: &RecCursor<'_>,
+    enc_cb: &RecCursor<'_>,
+    rec_cr: &RecCursor<'_>,
+    enc_cr: &RecCursor<'_>,
+    lambda: i32,
+) -> (u8, i32) {
+    intra_chroma_8x8_combined3_sad_neon(
+        pred_cb_cr,
+        rec_cb,
+        enc_cb,
+        rec_cr,
+        enc_cr,
+        lambda,
+        neon_token(),
+    )
+}
+
+#[inline(always)]
+pub fn intra_chroma_8x8_combined3_satd(
+    pred_cb_cr: &mut [u8; 128],
+    rec_cb: &RecCursor<'_>,
+    enc_cb: &RecCursor<'_>,
+    rec_cr: &RecCursor<'_>,
+    enc_cr: &RecCursor<'_>,
+    lambda: i32,
+) -> (u8, i32) {
+    intra_chroma_8x8_combined3_satd_neon(
+        pred_cb_cr,
+        rec_cb,
+        enc_cb,
+        rec_cr,
+        enc_cr,
+        lambda,
+        neon_token(),
+    )
+}
+
+simd_entry! {
+#[target_feature(enable = "neon")]
+fn intra_4x4_combined3_satd_neon(
+    pred: &mut [u8; 16],
+    rec: &RecCursor<'_>,
+    enc: &RecCursor<'_>,
+    lambda_dc: i32,
+    lambda_h: i32,
+    lambda_v: i32,
+    _t: NeonToken,
+) -> (i8, i32) {
+    let top = rec.row_n::<4>(-1, 0);
+    let left = [
+        rec.at(-1, 0),
+        rec.at(-1, 1),
+        rec.at(-1, 2),
+        rec.at(-1, 3),
+    ];
+    let enc_span = enc.span::<4, 4>(0, 0);
+    let (q, st) = enc_span.all_1_quad::<4>();
+    let (e0, e1, e2, e3) = EncSpan::read_quad::<4>(q, st);
+
+    let r02 = vreinterpretq_s16_u16(vmovl_u8(ld8(&[
+        e0[0], e0[1], e0[2], e0[3], e2[0], e2[1], e2[2], e2[3],
+    ])));
+    let r13 = vreinterpretq_s16_u16(vmovl_u8(ld8(&[
+        e1[0], e1[1], e1[2], e1[3], e3[0], e3[1], e3[2], e3[3],
+    ])));
+
+    let s01 = vaddq_s16(r02, r13);
+    let d01 = vsubq_s16(r02, r13);
+    let vlo = vreinterpretq_s16_s64(vzip1q_s64(vreinterpretq_s64_s16(s01), vreinterpretq_s64_s16(d01)));
+    let vhi = vreinterpretq_s16_s64(vzip2q_s64(vreinterpretq_s64_s16(s01), vreinterpretq_s64_s16(d01)));
+    let v02 = vaddq_s16(vlo, vhi);
+    let v13 = vsubq_s16(vlo, vhi);
+
+    let t0 = vzip1q_s16(v02, v13);
+    let t1 = vzip2q_s16(v02, v13);
+    let col01 = vreinterpretq_s16_s32(vzip1q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t1)));
+    let col23 = vreinterpretq_s16_s32(vzip2q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t1)));
+
+    let cs = vaddq_s16(col01, col23);
+    let cd = vsubq_s16(col01, col23);
+    let clo = vreinterpretq_s16_s64(vzip1q_s64(vreinterpretq_s64_s16(cs), vreinterpretq_s64_s16(cd)));
+    let chi = vreinterpretq_s16_s64(vzip2q_s64(vreinterpretq_s64_s16(cs), vreinterpretq_s64_s16(cd)));
+    let f02 = vaddq_s16(clo, chi);
+    let f13 = vsubq_s16(clo, chi);
+
+    let (sum_t, ht) = hdm4_u8x4_scaled4(top);
+    let (sum_l, hl) = hdm4_u8x4_scaled4(left);
+    let dc_val = ((sum_t + sum_l + 4) >> 3) as u8;
+
+    let v_sub_02 = ld8_i16(&[ht[0], 0, 0, 0, ht[1], 0, 0, 0]);
+    let v_sub_13 = ld8_i16(&[ht[2], 0, 0, 0, ht[3], 0, 0, 0]);
+    let h_sub_02 = ld8_i16(&[hl[0], hl[1], hl[2], hl[3], 0, 0, 0, 0]);
+    let dc_sub_02 = ld8_i16(&[(dc_val as i16) << 4, 0, 0, 0, 0, 0, 0, 0]);
+
+    let abs_f13 = vreinterpretq_u16_s16(vabsq_s16(f13));
+    let vec_v = vaddq_u16(
+        vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f02, v_sub_02))),
+        vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f13, v_sub_13))),
+    );
+    let vec_h = vaddq_u16(vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f02, h_sub_02))), abs_f13);
+    let vec_dc = vaddq_u16(vreinterpretq_u16_s16(vabsq_s16(vsubq_s16(f02, dc_sub_02))), abs_f13);
+
+    let satd_v = (vaddlvq_u16(vec_v) >> 1) as i32;
+    let satd_h = (vaddlvq_u16(vec_h) >> 1) as i32;
+    let satd_dc = (vaddlvq_u16(vec_dc) >> 1) as i32;
+
+    let cost_dc = satd_dc + lambda_dc;
+    let cost_h = satd_h + lambda_h;
+    let cost_v = satd_v + lambda_v;
+
+    if cost_dc <= cost_h && cost_dc <= cost_v {
+        st16(pred, vdupq_n_u8(dc_val));
+        (2i8, cost_dc)
+    } else if cost_h <= cost_v {
+        *pred = pack4([left[0]; 4], [left[1]; 4], [left[2]; 4], [left[3]; 4]);
+        (1i8, cost_h)
+    } else {
+        st16(pred, vreinterpretq_u8_u32(vdupq_n_u32(u32::from_ne_bytes(top))));
+        (0i8, cost_v)
+    }
+}
+
+#[target_feature(enable = "neon")]
+fn intra_16x16_combined3_satd_neon(
+    pred: &mut [u8; 256],
+    rec: &RecCursor<'_>,
+    enc: &RecCursor<'_>,
+    lambda: i32,
+    _t: NeonToken,
+) -> (u8, i32) {
+    let top = rec.row_n::<16>(-1, 0);
+    let v_vec = ld16(&top);
+    let sum_top = vaddlvq_u8(v_vec) as i32;
+
+    let mut left = [0u8; 16];
+    for (y, dst) in left.iter_mut().enumerate() {
+        *dst = rec.at(-1, y as isize);
+    }
+    let enc_span = enc.span::<16, 16>(0, 0);
+    let (qs, st) = enc_span.all_4_quads::<16>();
+
+    let mut sum_left = 0i32;
+    let mut h_vecs = [vdupq_n_s16(0); 4];
+    for s in 0..4 {
+        let (sl, hl) = hdm4_u8x4_scaled4([
+            left[s * 4],
+            left[s * 4 + 1],
+            left[s * 4 + 2],
+            left[s * 4 + 3],
+        ]);
+        sum_left += sl;
+        h_vecs[s] = ld8_i16(&[hl[0], hl[1], hl[2], hl[3], hl[0], hl[1], hl[2], hl[3]]);
+    }
+
+    let dc_val = ((16 + sum_top + sum_left) >> 5) as u8;
+    let dc16 = (dc_val as i16) << 4;
+    let dc_vec = ld8_i16(&[dc16, 0, 0, 0, dc16, 0, 0, 0]);
+    let v_subs_lo = top_v_subs_neon(vget_low_u8(v_vec));
+    let v_subs_hi = top_v_subs_neon(vget_high_u8(v_vec));
+
+    let mut acc_v = vdupq_n_u16(0);
+    let mut acc_h = vdupq_n_u16(0);
+    let mut acc_dc = vdupq_n_u16(0);
+
+    for (s, q) in qs.into_iter().enumerate() {
+        let (e0, e1, e2, e3) = EncSpan::read_quad::<16>(q, st);
+        let (sv0, sh0, sdc0) =
+            satd_strip_8x4_neon(&e0[..8], &e1[..8], &e2[..8], &e3[..8], v_subs_lo, h_vecs[s], dc_vec);
+        let (sv1, sh1, sdc1) =
+            satd_strip_8x4_neon(&e0[8..], &e1[8..], &e2[8..], &e3[8..], v_subs_hi, h_vecs[s], dc_vec);
+        acc_v = vaddq_u16(acc_v, vaddq_u16(sv0, sv1));
+        acc_h = vaddq_u16(acc_h, vaddq_u16(sh0, sh1));
+        acc_dc = vaddq_u16(acc_dc, vaddq_u16(sdc0, sdc1));
+    }
+
+    let satd_v = (vaddlvq_u16(acc_v) >> 1) as i32;
+    let satd_h = (vaddlvq_u16(acc_h) >> 1) as i32;
+    let satd_dc = (vaddlvq_u16(acc_dc) >> 1) as i32;
+
+    let cost_v = satd_v + lambda;
+    let cost_h = satd_h + lambda * 3;
+    let cost_dc = satd_dc + lambda * 3;
+
+    let (best_mode, best_cost) = if cost_dc < cost_h && cost_dc < cost_v {
+        (2u8, cost_dc)
+    } else if cost_h < cost_v {
+        (1u8, cost_h)
+    } else {
+        (0u8, cost_v)
+    };
+
+    match best_mode {
+        0 => {
+            for chunk in pred.as_chunks_mut::<16>().0 {
+                st16(chunk, v_vec);
+            }
+        }
+        1 => {
+            for (y, chunk) in pred.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                st16(chunk, vdupq_n_u8(left[y]));
+            }
+        }
+        _ => {
+            let dv = vdupq_n_u8(dc_val);
+            for chunk in pred.as_chunks_mut::<16>().0 {
+                st16(chunk, dv);
+            }
+        }
+    }
+
+    (best_mode, best_cost)
+}
+
+#[target_feature(enable = "neon")]
+fn intra_chroma_8x8_combined3_sad_neon(
+    pred_cb_cr: &mut [u8; 128],
+    rec_cb: &RecCursor<'_>,
+    enc_cb: &RecCursor<'_>,
+    rec_cr: &RecCursor<'_>,
+    enc_cr: &RecCursor<'_>,
+    lambda: i32,
+    _t: NeonToken,
+) -> (u8, i32) {
+    let top_cb = rec_cb.row_n::<8>(-1, 0);
+    let top_cr = rec_cr.row_n::<8>(-1, 0);
+    let mut left_cb = [0u8; 8];
+    let mut left_cr = [0u8; 8];
+    for y in 0..8 {
+        left_cb[y] = rec_cb.at(-1, y as isize);
+        left_cr[y] = rec_cr.at(-1, y as isize);
+    }
+    let enc_cb_span = enc_cb.span::<8, 8>(0, 0);
+    let enc_cr_span = enc_cr.span::<8, 8>(0, 0);
+    let ([qb0, qb1], stb) = enc_cb_span.all_2_quads::<8>();
+    let ([qr0, qr1], str_) = enc_cr_span.all_2_quads::<8>();
+
+    let (dc_top_cb, dc_bot_cb) = chroma_dc_rows(rec_cb, _t);
+    let (dc_top_cr, dc_bot_cr) = chroma_dc_rows(rec_cr, _t);
+
+    let v_vec = vcombine_u8(ld8(&top_cb), ld8(&top_cr));
+    let dc_top_vec = vcombine_u8(ld8(&dc_top_cb), ld8(&dc_top_cr));
+    let dc_bot_vec = vcombine_u8(ld8(&dc_bot_cb), ld8(&dc_bot_cr));
+
+    let mut acc_v = vdupq_n_u32(0);
+    let mut acc_h = vdupq_n_u32(0);
+    let mut acc_dc = vdupq_n_u32(0);
+
+    let (cb0, cb1, cb2, cb3) = EncSpan::read_quad::<8>(qb0, stb);
+    let (cr0, cr1, cr2, cr3) = EncSpan::read_quad::<8>(qr0, str_);
+    for (y, (cb_r, cr_r)) in [(cb0, cr0), (cb1, cr1), (cb2, cr2), (cb3, cr3)]
+        .into_iter()
+        .enumerate()
+    {
+        let enc_vec = vcombine_u8(ld8(&cb_r), ld8(&cr_r));
+        let h_vec = vcombine_u8(vdup_n_u8(left_cb[y]), vdup_n_u8(left_cr[y]));
+        acc_v = vpadalq_u16(acc_v, vpaddlq_u8(vabdq_u8(enc_vec, v_vec)));
+        acc_h = vpadalq_u16(acc_h, vpaddlq_u8(vabdq_u8(enc_vec, h_vec)));
+        acc_dc = vpadalq_u16(acc_dc, vpaddlq_u8(vabdq_u8(enc_vec, dc_top_vec)));
+    }
+
+    let (cb4, cb5, cb6, cb7) = EncSpan::read_quad::<8>(qb1, stb);
+    let (cr4, cr5, cr6, cr7) = EncSpan::read_quad::<8>(qr1, str_);
+    for (k, (cb_r, cr_r)) in [(cb4, cr4), (cb5, cr5), (cb6, cr6), (cb7, cr7)]
+        .into_iter()
+        .enumerate()
+    {
+        let y = k + 4;
+        let enc_vec = vcombine_u8(ld8(&cb_r), ld8(&cr_r));
+        let h_vec = vcombine_u8(vdup_n_u8(left_cb[y]), vdup_n_u8(left_cr[y]));
+        acc_v = vpadalq_u16(acc_v, vpaddlq_u8(vabdq_u8(enc_vec, v_vec)));
+        acc_h = vpadalq_u16(acc_h, vpaddlq_u8(vabdq_u8(enc_vec, h_vec)));
+        acc_dc = vpadalq_u16(acc_dc, vpaddlq_u8(vabdq_u8(enc_vec, dc_bot_vec)));
+    }
+
+    let sad_v = vaddvq_u32(acc_v) as i32;
+    let sad_h = vaddvq_u32(acc_h) as i32;
+    let sad_dc = vaddvq_u32(acc_dc) as i32;
+
+    let cost_dc = sad_dc + lambda;
+    let cost_h = sad_h + lambda * 3;
+    let cost_v = sad_v + lambda * 3;
+
+    let (best_mode, best_cost) = if cost_dc < cost_h && cost_dc < cost_v {
+        (0u8, cost_dc)
+    } else if cost_h < cost_v {
+        (1u8, cost_h)
+    } else {
+        (2u8, cost_v)
+    };
+
+    let (cb_dst, cr_dst) = pred_cb_cr.split_at_mut(64);
+    write_chroma_pred_neon(
+        cb_dst.first_chunk_mut::<64>().expect("cb 64"),
+        best_mode,
+        &top_cb,
+        &left_cb,
+        &dc_top_cb,
+        &dc_bot_cb,
+    );
+    write_chroma_pred_neon(
+        cr_dst.first_chunk_mut::<64>().expect("cr 64"),
+        best_mode,
+        &top_cr,
+        &left_cr,
+        &dc_top_cr,
+        &dc_bot_cr,
+    );
+
+    (best_mode, best_cost)
+}
+
+#[target_feature(enable = "neon")]
+fn intra_chroma_8x8_combined3_satd_neon(
+    pred_cb_cr: &mut [u8; 128],
+    rec_cb: &RecCursor<'_>,
+    enc_cb: &RecCursor<'_>,
+    rec_cr: &RecCursor<'_>,
+    enc_cr: &RecCursor<'_>,
+    lambda: i32,
+    _t: NeonToken,
+) -> (u8, i32) {
+    let top_cb = rec_cb.row_n::<8>(-1, 0);
+    let top_cr = rec_cr.row_n::<8>(-1, 0);
+    let mut left_cb = [0u8; 8];
+    let mut left_cr = [0u8; 8];
+    for y in 0..8 {
+        left_cb[y] = rec_cb.at(-1, y as isize);
+        left_cr[y] = rec_cr.at(-1, y as isize);
+    }
+    let enc_cb_span = enc_cb.span::<8, 8>(0, 0);
+    let enc_cr_span = enc_cr.span::<8, 8>(0, 0);
+    let ([qb0, qb1], stb) = enc_cb_span.all_2_quads::<8>();
+    let ([qr0, qr1], str_) = enc_cr_span.all_2_quads::<8>();
+
+    let (t0_cb, _) = hdm4_u8x4_scaled4([top_cb[0], top_cb[1], top_cb[2], top_cb[3]]);
+    let (t1_cb, _) = hdm4_u8x4_scaled4([top_cb[4], top_cb[5], top_cb[6], top_cb[7]]);
+    let (l0_cb, hl0_cb) = hdm4_u8x4_scaled4([left_cb[0], left_cb[1], left_cb[2], left_cb[3]]);
+    let (l1_cb, hl1_cb) = hdm4_u8x4_scaled4([left_cb[4], left_cb[5], left_cb[6], left_cb[7]]);
+    let (dc_cb, dc_top_cb, dc_bot_cb) = chroma_dc_quads_from_sums(t0_cb, t1_cb, l0_cb, l1_cb);
+
+    let (t0_cr, _) = hdm4_u8x4_scaled4([top_cr[0], top_cr[1], top_cr[2], top_cr[3]]);
+    let (t1_cr, _) = hdm4_u8x4_scaled4([top_cr[4], top_cr[5], top_cr[6], top_cr[7]]);
+    let (l0_cr, hl0_cr) = hdm4_u8x4_scaled4([left_cr[0], left_cr[1], left_cr[2], left_cr[3]]);
+    let (l1_cr, hl1_cr) = hdm4_u8x4_scaled4([left_cr[4], left_cr[5], left_cr[6], left_cr[7]]);
+    let (dc_cr, dc_top_cr, dc_bot_cr) = chroma_dc_quads_from_sums(t0_cr, t1_cr, l0_cr, l1_cr);
+
+    let v_subs_cb = top_v_subs_neon(ld8(&top_cb));
+    let v_subs_cr = top_v_subs_neon(ld8(&top_cr));
+
+    let (cb0, cb1, cb2, cb3) = EncSpan::read_quad::<8>(qb0, stb);
+    let (cb4, cb5, cb6, cb7) = EncSpan::read_quad::<8>(qb1, stb);
+    let (sv_b0, sh_b0, sdc_b0) = satd_strip_8x4_neon(
+        &cb0,
+        &cb1,
+        &cb2,
+        &cb3,
+        v_subs_cb,
+        ld8_i16(&[
+            hl0_cb[0], hl0_cb[1], hl0_cb[2], hl0_cb[3], hl0_cb[0], hl0_cb[1], hl0_cb[2], hl0_cb[3],
+        ]),
+        ld8_i16(&[(dc_cb[0] as i16) << 4, 0, 0, 0, (dc_cb[1] as i16) << 4, 0, 0, 0]),
+    );
+    let (sv_b1, sh_b1, sdc_b1) = satd_strip_8x4_neon(
+        &cb4,
+        &cb5,
+        &cb6,
+        &cb7,
+        v_subs_cb,
+        ld8_i16(&[
+            hl1_cb[0], hl1_cb[1], hl1_cb[2], hl1_cb[3], hl1_cb[0], hl1_cb[1], hl1_cb[2], hl1_cb[3],
+        ]),
+        ld8_i16(&[(dc_cb[2] as i16) << 4, 0, 0, 0, (dc_cb[3] as i16) << 4, 0, 0, 0]),
+    );
+
+    let (cr0, cr1, cr2, cr3) = EncSpan::read_quad::<8>(qr0, str_);
+    let (cr4, cr5, cr6, cr7) = EncSpan::read_quad::<8>(qr1, str_);
+    let (sv_r0, sh_r0, sdc_r0) = satd_strip_8x4_neon(
+        &cr0,
+        &cr1,
+        &cr2,
+        &cr3,
+        v_subs_cr,
+        ld8_i16(&[
+            hl0_cr[0], hl0_cr[1], hl0_cr[2], hl0_cr[3], hl0_cr[0], hl0_cr[1], hl0_cr[2], hl0_cr[3],
+        ]),
+        ld8_i16(&[(dc_cr[0] as i16) << 4, 0, 0, 0, (dc_cr[1] as i16) << 4, 0, 0, 0]),
+    );
+    let (sv_r1, sh_r1, sdc_r1) = satd_strip_8x4_neon(
+        &cr4,
+        &cr5,
+        &cr6,
+        &cr7,
+        v_subs_cr,
+        ld8_i16(&[
+            hl1_cr[0], hl1_cr[1], hl1_cr[2], hl1_cr[3], hl1_cr[0], hl1_cr[1], hl1_cr[2], hl1_cr[3],
+        ]),
+        ld8_i16(&[(dc_cr[2] as i16) << 4, 0, 0, 0, (dc_cr[3] as i16) << 4, 0, 0, 0]),
+    );
+
+    let acc_v = vaddq_u16(vaddq_u16(sv_b0, sv_b1), vaddq_u16(sv_r0, sv_r1));
+    let acc_h = vaddq_u16(vaddq_u16(sh_b0, sh_b1), vaddq_u16(sh_r0, sh_r1));
+    let acc_dc = vaddq_u16(vaddq_u16(sdc_b0, sdc_b1), vaddq_u16(sdc_r0, sdc_r1));
+
+    let satd_v = (vaddlvq_u16(acc_v) >> 1) as i32;
+    let satd_h = (vaddlvq_u16(acc_h) >> 1) as i32;
+    let satd_dc = (vaddlvq_u16(acc_dc) >> 1) as i32;
+
+    let cost_dc = satd_dc + lambda;
+    let cost_h = satd_h + lambda * 3;
+    let cost_v = satd_v + lambda * 3;
+
+    let (best_mode, best_cost) = if cost_dc < cost_h && cost_dc < cost_v {
+        (0u8, cost_dc)
+    } else if cost_h < cost_v {
+        (1u8, cost_h)
+    } else {
+        (2u8, cost_v)
+    };
+
+    let (cb_dst, cr_dst) = pred_cb_cr.split_at_mut(64);
+    write_chroma_pred_neon(
+        cb_dst.first_chunk_mut::<64>().expect("cb 64"),
+        best_mode,
+        &top_cb,
+        &left_cb,
+        &dc_top_cb,
+        &dc_bot_cb,
+    );
+    write_chroma_pred_neon(
+        cr_dst.first_chunk_mut::<64>().expect("cr 64"),
+        best_mode,
+        &top_cr,
+        &left_cr,
+        &dc_top_cr,
+        &dc_bot_cr,
+    );
+
+    (best_mode, best_cost)
+}
 }
 
 #[cfg(test)]
@@ -993,6 +1658,165 @@ mod tests {
                     scalar(&mut want, &rec);
                     simd(&mut got, &rec);
                     assert_eq!(got, want, "4x4 {name} mismatch at {anchor:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_combined3_parity() {
+        let mut seed = 0x1357_9BDF_2468_ACE0u64;
+        let mut pairs = vec![
+            (flat_plane(128), flat_plane(138)),
+            (flat_plane(0), flat_plane(255)),
+            (step_plane(true), step_plane(false)),
+        ];
+        for _ in 0..8 {
+            pairs.push((noise_plane(&mut seed), noise_plane(&mut seed)));
+        }
+
+        for (case_idx, (mut p_rec, mut p_enc)) in pairs.into_iter().enumerate() {
+            let v_rec = shared_plane_for_test(&mut p_rec);
+            let v_enc = shared_plane_for_test(&mut p_enc);
+            let rec = v_rec.cursor(8, 8);
+            let enc = v_enc.cursor(8, 8);
+
+            for (ldc, lh, lv) in [(0, 0, 0), (4, 16, 16), (16, 4, 16), (16, 16, 4)] {
+                let mut pred_dc = [0u8; 16];
+                let mut pred_h = [0u8; 16];
+                let mut pred_v = [0u8; 16];
+                WelsI4x4LumaPredDc_c(&mut pred_dc, &rec);
+                WelsI4x4LumaPredH_c(&mut pred_h, &rec);
+                WelsI4x4LumaPredV_c(&mut pred_v, &rec);
+                let cdc = crate::encoder::sample::satd_4x4(
+                    &RecCursor::over_owned(&mut pred_dc, 0, 4),
+                    &enc,
+                ) + ldc;
+                let ch = crate::encoder::sample::satd_4x4(
+                    &RecCursor::over_owned(&mut pred_h, 0, 4),
+                    &enc,
+                ) + lh;
+                let cv = crate::encoder::sample::satd_4x4(
+                    &RecCursor::over_owned(&mut pred_v, 0, 4),
+                    &enc,
+                ) + lv;
+                let (want_m, want_c, want_p) = if cdc <= ch && cdc <= cv {
+                    (2i8, cdc, pred_dc)
+                } else if ch <= cv {
+                    (1i8, ch, pred_h)
+                } else {
+                    (0i8, cv, pred_v)
+                };
+
+                let mut got_p = [0u8; 16];
+                let (got_m, got_c) = intra_4x4_combined3_satd(&mut got_p, &rec, &enc, ldc, lh, lv);
+                assert_eq!((got_m, got_c), (want_m, want_c), "4x4 case={case_idx}");
+                assert_eq!(got_p, want_p, "4x4 pred case={case_idx}");
+            }
+
+            for lambda in [0, 5, 25] {
+                let mut pv = [0u8; 256];
+                let mut ph = [0u8; 256];
+                let mut pdc = [0u8; 256];
+                WelsI16x16LumaPredV_c(&mut pv, &rec);
+                WelsI16x16LumaPredH_c(&mut ph, &rec);
+                WelsI16x16LumaPredDc_c(&mut pdc, &rec);
+
+                let cv = crate::encoder::sample::satd_16x16(
+                    &RecCursor::over_owned(&mut pv, 0, 16),
+                    &enc,
+                ) + lambda;
+                let ch = crate::encoder::sample::satd_16x16(
+                    &RecCursor::over_owned(&mut ph, 0, 16),
+                    &enc,
+                ) + lambda * 3;
+                let cdc = crate::encoder::sample::satd_16x16(
+                    &RecCursor::over_owned(&mut pdc, 0, 16),
+                    &enc,
+                ) + lambda * 3;
+                let (wm, wc, wp) = if cdc < ch && cdc < cv {
+                    (2u8, cdc, pdc)
+                } else if ch < cv {
+                    (1u8, ch, ph)
+                } else {
+                    (0u8, cv, pv)
+                };
+
+                let mut gp = [0u8; 256];
+                let (gm, gc) = intra_16x16_combined3_satd(&mut gp, &rec, &enc, lambda);
+                assert_eq!((gm, gc), (wm, wc), "16x16 satd case={case_idx} l={lambda}");
+                assert_eq!(gp, wp, "16x16 satd pred case={case_idx}");
+
+                let rec_cr = v_rec.cursor(16, 8);
+                let enc_cr = v_enc.cursor(16, 8);
+                for use_satd in [false, true] {
+                    let mut best_m = 2u8;
+                    let mut best_c = i32::MAX;
+                    let mut want_cb_cr = [0u8; 128];
+                    for (m, bits) in [(2u8, 3), (1u8, 3), (0u8, 1)] {
+                        let mut cb = [0u8; 64];
+                        let mut cr = [0u8; 64];
+                        match m {
+                            2 => {
+                                WelsIChromaPredV_c(&mut cb, &rec);
+                                WelsIChromaPredV_c(&mut cr, &rec_cr);
+                            }
+                            1 => {
+                                WelsIChromaPredH_c(&mut cb, &rec);
+                                WelsIChromaPredH_c(&mut cr, &rec_cr);
+                            }
+                            _ => {
+                                WelsIChromaPredDc_c(&mut cb, &rec);
+                                WelsIChromaPredDc_c(&mut cr, &rec_cr);
+                            }
+                        }
+                        let c1 = RecCursor::over_owned(&mut cb, 0, 8);
+                        let c2 = RecCursor::over_owned(&mut cr, 0, 8);
+                        let dist = if use_satd {
+                            crate::encoder::sample::satd_8x8(&c1, &enc)
+                                + crate::encoder::sample::satd_8x8(&c2, &enc_cr)
+                        } else {
+                            crate::common::sad_common::sample_sad::<8, 8, _>(&c1, &enc)
+                                + crate::common::sad_common::sample_sad::<8, 8, _>(&c2, &enc_cr)
+                        };
+                        let cur = dist + lambda * bits;
+                        if cur < best_c {
+                            best_m = m;
+                            best_c = cur;
+                            want_cb_cr[..64].copy_from_slice(&cb);
+                            want_cb_cr[64..].copy_from_slice(&cr);
+                        }
+                    }
+
+                    let mut got_cb_cr = [0u8; 128];
+                    let got = if use_satd {
+                        intra_chroma_8x8_combined3_satd(
+                            &mut got_cb_cr,
+                            &rec,
+                            &enc,
+                            &rec_cr,
+                            &enc_cr,
+                            lambda,
+                        )
+                    } else {
+                        intra_chroma_8x8_combined3_sad(
+                            &mut got_cb_cr,
+                            &rec,
+                            &enc,
+                            &rec_cr,
+                            &enc_cr,
+                            lambda,
+                        )
+                    };
+                    assert_eq!(
+                        got,
+                        (best_m, best_c),
+                        "chroma satd={use_satd} case={case_idx} l={lambda}"
+                    );
+                    assert_eq!(
+                        got_cb_cr, want_cb_cr,
+                        "chroma pred satd={use_satd} case={case_idx}"
+                    );
                 }
             }
         }

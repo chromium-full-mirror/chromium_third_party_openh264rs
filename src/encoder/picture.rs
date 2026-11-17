@@ -34,9 +34,7 @@
 #![forbid(unsafe_code)]
 
 use crate::encoder::encoder_context::{BLOCK_SIZE_ALL, SMVUnitXY};
-use crate::encoder::svc_motion_estimate::{
-    LIST_SIZE_MSE_16x16, LIST_SIZE_SUM_8x8, LIST_SIZE_SUM_16x16,
-};
+use crate::encoder::svc_motion_estimate::{LIST_SIZE_SUM_8x8, LIST_SIZE_SUM_16x16};
 pub use crate::safe::plane::PaddedPlane;
 use crate::safe::pool::{Id, Pool};
 
@@ -57,9 +55,8 @@ pub const LIST_SIZE: usize = 0x10000;
 /// `SScreenBlockFeatureStorage` — `codec/encoder/core/inc/picture.h:43`.
 /// Stored with a reference picture, one per frame.
 ///
-/// `iActualListSize` bounds the first two tables; the cursor table is
-/// `WELS_MAX (LIST_SIZE_SUM_16x16, LIST_SIZE_MSE_16x16)` long, **not**
-/// `iActualListSize`.
+/// `iActualListSize` bounds the first two tables; the cursor table is [`LIST_SIZE`]
+/// (65,536) entries long so `u16` feature values index it without bounds checks.
 #[derive(Debug)]
 pub struct SScreenBlockFeatureStorage {
     pub iIs16x16: i32,
@@ -102,8 +99,7 @@ impl SScreenBlockFeatureStorage {
     /// `svc_motion_estimate.cpp:690-721` as a constructor.
     ///
     /// The histogram and base table are `kiListSize` long, the arena is
-    /// `2 * kiFrameSize`, and the cursor table is
-    /// `WELS_MAX (LIST_SIZE_SUM_16x16, LIST_SIZE_MSE_16x16)` — not `kiListSize`.
+    /// `2 * kiFrameSize`, and the cursor table is [`LIST_SIZE`] — not `kiListSize`.
     ///
     /// Called from `AllocPicture` for the last layer's reference pictures under
     /// `SCREEN_CONTENT_REAL_TIME`; `bIsBlock8x8` is `(kiMe8x8FME == ME_FME)`.
@@ -134,7 +130,7 @@ impl SScreenBlockFeatureStorage {
             iActualListSize: kiListSize as i32,
             uiSadCostThreshold: [u32::MAX; BLOCK_SIZE_ALL],
             bRefBlockFeatureCalculated: false,
-            pFeatureValuePointerList: vec![0; LIST_SIZE_SUM_16x16.max(LIST_SIZE_MSE_16x16)],
+            pFeatureValuePointerList: vec![0; LIST_SIZE],
         }
     }
 }

@@ -16,27 +16,30 @@
 //! a time with `pextrw`/`pinsrw`; given `movdqu`, LLVM instead issues the second load at a
 //! 7-word offset, which lands those samples in the lanes they belong in.
 
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::x86_64::*;
+
+use super::lanes::ld8_i16;
+use super::sse2_token;
+use crate::simd::{simd_entry, tokens::Sse2Token};
 
 // ============================================================================
 // CAVLC bit-cost estimate
 // ============================================================================
 
-/// The 16-bit mask whose bit `i` is set when `dct[i]` is non-zero.
-///
-/// `packs` saturates rather than truncates, so a coefficient survives it
-/// non-zero whatever its magnitude: `_mm_packs_epi16` maps `v` to
-/// `clamp(v, -128, 127)`, which is `0` only for `v == 0`. A truncating narrow
-/// would lose every multiple of 256.
-#[inline(always)]
-fn nonzero_mask(dct: &[i16; 16]) -> u32 {
-    unsafe {
+simd_entry! {
+    /// The 16-bit mask whose bit `i` is set when `dct[i]` is non-zero.
+    ///
+    /// `packs` saturates rather than truncates, so a coefficient survives it
+    /// non-zero whatever its magnitude: `_mm_packs_epi16` maps `v` to
+    /// `clamp(v, -128, 127)`, which is `0` only for `v == 0`. A truncating narrow
+    /// would lose every multiple of 256.
+    #[target_feature(enable = "sse2")]
+    fn nonzero_mask(dct: &[i16; 16], _token: Sse2Token) -> u32 {
         let zero = _mm_setzero_si128();
-        let ptr = dct.as_ptr() as *const __m128i;
-        let v0 = _mm_loadu_si128(ptr);
-        let v1 = _mm_loadu_si128(ptr.add(1));
+        let v0 = ld8_i16(&dct[..8]);
+        let v1 = ld8_i16(&dct[8..]);
         let packed = _mm_packs_epi16(v0, v1);
         let is_zero = _mm_cmpeq_epi8(packed, zero);
         (!(_mm_movemask_epi8(is_zero) as u32)) & 0xFFFF
@@ -53,7 +56,7 @@ fn nonzero_mask(dct: &[i16; 16]) -> u32 {
 /// Upstream asm: `WelsCalculateSingleCtr4x4_sse2` in `codec/encoder/core/x86/score.asm`.
 #[inline(always)]
 pub fn calculate_single_ctr_4x4(dct: &[i16; 16]) -> i32 {
-    let nz = nonzero_mask(dct);
+    let nz = nonzero_mask(dct, sse2_token());
     let p0 = (nz << 1) | 1;
     let p2 = p0 | (p0 << 1) | (p0 << 2);
     let p5 = p2 | (p2 << 3);

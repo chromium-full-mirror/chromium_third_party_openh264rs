@@ -14,8 +14,10 @@ pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 }
 
 #[inline(always)]
-pub(crate) fn sample_sad_16x16_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    sample_sad::<16, 16, _>(sample1, sample2)
+pub(crate) fn sample_sad_16x16_avx2() -> Option<
+    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+> {
+    None
 }
 
 #[inline(always)]
@@ -24,8 +26,10 @@ pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 }
 
 #[inline(always)]
-pub(crate) fn sample_sad_16x8_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    sample_sad::<16, 8, _>(sample1, sample2)
+pub(crate) fn sample_sad_16x8_avx2() -> Option<
+    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+> {
+    None
 }
 
 #[inline(always)]

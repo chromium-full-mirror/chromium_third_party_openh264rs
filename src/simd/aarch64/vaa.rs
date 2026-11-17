@@ -53,11 +53,13 @@
 //! below the last macroblock row is touched — which lets
 //! `CVAACalculation::Process` trim both planes to that length and turn a geometry
 //! bug into a panic instead of a read past the plane.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
-use super::lanes::{ld16, low4};
+use super::lanes::{ld16, low4, st4_i32};
+use super::neon_token;
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // Where a macroblock's statistics go
@@ -113,8 +115,7 @@ fn reduce_quads(top: uint16x8_t, bot: uint16x8_t) -> uint32x4_t {
 #[inline]
 #[target_feature(enable = "neon")]
 fn st_quads(out: &mut [i32; 4], v: uint32x4_t) {
-    // SAFETY: `out` is an array of exactly four `i32`, which is what `vst1q_s32` writes.
-    unsafe { vst1q_s32(out.as_mut_ptr(), vreinterpretq_s32_u32(v)) }
+    st4_i32(out, vreinterpretq_s32_u32(v));
 }
 
 /// The eight rows of one half-macroblock, from plane slices anchored at its
@@ -233,51 +234,53 @@ fn mb_stats<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
     vaddvq_u32(sad) as i32
 }
 
-/// The picture walk, macroblock by macroblock, returning the frame's total SAD.
-///
-/// The same walk as `vaacalc.rs`'s `walk_picture`, step quirk included. The frame
-/// total accumulates a macroblock's four quadrants at a time, in the vector unit.
-#[inline]
-#[target_feature(enable = "neon")]
-fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
-    cur: &[u8],
-    refp: &[u8],
-    pic_width: i32,
-    pic_height: i32,
-    pic_stride: i32,
-    out: &mut Outputs<'_>,
-) -> i32 {
-    let mb_width = pic_width >> 4;
-    let mb_height = pic_height >> 4;
-    if mb_width <= 0 || mb_height <= 0 {
-        return 0;
-    }
-    let span = crate::processing::vaacalc::vaa_span(pic_width, pic_height, pic_stride);
-    let cur = &cur[..span];
-    let refp = &refp[..span];
-    let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
-    let step = usize::try_from((pic_stride << 4) - pic_width)
-        .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
-
-    let mut frame_sad = 0i32;
-    let mut mb_index = 0usize;
-    let mut row_origin = 0usize;
-    for _ in 0..mb_height {
-        let mut mb_origin = row_origin;
-        for _ in 0..mb_width {
-            frame_sad = frame_sad.wrapping_add(mb_stats::<VAR, SQDIFF, BGD>(
-                &cur[mb_origin..],
-                &refp[mb_origin..],
-                stride,
-                mb_index,
-                out,
-            ));
-            mb_index += 1;
-            mb_origin += 16;
+simd_entry! {
+    /// The picture walk, macroblock by macroblock, returning the frame's total SAD.
+    ///
+    /// The same walk as `vaacalc.rs`'s `walk_picture`, step quirk included. The frame
+    /// total accumulates a macroblock's four quadrants at a time, in the vector unit.
+    #[target_feature(enable = "neon")]
+    fn walk<const VAR: bool, const SQDIFF: bool, const BGD: bool>(
+        cur: &[u8],
+        refp: &[u8],
+        pic_width: i32,
+        pic_height: i32,
+        pic_stride: i32,
+        out: &mut Outputs<'_>,
+        _token: NeonToken,
+    ) -> i32 {
+        let mb_width = pic_width >> 4;
+        let mb_height = pic_height >> 4;
+        if mb_width <= 0 || mb_height <= 0 {
+            return 0;
         }
-        row_origin = mb_origin + step;
+        let span = crate::processing::vaacalc::vaa_span(pic_width, pic_height, pic_stride);
+        let cur = &cur[..span];
+        let refp = &refp[..span];
+        let stride = usize::try_from(pic_stride).expect("vaa_calc: pic_stride must be non-negative");
+        let step = usize::try_from((pic_stride << 4) - pic_width)
+            .expect("vaa_calc: (pic_stride << 4) must be >= pic_width");
+
+        let mut frame_sad = 0i32;
+        let mut mb_index = 0usize;
+        let mut row_origin = 0usize;
+        for _ in 0..mb_height {
+            let mut mb_origin = row_origin;
+            for _ in 0..mb_width {
+                frame_sad = frame_sad.wrapping_add(mb_stats::<VAR, SQDIFF, BGD>(
+                    &cur[mb_origin..],
+                    &refp[mb_origin..],
+                    stride,
+                    mb_index,
+                    out,
+                ));
+                mb_index += 1;
+                mb_origin += 16;
+            }
+            row_origin = mb_origin + step;
+        }
+        frame_sad
     }
-    frame_sad
 }
 
 // ============================================================================
@@ -302,8 +305,15 @@ pub fn vaa_calc_sad(
         sqsum16x16: &mut [],
         sqdiff16x16: &mut [],
     };
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { walk::<false, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<false, false, false>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        &mut out,
+        neon_token(),
+    )
 }
 
 /// Upstream asm: `VAACalcSadVar_AArch64_neon`.
@@ -327,8 +337,15 @@ pub fn vaa_calc_sad_var(
         sqsum16x16,
         sqdiff16x16: &mut [],
     };
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { walk::<true, false, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, false, false>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        &mut out,
+        neon_token(),
+    )
 }
 
 /// Upstream asm: `VAACalcSadSsd_AArch64_neon`.
@@ -353,8 +370,15 @@ pub fn vaa_calc_sad_ssd(
         sqsum16x16,
         sqdiff16x16,
     };
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { walk::<true, true, false>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, true, false>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        &mut out,
+        neon_token(),
+    )
 }
 
 /// Upstream asm: `VAACalcSadBgd_AArch64_neon`.
@@ -378,8 +402,15 @@ pub fn vaa_calc_sad_bgd(
         sqsum16x16: &mut [],
         sqdiff16x16: &mut [],
     };
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { walk::<false, false, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<false, false, true>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        &mut out,
+        neon_token(),
+    )
 }
 
 /// Upstream asm: `VAACalcSadSsdBgd_AArch64_neon`.
@@ -406,8 +437,15 @@ pub fn vaa_calc_sad_ssd_bgd(
         sqsum16x16,
         sqdiff16x16,
     };
-    // SAFETY: NEON is baseline on aarch64; see the module header.
-    unsafe { walk::<true, true, true>(cur, refp, pic_width, pic_height, pic_stride, &mut out) }
+    walk::<true, true, true>(
+        cur,
+        refp,
+        pic_width,
+        pic_height,
+        pic_stride,
+        &mut out,
+        neon_token(),
+    )
 }
 
 #[cfg(test)]

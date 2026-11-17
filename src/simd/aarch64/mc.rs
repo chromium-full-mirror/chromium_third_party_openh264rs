@@ -35,7 +35,8 @@
 //! `common::mc`'s `hor_shaped`, `ver_shaped`, `cen_shaped`, `avg_shaped` and
 //! `chroma_shaped` are the dispatch onto those shapes.
 //!
-//! Inside a kernel the rows come a [`ROW_GROUP`] at a time through
+//! Inside a kernel the rows come via [`BlockRows::split_views`](crate::safe::plane::BlockRows::split_views)
+//! or a [`ROW_GROUP`] at a time through
 //! [`BlockRows::window`](crate::safe::plane::BlockRows::window), and the six taps of a
 //! filtered row through [`hor_chunk`].
 //!
@@ -51,16 +52,18 @@
 //!
 //! `pixel_avg` is `urhadd`, the one-instruction form of the asm's `uaddl`/`rshrn #1`
 //! pair; `mc_chroma` is `umull`/`umlal` by the four byte weights and `rshrn #6`.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 use core::arch::aarch64::*;
 
 use super::lanes::{ld4, ld8, ld8_i16, ld16, st4, st8, st8_i16, st16};
+use super::neon_token;
 use crate::common::mc::{
     McLeaves, WelsClip1, avg_shaped, cen_shaped, chroma_shaped, filter_input_8bit, g_kuiABCD,
     hor_filter_input_16bit, hor_shaped, mc_copy, ver_shaped,
 };
-use crate::safe::plane::{BlockRows, PlaneCursorMut, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursorMut, RefSamples, RowSampleView};
+use crate::simd::{simd_entry, tokens::NeonToken};
 
 // ============================================================================
 // The 6-tap filter
@@ -130,30 +133,23 @@ fn filter6_16(p: &[uint8x16_t; 6]) -> uint8x16_t {
 /// blocks leave one row over, which the tail loop takes a row at a time.
 const ROW_GROUP: usize = 4;
 
-/// The six taps of `N` outputs at column `x` of window row `y`, filtered and stored
-/// — `N` is 16, 8 or 4, and `AVG` is [`hor_row`]'s.
+/// The six taps of `N` outputs at column `x` of borrowed row view `sr`, filtered and
+/// stored — `N` is 16, 8 or 4, and `AVG` is [`hor_row`]'s.
 ///
-/// [`BlockRows::row`] hands a row over **by value**, which is right where the vector
-/// load consumes the whole of it — a `[u8; 16]` is one `ldr q` — and wrong for a
-/// six-tap filter, whose row is `W + 5` samples read in six overlapping loads: a
-/// `[u8; 21]` would be spilled to the stack and read back six times. Loading each tap
-/// as its own `row::<N>(y, x + k)` keeps every load against the original storage, plane
-/// or cell view alike.
-///
-/// That only pays if `y` and `x` are **constants** at the point the bounds checks are
-/// decided, so that each tap's offset provably lands inside the window the caller cut.
-/// Hence a macro: a `#[target_feature]` function cannot be `#[inline(always)]`, and as
-/// a function the row index arrives symbolic and all twelve checks come back.
+/// Walking the block with [`BlockRows::split_views`] hands each row as a borrowed
+/// `&[u8; SW]` or `&[Cell<u8>; SW]` view (`SW = W + 5`), so `sr.sub::<N>(x + k)` reads
+/// directly from the backing storage with zero stack copies and zero per-tap bounds
+/// checks.
 macro_rules! hor_chunk {
-    (16, $out:expr, $r:expr, $y:expr, $x:expr, $avg:expr) => {{
-        let (r, y, x) = (&$r, $y, $x);
+    (16, $out:expr, $sr:expr, $x:expr, $avg:expr) => {{
+        let (sr, x) = ($sr, $x);
         let t = [
-            ld16(&r.row::<16>(y, x)),
-            ld16(&r.row::<16>(y, x + 1)),
-            ld16(&r.row::<16>(y, x + 2)),
-            ld16(&r.row::<16>(y, x + 3)),
-            ld16(&r.row::<16>(y, x + 4)),
-            ld16(&r.row::<16>(y, x + 5)),
+            ld16(&sr.sub::<16>(x)),
+            ld16(&sr.sub::<16>(x + 1)),
+            ld16(&sr.sub::<16>(x + 2)),
+            ld16(&sr.sub::<16>(x + 3)),
+            ld16(&sr.sub::<16>(x + 4)),
+            ld16(&sr.sub::<16>(x + 5)),
         ];
         let mut v = filter6_16(&t);
         if $avg != 0 {
@@ -161,15 +157,15 @@ macro_rules! hor_chunk {
         }
         st16(&mut $out[x..], v);
     }};
-    (8, $out:expr, $r:expr, $y:expr, $x:expr, $avg:expr) => {{
-        let (r, y, x) = (&$r, $y, $x);
+    (8, $out:expr, $sr:expr, $x:expr, $avg:expr) => {{
+        let (sr, x) = ($sr, $x);
         let t = [
-            ld8(&r.row::<8>(y, x)),
-            ld8(&r.row::<8>(y, x + 1)),
-            ld8(&r.row::<8>(y, x + 2)),
-            ld8(&r.row::<8>(y, x + 3)),
-            ld8(&r.row::<8>(y, x + 4)),
-            ld8(&r.row::<8>(y, x + 5)),
+            ld8(&sr.sub::<8>(x)),
+            ld8(&sr.sub::<8>(x + 1)),
+            ld8(&sr.sub::<8>(x + 2)),
+            ld8(&sr.sub::<8>(x + 3)),
+            ld8(&sr.sub::<8>(x + 4)),
+            ld8(&sr.sub::<8>(x + 5)),
         ];
         let mut v = filter6_8(t);
         if $avg != 0 {
@@ -177,17 +173,15 @@ macro_rules! hor_chunk {
         }
         st8(&mut $out[x..], v);
     }};
-    // The asm reads nine bytes and `ext`s between them; six four-byte loads against an
-    // already bounds-checked window are the same instruction count without the shuffles.
-    (4, $out:expr, $r:expr, $y:expr, $x:expr, $avg:expr) => {{
-        let (r, y, x) = (&$r, $y, $x);
+    (4, $out:expr, $sr:expr, $x:expr, $avg:expr) => {{
+        let (sr, x) = ($sr, $x);
         let t = [
-            ld4(&r.row::<4>(y, x)),
-            ld4(&r.row::<4>(y, x + 1)),
-            ld4(&r.row::<4>(y, x + 2)),
-            ld4(&r.row::<4>(y, x + 3)),
-            ld4(&r.row::<4>(y, x + 4)),
-            ld4(&r.row::<4>(y, x + 5)),
+            ld4(&sr.sub::<4>(x)),
+            ld4(&sr.sub::<4>(x + 1)),
+            ld4(&sr.sub::<4>(x + 2)),
+            ld4(&sr.sub::<4>(x + 3)),
+            ld4(&sr.sub::<4>(x + 4)),
+            ld4(&sr.sub::<4>(x + 5)),
         ];
         let mut v = filter6_8(t);
         if $avg != 0 {
@@ -197,40 +191,38 @@ macro_rules! hor_chunk {
     }};
 }
 
-/// One output row of the horizontal filter at row `y` of the window `r`, which
-/// starts at `x = -2` and holds `SW = W + 5` bytes.
+/// One output row of the horizontal filter over borrowed row view `sr`, which starts at
+/// `x = -2` and holds `SW = W + 5` bytes.
 ///
 /// `AVG` is 0, or the tap the result is averaged with: 2 (`src[0]`, the
 /// `_AVERAGE_WITH_0` kernels, quarter-pel `(1, 0)`) or 3 (`src[1]`,
 /// `_AVERAGE_WITH_1`, quarter-pel `(3, 0)`).
-///
-/// A macro for the reason [`hor_chunk`] is one: the row index has to stay a constant at
-/// the point the bounds checks are decided.
 macro_rules! hor_row {
-    ($out:expr, $r:expr, $y:expr, $w:expr, $avg:expr) => {{
+    ($out:expr, $sr:expr, $w:expr, $avg:expr) => {{
         let out: &mut [u8; W] = $out;
+        let sr = $sr;
         let mut x = 0;
         while x + 16 <= W {
-            hor_chunk!(16, out, $r, $y, x, $avg);
+            hor_chunk!(16, out, sr, x, $avg);
             x += 16;
         }
         if x + 8 <= W {
-            hor_chunk!(8, out, $r, $y, x, $avg);
+            hor_chunk!(8, out, sr, x, $avg);
             x += 8;
         }
         if x + 4 <= W {
-            hor_chunk!(4, out, $r, $y, x, $avg);
+            hor_chunk!(4, out, sr, x, $avg);
             x += 4;
         }
         // The odd column of a 5-, 9- or 17-wide row: one more chunk, ending at it.
         if x < W {
             if W >= 8 {
-                hor_chunk!(8, out, $r, $y, W - 8, $avg);
+                hor_chunk!(8, out, sr, W - 8, $avg);
             } else if W >= 4 {
-                hor_chunk!(4, out, $r, $y, W - 4, $avg);
+                hor_chunk!(4, out, sr, W - 4, $avg);
             } else {
                 while x < W {
-                    let w = $r.row::<6>($y, x);
+                    let w = sr.sub::<6>(x);
                     let mut v = WelsClip1((filter_input_8bit(&w) + 16) >> 5);
                     if $avg != 0 {
                         v = ((v as u32 + w[$avg] as u32 + 1) >> 1) as u8;
@@ -243,15 +235,9 @@ macro_rules! hor_row {
     }};
 }
 
-/// The horizontal filter over one const-shape block: one span for the source, one for
-/// the destination, and `hor_row` per row over an `SW = W + 5` array.
-///
-/// The rows come out of the span by value — a `[u8; SW]` the vector loads read straight
-/// from, one `ldr q` on the plane cursors and one gathered load on the shared cell view.
-/// See [`RefSamples::span`](crate::safe::plane::RefSamples::span).
-#[inline]
-#[target_feature(enable = "neon")]
-fn hor_block<
+#[cold]
+#[inline(never)]
+fn hor_narrow<
     S: RefSamples + Copy,
     const W: usize,
     const SW: usize,
@@ -263,20 +249,49 @@ fn hor_block<
 ) {
     let s = src.span::<SW, H>(0, -2);
     let mut d = dst.span_mut::<W, H>(0, 0);
-    let mut y = 0;
-    while y + ROW_GROUP <= H {
-        let g = s.window::<SW>(y, ROW_GROUP);
-        let mut gd = d.window_mut::<W>(y, ROW_GROUP);
-        for k in 0..ROW_GROUP {
-            hor_row!(gd.row_mut::<W>(k, 0), &g, k, W, AVG);
+    for y in 0..H {
+        let sr = s.row::<SW>(y, 0);
+        let out = d.row_mut::<W>(y, 0);
+        for col in 0..W {
+            let w: [u8; 6] = sr[col..col + 6].try_into().expect("six taps");
+            let mut v = WelsClip1((filter_input_8bit(&w) + 16) >> 5);
+            if AVG != 0 {
+                v = ((v as u32 + w[AVG] as u32 + 1) >> 1) as u8;
+            }
+            out[col] = v;
         }
-        y += ROW_GROUP;
     }
-    while y < H {
-        let g = s.window::<SW>(y, 1);
-        hor_row!(d.row_mut::<W>(y, 0), &g, 0, W, AVG);
-        y += 1;
+}
+
+simd_entry! {
+/// The horizontal filter over one const-shape block: one span for the source, one for
+/// the destination, walked via `split_views` / `split_rows_mut` with zero per-row checks.
+#[target_feature(enable = "neon")]
+fn hor_block<
+    S: RefSamples + Copy,
+    const W: usize,
+    const SW: usize,
+    const H: usize,
+    const AVG: usize,
+>(
+    src: &S,
+    dst: &mut PlaneCursorMut<'_>,
+    _token: NeonToken,
+) {
+    let s = src.span::<SW, H>(0, -2);
+    let mut d = dst.span_mut::<W, H>(0, 0);
+    if let (Some((mut sh, st)), Some((dh, dt))) =
+        (s.split_views::<SW, H>(), d.split_rows_mut::<W, H>())
+    {
+        for out in dh {
+            let sr = sh.next().expect("hor head row");
+            hor_row!(out, sr, W, AVG);
+        }
+        hor_row!(dt, st, W, AVG);
+    } else {
+        hor_narrow::<S, W, SW, H, AVG>(src, dst);
     }
+}
 }
 
 /// The run-time-shape twin — cold, and scalar; see [`McLeaves`].
@@ -487,9 +502,10 @@ fn ver_odd_block<
     }
 }
 
+simd_entry! {
 /// The vertical filter at a const shape: the width picks the lane count, and the
 /// `match` folds because `W` is a constant.
-#[inline]
+#[target_feature(enable = "neon")]
 fn ver_block<
     S: RefSamples + Copy,
     const W: usize,
@@ -499,16 +515,15 @@ fn ver_block<
 >(
     src: &S,
     dst: &mut PlaneCursorMut<'_>,
+    _token: NeonToken,
 ) {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe {
-        match W {
-            16 => ver16_block::<S, H, SH, AVG>(src, dst),
-            8 => ver8_block::<S, H, SH, AVG>(src, dst),
-            4 => ver4_block::<S, H, SH, AVG>(src, dst),
-            _ => ver_odd_block::<S, W, H, SH, AVG>(src, dst),
-        }
+    match W {
+        16 => ver16_block::<S, H, SH, AVG>(src, dst),
+        8 => ver8_block::<S, H, SH, AVG>(src, dst),
+        4 => ver4_block::<S, H, SH, AVG>(src, dst),
+        _ => ver_odd_block::<S, W, H, SH, AVG>(src, dst),
     }
+}
 }
 
 /// The run-time-shape twin — cold; see [`McLeaves`].
@@ -648,11 +663,11 @@ macro_rules! cen_out_row {
     }};
 }
 
+simd_entry! {
 /// `McHorVer22WidthEq16_AArch64_neon` and the `Width17/9/5` forms; see the header for
 /// the widths and for the horizontal pass's precision.
 ///
 /// The reach is `SW = W + 5` columns by `SH = H + 5` rows, cut **once**.
-#[inline]
 #[target_feature(enable = "neon")]
 fn cen_block<
     S: RefSamples + Copy,
@@ -663,6 +678,7 @@ fn cen_block<
 >(
     src: &S,
     dst: &mut PlaneCursorMut<'_>,
+    _token: NeonToken,
 ) {
     // The widest caller is `md.rs`'s `kiW + 1` with `kiW = 16`. The scratch is wider
     // than `iTmp`'s `17 + 5` so the eight-lane loads of the horizontal pass may run
@@ -710,6 +726,7 @@ fn cen_block<
         );
         y += 1;
     }
+}
 }
 
 /// The run-time-shape twin — cold; see [`McLeaves`]. The `width <= 17` contract is what
@@ -767,14 +784,15 @@ fn avg_row<const W: usize>(out: &mut [u8; W], a: &[u8; W], b: &[u8; W]) {
     }
 }
 
+simd_entry! {
 /// `PixelAvgWidthEq16/8/4_AArch64_neon` over one const-shape block: one span per
 /// operand, then `urhadd` per chunk per row.
-#[inline]
 #[target_feature(enable = "neon")]
 fn avg_block<A: RefSamples, B: RefSamples, const W: usize, const H: usize>(
     dst: &mut PlaneCursorMut<'_>,
     a: &A,
     b: &B,
+    _token: NeonToken,
 ) {
     let sa = a.span::<W, H>(0, 0);
     let sb = b.span::<W, H>(0, 0);
@@ -796,6 +814,7 @@ fn avg_block<A: RefSamples, B: RefSamples, const W: usize, const H: usize>(
         avg_row::<W>(d.row_mut::<W>(y, 0), &sa.row::<W>(y, 0), &sb.row::<W>(y, 0));
         y += 1;
     }
+}
 }
 
 /// The run-time-shape twin — cold; see [`McLeaves`].
@@ -942,9 +961,10 @@ fn chroma_odd_block<
     }
 }
 
+simd_entry! {
 /// The bilinear chroma filter at a const shape: the width picks the kernel, and the
 /// `match` folds because `W` is a constant.
-#[inline(always)]
+#[target_feature(enable = "neon")]
 fn chroma_block<
     S: RefSamples + Copy,
     const W: usize,
@@ -955,15 +975,14 @@ fn chroma_block<
     src: &S,
     dst: &mut PlaneCursorMut<'_>,
     w: &[u8; 4],
+    _token: NeonToken,
 ) {
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe {
-        match W {
-            8 => chroma8_block::<S, H, SH>(src, dst, w),
-            4 => chroma4_block::<S, H, SH>(src, dst, w),
-            _ => chroma_odd_block::<S, W, SW, H, SH>(src, dst, w),
-        }
+    match W {
+        8 => chroma8_block::<S, H, SH>(src, dst, w),
+        4 => chroma4_block::<S, H, SH>(src, dst, w),
+        _ => chroma_odd_block::<S, W, SW, H, SH>(src, dst, w),
     }
+}
 }
 
 /// The run-time-shape twin — cold; see [`McLeaves`].
@@ -1013,8 +1032,7 @@ impl McLeaves for NeonLeaves {
         src: &S,
         dst: &mut PlaneCursorMut<'_>,
     ) {
-        // SAFETY: NEON is baseline on aarch64.
-        unsafe { hor_block::<S, W, SW, H, AVG>(src, dst) }
+        hor_block::<S, W, SW, H, AVG>(src, dst, neon_token())
     }
     #[inline(always)]
     fn hor_any<S: RefSamples + Copy, const AVG: usize>(
@@ -1036,7 +1054,7 @@ impl McLeaves for NeonLeaves {
         src: &S,
         dst: &mut PlaneCursorMut<'_>,
     ) {
-        ver_block::<S, W, H, SH, AVG>(src, dst)
+        ver_block::<S, W, H, SH, AVG>(src, dst, neon_token())
     }
     #[inline(always)]
     fn ver_any<S: RefSamples + Copy, const AVG: usize>(
@@ -1058,8 +1076,7 @@ impl McLeaves for NeonLeaves {
         src: &S,
         dst: &mut PlaneCursorMut<'_>,
     ) {
-        // SAFETY: NEON is baseline on aarch64.
-        unsafe { cen_block::<S, W, SW, H, SH>(src, dst) }
+        cen_block::<S, W, SW, H, SH>(src, dst, neon_token())
     }
     #[inline(always)]
     fn cen_any<S: RefSamples + Copy>(
@@ -1076,8 +1093,7 @@ impl McLeaves for NeonLeaves {
         a: &A,
         b: &B,
     ) {
-        // SAFETY: NEON is baseline on aarch64.
-        unsafe { avg_block::<A, B, W, H>(dst, a, b) }
+        avg_block::<A, B, W, H>(dst, a, b, neon_token())
     }
     #[inline(always)]
     fn avg_any<A: RefSamples, B: RefSamples>(
@@ -1101,7 +1117,7 @@ impl McLeaves for NeonLeaves {
         dst: &mut PlaneCursorMut<'_>,
         w: &[u8; 4],
     ) {
-        chroma_block::<S, W, SW, H, SH>(src, dst, w)
+        chroma_block::<S, W, SW, H, SH>(src, dst, w, neon_token())
     }
     #[inline(always)]
     fn chroma_any<S: RefSamples + Copy>(

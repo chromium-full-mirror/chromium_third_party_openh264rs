@@ -549,20 +549,21 @@ impl BsCursor {
 // Writer
 // ---------------------------------------------------------------------------
 
-/// A bitstream write position — the writing half of `SBitStringAux`.
+/// Register-cached session accumulator for [`BsWriter`].
 ///
-/// Implements the canonical semantics of `codec/common/inc/bit_stream.h`: no masking
-/// of the value, no `iLen <= 0` guard. Writes are checked against buffer capacity;
-/// writing past the end sets `overflow` rather than panicking.
+/// Created via [`BsWriter::begin_local`] and committed back via
+/// [`BsWriter::end_local`]. Holding the four writer fields by value allows
+/// LLVM to keep them in general-purpose registers across loops with zero
+/// aliasing against `buf: &mut [u8]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BsWriter {
+pub struct LocalBsWriter {
     pos: usize,
     cur_bits: u32,
     left_bits: i32,
     overflow: bool,
 }
 
-impl Default for BsWriter {
+impl Default for LocalBsWriter {
     /// The state `InitBits` establishes: empty accumulator, 32 bits free.
     fn default() -> Self {
         Self::new()
@@ -579,10 +580,8 @@ fn write_be_32(buf: &mut [u8], pos: usize, value: u32) -> Result<(), ()> {
     Ok(())
 }
 
-impl BsWriter {
-    /// A writer positioned at the start of a buffer.
-    ///
-    /// Mirrors `InitBits` (`codec/encoder/core/inc/vlc_encoder.h`).
+impl LocalBsWriter {
+    /// An accumulator positioned at the start of a buffer.
     #[inline(always)]
     pub fn new() -> Self {
         Self {
@@ -593,14 +592,25 @@ impl BsWriter {
         }
     }
 
-    /// Bytes written so far — the C++ `pCurBuf - pStartBuf`. Whole words only; bits
-    /// still in the accumulator are not counted (use [`bits_pos`](Self::bits_pos)).
+    /// An accumulator positioned at `pos` with an empty 32-bit word.
+    #[inline(always)]
+    pub fn at(pos: usize) -> Self {
+        Self {
+            pos,
+            cur_bits: 0,
+            left_bits: 32,
+            overflow: false,
+        }
+    }
+
+    /// Bytes written so far — whole words only; bits still in the accumulator
+    /// are not counted.
     #[inline(always)]
     pub fn pos(&self) -> usize {
         self.pos
     }
 
-    /// Bits free in the accumulator — the C++ `iLeftBits`.
+    /// Bits free in the accumulator.
     #[inline(always)]
     pub fn left_bits(&self) -> i32 {
         self.left_bits
@@ -612,30 +622,7 @@ impl BsWriter {
         self.overflow
     }
 
-    /// Explicitly sets the overflow state.
-    #[inline(always)]
-    pub fn set_overflow(&mut self, overflow: bool) {
-        self.overflow = overflow;
-    }
-
-    /// A writer positioned at `pos` with an empty accumulator.
-    ///
-    /// One caller: the CABAC slice tail (`WelsWriteSliceEndSyn`), where the arithmetic
-    /// coder has written bytes through its own cursor into the same buffer and hands
-    /// the position back.
-    #[inline(always)]
-    pub fn at(pos: usize) -> Self {
-        Self {
-            pos,
-            cur_bits: 0,
-            left_bits: 32,
-            overflow: false,
-        }
-    }
-
     /// The write position in bits.
-    ///
-    /// Mirrors `BsGetBitsPos`.
     #[inline(always)]
     pub fn bits_pos(&self) -> i32 {
         ((self.pos as i32) << 3) + 32 - self.left_bits
@@ -643,13 +630,14 @@ impl BsWriter {
 
     /// Writes the low `n` bits of `value`, MSB first.
     ///
-    /// Mirrors `BsWriteBits`.
+    /// Mirrors [`BsWriter::write_bits`].
     ///
     /// # Contract
     /// `n` in `1..=32`, and `value` must have no bits set above bit `n-1`: it is ORed
-    /// into the accumulator unmasked and unasserted.
+    /// into the accumulator unmasked (checked via `debug_assert!`).
     #[inline(always)]
-    pub fn write_bits(&mut self, buf: &mut [u8], n: i32, value: u32) {
+    pub fn write(&mut self, buf: &mut [u8], n: i32, value: u32) {
+        debug_assert!((1..=32).contains(&n) && (n == 32 || value >> n == 0));
         if n < self.left_bits {
             self.cur_bits = (self.cur_bits << n) | value;
             self.left_bits -= n;
@@ -677,10 +665,10 @@ impl BsWriter {
         }
     }
 
-    /// Writes one bit. Mirrors `BsWriteOneBit`.
+    /// Writes one bit. Mirrors [`BsWriter::write_one_bit`].
     #[inline(always)]
     pub fn write_one_bit(&mut self, buf: &mut [u8], value: u32) {
-        self.write_bits(buf, 1, value);
+        self.write(buf, 1, value);
     }
 
     /// Writes an unsigned Exp-Golomb code, `ue(v)`.
@@ -693,18 +681,15 @@ impl BsWriter {
     pub fn write_ue(&mut self, buf: &mut [u8], value: u32) {
         let len = size_ue(value) as i32;
         if len <= 32 {
-            self.write_bits(buf, len, value + 1);
+            self.write(buf, len, value + 1);
         } else {
             let half = len >> 1;
-            self.write_bits(buf, half, 0);
-            self.write_bits(buf, half + 1, value + 1);
+            self.write(buf, half, 0);
+            self.write(buf, half + 1, value + 1);
         }
     }
 
     /// Writes a signed Exp-Golomb code, `se(v)`.
-    ///
-    /// The magnitude is taken with `unsigned_abs`, so `i32::MIN` encodes the wrapped
-    /// value instead of overflowing.
     #[inline(always)]
     pub fn write_se(&mut self, buf: &mut [u8], value: i32) {
         let code = if value > 0 {
@@ -715,10 +700,17 @@ impl BsWriter {
         self.write_ue(buf, code);
     }
 
+    /// Writes a truncated Exp-Golomb code, `te(v)`.
+    #[inline(always)]
+    pub fn write_te(&mut self, buf: &mut [u8], x: i32, value: u32) {
+        if x == 1 {
+            self.write_one_bit(buf, u32::from(value == 0));
+        } else {
+            self.write_ue(buf, value);
+        }
+    }
+
     /// Flushes the accumulator, padding the last byte with zeros.
-    ///
-    /// Stores a full 32-bit word if 4 bytes remain, or the exact needed bytes if space allows.
-    /// If buffer space is insufficient, records an overflow without panicking.
     #[inline]
     pub fn flush(&mut self, buf: &mut [u8]) {
         if self.left_bits < 32 {
@@ -740,32 +732,13 @@ impl BsWriter {
     }
 
     /// Writes `rbsp_stop_one_bit` and flushes to byte alignment.
-    ///
-    /// Mirrors `BsRbspTrailingBits`.
     #[inline]
     pub fn rbsp_trailing_bits(&mut self, buf: &mut [u8]) {
         self.write_one_bit(buf, 1);
         self.flush(buf);
     }
 
-    /// Writes a truncated Exp-Golomb code, `te(v)`.
-    ///
-    /// Mirrors `BsWriteTE`: at `x == 1` the range is
-    /// binary and the code is the *inverted* single bit; otherwise it is `ue(v)`.
-    #[inline]
-    pub fn write_te(&mut self, buf: &mut [u8], x: i32, value: u32) {
-        if x == 1 {
-            self.write_one_bit(buf, u32::from(value == 0));
-        } else {
-            self.write_ue(buf, value);
-        }
-    }
-
     /// Pads to the next byte boundary with **one** bits, then flushes.
-    ///
-    /// `cabac_alignment_one_bit`: the one bits are normative, unlike
-    /// [`flush`](Self::flush)'s zero padding, which widening the accumulator to a byte
-    /// boundary first makes unreachable.
     #[inline]
     pub fn align(&mut self, buf: &mut [u8]) {
         let rem = self.left_bits & 7;
@@ -775,6 +748,174 @@ impl BsWriter {
             self.left_bits &= !7;
         }
         self.flush(buf);
+    }
+}
+
+/// A bitstream write position — the writing half of `SBitStringAux`.
+///
+/// Implements the canonical semantics of `codec/common/inc/bit_stream.h`: no masking
+/// of the value, no `iLen <= 0` guard. Writes are checked against buffer capacity;
+/// writing past the end sets `overflow` rather than panicking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BsWriter {
+    inner: LocalBsWriter,
+}
+
+impl Default for BsWriter {
+    /// The state `InitBits` establishes: empty accumulator, 32 bits free.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BsWriter {
+    /// A writer positioned at the start of a buffer.
+    ///
+    /// Mirrors `InitBits` (`codec/encoder/core/inc/vlc_encoder.h`).
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            inner: LocalBsWriter::new(),
+        }
+    }
+
+    /// Copies the writer state into a by-value [`LocalBsWriter`] for register-cached writes.
+    #[inline(always)]
+    pub fn begin_local(&self) -> LocalBsWriter {
+        LocalBsWriter {
+            pos: self.inner.pos,
+            cur_bits: self.inner.cur_bits,
+            left_bits: self.inner.left_bits,
+            overflow: self.inner.overflow,
+        }
+    }
+
+    /// Commits a [`LocalBsWriter`] session back into this writer.
+    #[inline(always)]
+    pub fn end_local(&mut self, local: LocalBsWriter) {
+        self.inner.pos = local.pos;
+        self.inner.cur_bits = local.cur_bits;
+        self.inner.left_bits = local.left_bits;
+        self.inner.overflow = local.overflow;
+    }
+
+    /// Bytes written so far — the C++ `pCurBuf - pStartBuf`. Whole words only; bits
+    /// still in the accumulator are not counted (use [`bits_pos`](Self::bits_pos)).
+    #[inline(always)]
+    pub fn pos(&self) -> usize {
+        self.inner.pos()
+    }
+
+    /// Bits free in the accumulator — the C++ `iLeftBits`.
+    #[inline(always)]
+    pub fn left_bits(&self) -> i32 {
+        self.inner.left_bits()
+    }
+
+    /// Returns whether any write exceeded buffer capacity.
+    #[inline(always)]
+    pub fn is_overflow(&self) -> bool {
+        self.inner.is_overflow()
+    }
+
+    /// Explicitly sets the overflow state.
+    #[inline(always)]
+    pub fn set_overflow(&mut self, overflow: bool) {
+        self.inner.overflow = overflow;
+    }
+
+    /// A writer positioned at `pos` with an empty accumulator.
+    ///
+    /// One caller: the CABAC slice tail (`WelsWriteSliceEndSyn`), where the arithmetic
+    /// coder has written bytes through its own cursor into the same buffer and hands
+    /// the position back.
+    #[inline(always)]
+    pub fn at(pos: usize) -> Self {
+        Self {
+            inner: LocalBsWriter::at(pos),
+        }
+    }
+
+    /// The write position in bits.
+    ///
+    /// Mirrors `BsGetBitsPos`.
+    #[inline(always)]
+    pub fn bits_pos(&self) -> i32 {
+        self.inner.bits_pos()
+    }
+
+    /// Writes the low `n` bits of `value`, MSB first.
+    ///
+    /// Mirrors `BsWriteBits`.
+    ///
+    /// # Contract
+    /// `n` in `1..=32`, and `value` must have no bits set above bit `n-1`: it is ORed
+    /// into the accumulator unmasked (checked via `debug_assert!`).
+    #[inline(always)]
+    pub fn write_bits(&mut self, buf: &mut [u8], n: i32, value: u32) {
+        self.inner.write(buf, n, value);
+    }
+
+    /// Writes one bit. Mirrors `BsWriteOneBit`.
+    #[inline(always)]
+    pub fn write_one_bit(&mut self, buf: &mut [u8], value: u32) {
+        self.inner.write_one_bit(buf, value);
+    }
+
+    /// Writes an unsigned Exp-Golomb code, `ue(v)`.
+    ///
+    /// The code length is [`size_ue`], `2 * floor(log2(value + 1)) + 1`.
+    ///
+    /// # Panics
+    /// On `u32::MAX`, where `value + 1` overflows.
+    #[inline(always)]
+    pub fn write_ue(&mut self, buf: &mut [u8], value: u32) {
+        self.inner.write_ue(buf, value);
+    }
+
+    /// Writes a signed Exp-Golomb code, `se(v)`.
+    ///
+    /// The magnitude is taken with `unsigned_abs`, so `i32::MIN` encodes the wrapped
+    /// value instead of overflowing.
+    #[inline(always)]
+    pub fn write_se(&mut self, buf: &mut [u8], value: i32) {
+        self.inner.write_se(buf, value);
+    }
+
+    /// Flushes the accumulator, padding the last byte with zeros.
+    ///
+    /// Stores a full 32-bit word if 4 bytes remain, or the exact needed bytes if space allows.
+    /// If buffer space is insufficient, records an overflow without panicking.
+    #[inline]
+    pub fn flush(&mut self, buf: &mut [u8]) {
+        self.inner.flush(buf);
+    }
+
+    /// Writes `rbsp_stop_one_bit` and flushes to byte alignment.
+    ///
+    /// Mirrors `BsRbspTrailingBits`.
+    #[inline]
+    pub fn rbsp_trailing_bits(&mut self, buf: &mut [u8]) {
+        self.inner.rbsp_trailing_bits(buf);
+    }
+
+    /// Writes a truncated Exp-Golomb code, `te(v)`.
+    ///
+    /// Mirrors `BsWriteTE`: at `x == 1` the range is
+    /// binary and the code is the *inverted* single bit; otherwise it is `ue(v)`.
+    #[inline]
+    pub fn write_te(&mut self, buf: &mut [u8], x: i32, value: u32) {
+        self.inner.write_te(buf, x, value);
+    }
+
+    /// Pads to the next byte boundary with **one** bits, then flushes.
+    ///
+    /// `cabac_alignment_one_bit`: the one bits are normative, unlike
+    /// [`flush`](Self::flush)'s zero padding, which widening the accumulator to a byte
+    /// boundary first makes unreachable.
+    #[inline]
+    pub fn align(&mut self, buf: &mut [u8]) {
+        self.inner.align(buf);
     }
 }
 
@@ -1438,5 +1579,134 @@ mod tests {
                 assert_eq!(c.get_bits(&out, 8), Ok(0xA5), "phase={phase}, v={v}");
             }
         }
+    }
+
+    #[test]
+    fn local_writer_matches_bs_writer_across_random_sequences() {
+        let mut rng = Prng::new(0xC0FF_EE42);
+        for round in 0..scale_unit(300) {
+            let mut buf_ref = vec![0u8; 512];
+            let mut buf_loc = vec![0u8; 512];
+            let mut w_ref = BsWriter::new();
+            let mut w_loc = BsWriter::new();
+
+            // Exercise multiple begin_local/end_local sessions interspersed with direct writes.
+            let sessions = rng.range_i32(1, 5);
+            for _ in 0..sessions {
+                let prefix_n = rng.range_i32(1, 16);
+                let prefix_v = rng.next_u32() & ((1u32 << prefix_n) - 1);
+                w_ref.write_bits(&mut buf_ref, prefix_n, prefix_v);
+                w_loc.write_bits(&mut buf_loc, prefix_n, prefix_v);
+
+                let mut lbs = w_loc.begin_local();
+                let ops = rng.range_i32(1, 32);
+                for _ in 0..ops {
+                    match rng.below(5) {
+                        0 => {
+                            let n = rng.range_i32(1, 32);
+                            let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+                            let v = rng.next_u32() & mask;
+                            w_ref.write_bits(&mut buf_ref, n, v);
+                            lbs.write(&mut buf_loc, n, v);
+                        }
+                        1 => {
+                            let v = rng.below(2);
+                            w_ref.write_one_bit(&mut buf_ref, v);
+                            lbs.write_one_bit(&mut buf_loc, v);
+                        }
+                        2 => {
+                            let v = rng.below(100_000);
+                            w_ref.write_ue(&mut buf_ref, v);
+                            lbs.write_ue(&mut buf_loc, v);
+                        }
+                        3 => {
+                            let v = rng.range_i32(-50_000, 50_000);
+                            w_ref.write_se(&mut buf_ref, v);
+                            lbs.write_se(&mut buf_loc, v);
+                        }
+                        _ => {
+                            let x = if rng.below(2) == 0 { 1 } else { 3 };
+                            let v = if x == 1 { rng.below(2) } else { rng.below(64) };
+                            w_ref.write_te(&mut buf_ref, x, v);
+                            lbs.write_te(&mut buf_loc, x, v);
+                        }
+                    }
+                    assert_eq!(lbs.bits_pos(), w_ref.bits_pos(), "round {round}");
+                    assert_eq!(lbs.pos(), w_ref.pos(), "round {round}");
+                    assert_eq!(lbs.left_bits(), w_ref.left_bits(), "round {round}");
+                    assert_eq!(lbs.is_overflow(), w_ref.is_overflow(), "round {round}");
+                }
+                w_loc.end_local(lbs);
+                assert_eq!(w_loc, w_ref, "round {round}");
+            }
+
+            w_ref.rbsp_trailing_bits(&mut buf_ref);
+            w_loc.rbsp_trailing_bits(&mut buf_loc);
+            assert_eq!(w_loc, w_ref, "round {round} after trailing bits");
+            assert_eq!(buf_loc, buf_ref, "round {round} buffer mismatch");
+        }
+    }
+
+    #[test]
+    fn local_writer_handles_exact_32bit_boundaries_and_overflow() {
+        // Exact 32-bit write with left_bits == 32, exact fill, and straddling flush.
+        let mut buf_ref = vec![0u8; 16];
+        let mut buf_loc = vec![0u8; 16];
+        let mut w_ref = BsWriter::new();
+        let mut w_loc = BsWriter::new();
+
+        let mut lbs = w_loc.begin_local();
+        for &(n, v) in &[
+            (32, 0xDEAD_BEEF),
+            (13, 0x1A5A),
+            (19, 0x5_5555),
+            (7, 0x7F),
+            (32, 0xCAFE_BABE),
+            (1, 1),
+        ] {
+            w_ref.write_bits(&mut buf_ref, n, v);
+            lbs.write(&mut buf_loc, n, v);
+        }
+        w_loc.end_local(lbs);
+        assert_eq!(w_loc, w_ref);
+        assert_eq!(w_loc.bits_pos(), w_ref.bits_pos());
+        assert_eq!(buf_loc, buf_ref);
+
+        // Buffer boundary overflow: 3-byte, 4-byte, and 7-byte buffers.
+        for cap in [0usize, 3, 4, 7] {
+            let mut ref_small = vec![0u8; cap];
+            let mut loc_small = vec![0u8; cap];
+            let mut r = BsWriter::new();
+            let mut l = BsWriter::new();
+            let mut local = l.begin_local();
+
+            for &(n, v) in &[(16, 0x1234), (16, 0x5678), (32, 0x9ABC_DEF0)] {
+                r.write_bits(&mut ref_small, n, v);
+                local.write(&mut loc_small, n, v);
+            }
+            l.end_local(local);
+            assert_eq!(l, r, "cap={cap}");
+            assert_eq!(l.is_overflow(), r.is_overflow(), "cap={cap}");
+            assert_eq!(l.bits_pos(), r.bits_pos(), "cap={cap}");
+            assert_eq!(loc_small, ref_small, "cap={cap}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn local_writer_rejects_unmasked_value_in_debug() {
+        let mut buf = [0u8; 8];
+        let mut lbs = LocalBsWriter::new();
+        lbs.write(&mut buf, 3, 0b1000);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn local_writer_rejects_zero_width_in_debug() {
+        let mut buf = [0u8; 8];
+        let mut lbs = LocalBsWriter::new();
+        lbs.write(&mut buf, 0, 0);
     }
 }

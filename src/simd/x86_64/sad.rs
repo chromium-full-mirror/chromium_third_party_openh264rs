@@ -13,259 +13,305 @@
 //! probes at span rows `j` and `j + 2` of column 1, the left and right at row `j + 1`
 //! of columns 0 and 2. Per group rather than once per block because only a constant
 //! row offset inside a span folds; `G` is sized so the group's walk unrolls.
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
+use super::lanes::{ld4, ld8, ld16};
+use super::sse2_token;
+use crate::encoder::rec_view::RecCursor;
 use crate::safe::plane::{BlockRows, RefSamples};
-#[cfg(target_arch = "x86_64")]
+use crate::simd::{
+    Avx2RecSadKernel, simd_entry,
+    tokens::{Avx2Token, Sse2Token},
+};
 use core::arch::x86_64::*;
 
 // ============================================================================
 // Internal SSE2 & AVX2 Kernels
 // ============================================================================
 
-#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn reduce16(acc: __m128i) -> i32 {
+    let hi = _mm_srli_si128(acc, 8);
+    let sum = _mm_add_epi32(acc, hi);
+    _mm_cvtsi128_si32(sum)
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+fn reduce256(acc: __m256i) -> i32 {
+    let lo = _mm256_castsi256_si128(acc);
+    let hi = _mm256_extracti128_si256(acc, 1);
+    let sum128 = _mm_add_epi64(lo, hi);
+    let sum_hi = _mm_srli_si128(sum128, 8);
+    _mm_cvtsi128_si32(_mm_add_epi32(sum128, sum_hi))
+}
+
 #[inline(always)]
-pub unsafe fn sad_16x<S: RefSamples, const H: usize>(
-    sample1: &S,
-    sample2: &S,
-    dx: isize,
-    dy: isize,
-) -> i32 {
-    unsafe {
+fn split_probe_header<'b, B: BlockRows + 'b, const W: usize, const SW: usize, const H: usize>(
+    s2: &'b B,
+) -> ([u8; W], ([u8; W], [u8; W], [u8; W]), B::RawSlice<'b>, usize) {
+    let (raw2, st2) = s2.raw_parts();
+    let st2 = st2 as usize;
+    let p0 = B::slice_prefix(raw2, (H + 1) * st2 + SW);
+    let (_, r0_m, _) = B::read_head3::<W, SW>(p0);
+    let p1 = B::split_suffix(p0, st2);
+    let r1 = B::read_head3::<W, SW>(p1);
+    let p2 = B::split_suffix(p1, st2);
+    (r0_m, r1, p2, st2)
+}
+
+macro_rules! sad_four_sse2_step {
+    ($ld:ident, $a:expr, $p:expr, $acc0:ident, $acc1:ident, $acc2:ident, $acc3:ident, $v2_up:ident, $v2_mid:ident, $v2_lt:ident, $v2_rt:ident) => {{
+        let (dn_l, dn_m, dn_r) = $p;
+        let v1 = $ld(&$a);
+        let v2_dn = $ld(&dn_m);
+        $acc0 = _mm_add_epi64($acc0, _mm_sad_epu8(v1, $v2_up));
+        $acc1 = _mm_add_epi64($acc1, _mm_sad_epu8(v1, v2_dn));
+        $acc2 = _mm_add_epi64($acc2, _mm_sad_epu8(v1, $v2_lt));
+        $acc3 = _mm_add_epi64($acc3, _mm_sad_epu8(v1, $v2_rt));
+        $v2_up = $v2_mid;
+        $v2_mid = v2_dn;
+        $v2_lt = $ld(&dn_l);
+        $v2_rt = $ld(&dn_r);
+    }};
+}
+
+macro_rules! sad_four_avx2_pair {
+    ($a0:expr, $a1:expr, $p2:expr, $p3:expr, $acc0:ident, $acc1:ident, $acc2:ident, $acc3:ident, $v2_r0:ident, $v2_r1:ident, $v2_lt_0:ident, $v2_rt_0:ident) => {{
+        let (r2_l, r2_m, r2_r) = $p2;
+        let (r3_l, r3_m, r3_r) = $p3;
+        let v1 = _mm256_set_m128i(ld16(&$a1), ld16(&$a0));
+        let v2_r2 = ld16(&r2_m);
+        let v2_r3 = ld16(&r3_m);
+        let v2_lt_1 = ld16(&r2_l);
+        let v2_rt_1 = ld16(&r2_r);
+        $acc0 = _mm256_add_epi64($acc0, _mm256_sad_epu8(v1, _mm256_set_m128i($v2_r1, $v2_r0)));
+        $acc1 = _mm256_add_epi64($acc1, _mm256_sad_epu8(v1, _mm256_set_m128i(v2_r3, v2_r2)));
+        $acc2 = _mm256_add_epi64(
+            $acc2,
+            _mm256_sad_epu8(v1, _mm256_set_m128i(v2_lt_1, $v2_lt_0)),
+        );
+        $acc3 = _mm256_add_epi64(
+            $acc3,
+            _mm256_sad_epu8(v1, _mm256_set_m128i(v2_rt_1, $v2_rt_0)),
+        );
+        $v2_r0 = v2_r2;
+        $v2_r1 = v2_r3;
+        $v2_lt_0 = ld16(&r3_l);
+        $v2_rt_0 = ld16(&r3_r);
+    }};
+    (last $a0:expr, $a1:expr, $p2:expr, $p3:expr, $acc0:ident, $acc1:ident, $acc2:ident, $acc3:ident, $v2_r0:ident, $v2_r1:ident, $v2_lt_0:ident, $v2_rt_0:ident) => {{
+        let (r2_l, r2_m, r2_r) = $p2;
+        let (_, r3_m, _) = $p3;
+        let v1 = _mm256_set_m128i(ld16(&$a1), ld16(&$a0));
+        let v2_r2 = ld16(&r2_m);
+        let v2_r3 = ld16(&r3_m);
+        let v2_lt_1 = ld16(&r2_l);
+        let v2_rt_1 = ld16(&r2_r);
+        $acc0 = _mm256_add_epi64($acc0, _mm256_sad_epu8(v1, _mm256_set_m128i($v2_r1, $v2_r0)));
+        $acc1 = _mm256_add_epi64($acc1, _mm256_sad_epu8(v1, _mm256_set_m128i(v2_r3, v2_r2)));
+        $acc2 = _mm256_add_epi64(
+            $acc2,
+            _mm256_sad_epu8(v1, _mm256_set_m128i(v2_lt_1, $v2_lt_0)),
+        );
+        $acc3 = _mm256_add_epi64(
+            $acc3,
+            _mm256_sad_epu8(v1, _mm256_set_m128i(v2_rt_1, $v2_rt_0)),
+        );
+    }};
+}
+
+macro_rules! sad_16x_sse2_quad {
+    ($S:ident, $q1:expr, $st1:expr, $q2:expr, $st2:expr, $acc:ident) => {{
+        let (a0, a1, a2, a3) = $S::Span::read_quad::<16>($q1, $st1);
+        let (c0, c1, c2, c3) = $S::Span::read_quad::<16>($q2, $st2);
+        $acc = _mm_add_epi64($acc, _mm_sad_epu8(ld16(&a0), ld16(&c0)));
+        $acc = _mm_add_epi64($acc, _mm_sad_epu8(ld16(&a1), ld16(&c1)));
+        $acc = _mm_add_epi64($acc, _mm_sad_epu8(ld16(&a2), ld16(&c2)));
+        $acc = _mm_add_epi64($acc, _mm_sad_epu8(ld16(&a3), ld16(&c3)));
+    }};
+}
+
+macro_rules! sad_16x_avx2_quad {
+    ($S:ident, $q1:expr, $st1:expr, $q2:expr, $st2:expr, $acc:ident) => {{
+        let (a0, a1, a2, a3) = $S::Span::read_quad::<16>($q1, $st1);
+        let (c0, c1, c2, c3) = $S::Span::read_quad::<16>($q2, $st2);
+        let va0 = _mm256_set_m128i(ld16(&a1), ld16(&a0));
+        let vc0 = _mm256_set_m128i(ld16(&c1), ld16(&c0));
+        let va1 = _mm256_set_m128i(ld16(&a3), ld16(&a2));
+        let vc1 = _mm256_set_m128i(ld16(&c3), ld16(&c2));
+        $acc = _mm256_add_epi64($acc, _mm256_sad_epu8(va0, vc0));
+        $acc = _mm256_add_epi64($acc, _mm256_sad_epu8(va1, vc1));
+    }};
+}
+
+simd_entry! {
+    #[target_feature(enable = "sse2")]
+    fn sad_16x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: Sse2Token,
+    ) -> i32 {
+        const { assert!(H == 8 || H == 16, "sad_16x supports H = 8 or 16") };
         let (s1, s2) = (sample1.span::<16, H>(0, 0), sample2.span::<16, H>(dy, dx));
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
+        let (raw1, st1) = s1.raw_parts();
+        let (raw2, st2) = s2.raw_parts();
+        let (st1, st2) = (st1 as usize, st2 as usize);
         let mut acc = _mm_setzero_si128();
-        for y in 0..H {
-            let v1 = _mm_loadu_si128(p1.add(y * stride1) as *const __m128i);
-            let v2 = _mm_loadu_si128(p2.add(y * stride2) as *const __m128i);
-            acc = _mm_add_epi64(acc, _mm_sad_epu8(v1, v2));
+        if H == 16 {
+            let q1_0 = S::Span::slice_prefix(raw1, 15 * st1 + 16);
+            let q2_0 = S::Span::slice_prefix(raw2, 15 * st2 + 16);
+            sad_16x_sse2_quad!(S, q1_0, st1, q2_0, st2, acc);
+            sad_16x_sse2_quad!(S, S::Span::split_suffix(q1_0, 4 * st1), st1, S::Span::split_suffix(q2_0, 4 * st2), st2, acc);
+            let q1_2 = S::Span::split_suffix(q1_0, 8 * st1);
+            let q2_2 = S::Span::split_suffix(q2_0, 8 * st2);
+            sad_16x_sse2_quad!(S, q1_2, st1, q2_2, st2, acc);
+            sad_16x_sse2_quad!(S, S::Span::split_suffix(q1_2, 4 * st1), st1, S::Span::split_suffix(q2_2, 4 * st2), st2, acc);
+        } else {
+            let q1_0 = S::Span::slice_prefix(raw1, 7 * st1 + 16);
+            let q2_0 = S::Span::slice_prefix(raw2, 7 * st2 + 16);
+            sad_16x_sse2_quad!(S, q1_0, st1, q2_0, st2, acc);
+            sad_16x_sse2_quad!(S, S::Span::split_suffix(q1_0, 4 * st1), st1, S::Span::split_suffix(q2_0, 4 * st2), st2, acc);
         }
-        let hi = _mm_srli_si128(acc, 8);
-        let sum = _mm_add_epi32(acc, hi);
-        _mm_cvtsi128_si32(sum)
+        reduce16(acc)
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub fn sad_16x_avx2<S: RefSamples, const H: usize>(sample1: &S, sample2: &S) -> i32 {
-    // The loop steps two rows per iteration, so an odd `H` would read and accumulate
-    // row `H` — one past the block.
-    const {
-        assert!(
-            H % 2 == 0,
-            "sad_16x_avx2 filters two rows per step; H must be even"
-        )
-    };
-    unsafe {
-        let (s1, s2) = (sample1.span::<16, H>(0, 0), sample2.span::<16, H>(0, 0));
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
-        let mut acc = _mm256_setzero_si256();
-        let mut y = 0;
-        while y < H {
-            let v1_0 = _mm_loadu_si128(p1.add(y * stride1) as *const __m128i);
-            let v2_0 = _mm_loadu_si128(p2.add(y * stride2) as *const __m128i);
-            let v1_1 = _mm_loadu_si128(p1.add((y + 1) * stride1) as *const __m128i);
-            let v2_1 = _mm_loadu_si128(p2.add((y + 1) * stride2) as *const __m128i);
-
-            let v1 = _mm256_set_m128i(v1_1, v1_0);
-            let v2 = _mm256_set_m128i(v2_1, v2_0);
-
-            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(v1, v2));
-            y += 2;
-        }
-        let lo = _mm256_castsi256_si128(acc);
-        let hi = _mm256_extracti128_si256(acc, 1);
-        let sum128 = _mm_add_epi64(lo, hi);
-        let sum_hi = _mm_srli_si128(sum128, 8);
-        let total = _mm_add_epi32(sum128, sum_hi);
-        _mm_cvtsi128_si32(total)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub unsafe fn sad_8x<S: RefSamples, const H: usize>(
-    sample1: &S,
-    sample2: &S,
-    dx: isize,
-    dy: isize,
-) -> i32 {
-    unsafe {
+    #[target_feature(enable = "sse2")]
+    fn sad_8x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: Sse2Token,
+    ) -> i32 {
+        const { assert!(H == 4 || H == 8 || H == 16, "sad_8x supports H = 4, 8, 16") };
         let (s1, s2) = (sample1.span::<8, H>(0, 0), sample2.span::<8, H>(dy, dx));
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
         let mut acc = _mm_setzero_si128();
-        for y in 0..H {
-            let v1 = _mm_loadl_epi64(p1.add(y * stride1) as *const __m128i);
-            let v2 = _mm_loadl_epi64(p2.add(y * stride2) as *const __m128i);
-            acc = _mm_add_epi64(acc, _mm_sad_epu8(v1, v2));
+        if H == 16 {
+            let (qs1, st1) = s1.all_4_quads::<8>();
+            let (qs2, st2) = s2.all_4_quads::<8>();
+            for (q1, q2) in qs1.into_iter().zip(qs2) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+                let (c0, c1, c2, c3) = S::Span::read_quad::<8>(q2, st2);
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a0), ld8(&c0)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a1), ld8(&c1)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a2), ld8(&c2)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a3), ld8(&c3)));
+            }
+        } else if H == 8 {
+            let (qs1, st1) = s1.all_2_quads::<8>();
+            let (qs2, st2) = s2.all_2_quads::<8>();
+            for (q1, q2) in qs1.into_iter().zip(qs2) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+                let (c0, c1, c2, c3) = S::Span::read_quad::<8>(q2, st2);
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a0), ld8(&c0)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a1), ld8(&c1)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a2), ld8(&c2)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a3), ld8(&c3)));
+            }
+        } else {
+            let (q1, st1) = s1.all_1_quad::<8>();
+            let (q2, st2) = s2.all_1_quad::<8>();
+            let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+            let (c0, c1, c2, c3) = S::Span::read_quad::<8>(q2, st2);
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a0), ld8(&c0)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a1), ld8(&c1)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a2), ld8(&c2)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&a3), ld8(&c3)));
         }
         _mm_cvtsi128_si32(acc)
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub unsafe fn sad_4x<S: RefSamples, const H: usize>(
-    sample1: &S,
-    sample2: &S,
-    dx: isize,
-    dy: isize,
-) -> i32 {
-    unsafe {
+    #[target_feature(enable = "sse2")]
+    fn sad_4x<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        dx: isize,
+        dy: isize,
+        _token: Sse2Token,
+    ) -> i32 {
+        const { assert!(H == 4 || H == 8, "sad_4x supports H = 4 or 8") };
         let (s1, s2) = (sample1.span::<4, H>(0, 0), sample2.span::<4, H>(dy, dx));
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
         let mut acc = _mm_setzero_si128();
-        for y in 0..H {
-            let v1 = _mm_cvtsi32_si128((p1.add(y * stride1) as *const i32).read_unaligned());
-            let v2 = _mm_cvtsi32_si128((p2.add(y * stride2) as *const i32).read_unaligned());
-            acc = _mm_add_epi64(acc, _mm_sad_epu8(v1, v2));
+        if H == 8 {
+            let (qs1, st1) = s1.all_2_quads::<4>();
+            let (qs2, st2) = s2.all_2_quads::<4>();
+            for (q1, q2) in qs1.into_iter().zip(qs2) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<4>(q1, st1);
+                let (c0, c1, c2, c3) = S::Span::read_quad::<4>(q2, st2);
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a0), ld4(&c0)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a1), ld4(&c1)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a2), ld4(&c2)));
+                acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a3), ld4(&c3)));
+            }
+        } else {
+            let (q1, st1) = s1.all_1_quad::<4>();
+            let (q2, st2) = s2.all_1_quad::<4>();
+            let (a0, a1, a2, a3) = S::Span::read_quad::<4>(q1, st1);
+            let (c0, c1, c2, c3) = S::Span::read_quad::<4>(q2, st2);
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a0), ld4(&c0)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a1), ld4(&c1)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a2), ld4(&c2)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(ld4(&a3), ld4(&c3)));
         }
         _mm_cvtsi128_si32(acc)
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn sample_sad_four_16x_avx2<S: RefSamples, const H: usize, const HW: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    const { assert!(H % 2 == 0, "H must be even") };
-    const { assert!(HW == H + 2, "HW must equal H + 2") };
-    let s1 = sample1.span::<16, H>(0, 0);
-    let s2 = sample2.span::<18, HW>(-1, -1);
-    let (p1, stride1) = s1.as_ptr_and_stride();
-    let (p2, stride2) = s2.as_ptr_and_stride();
-
-    let mut acc0 = _mm256_setzero_si256();
-    let mut acc1 = _mm256_setzero_si256();
-    let mut acc2 = _mm256_setzero_si256();
-    let mut acc3 = _mm256_setzero_si256();
-
-    let (mut v2_r0, mut v2_r1) = unsafe {
-        (
-            _mm_loadu_si128(p2.add(1) as *const __m128i),
-            _mm_loadu_si128(p2.add(stride2 + 1) as *const __m128i),
-        )
-    };
-
-    let mut y = 0usize;
-    while y < H {
-        let (v1_0, v1_1, v2_r2, v2_r3, v2_lt_0, v2_lt_1, v2_rt_0, v2_rt_1) = unsafe {
-            let v1_0 = _mm_loadu_si128(p1.add(y * stride1) as *const __m128i);
-            let v1_1 = _mm_loadu_si128(p1.add((y + 1) * stride1) as *const __m128i);
-
-            let p2_r1 = p2.add((y + 1) * stride2);
-            let p2_r2 = p2.add((y + 2) * stride2);
-            let p2_r3 = p2.add((y + 3) * stride2);
-
-            let v2_r2 = _mm_loadu_si128(p2_r2.add(1) as *const __m128i);
-            let v2_r3 = _mm_loadu_si128(p2_r3.add(1) as *const __m128i);
-
-            let v2_lt_0 = _mm_loadu_si128(p2_r1 as *const __m128i);
-            let v2_lt_1 = _mm_loadu_si128(p2_r2 as *const __m128i);
-
-            let v2_rt_0 = _mm_loadu_si128(p2_r1.add(2) as *const __m128i);
-            let v2_rt_1 = _mm_loadu_si128(p2_r2.add(2) as *const __m128i);
-            (v1_0, v1_1, v2_r2, v2_r3, v2_lt_0, v2_lt_1, v2_rt_0, v2_rt_1)
-        };
-
-        let v1 = _mm256_set_m128i(v1_1, v1_0);
-        let v2_up = _mm256_set_m128i(v2_r1, v2_r0);
-        let v2_dn = _mm256_set_m128i(v2_r3, v2_r2);
-        let v2_lt = _mm256_set_m128i(v2_lt_1, v2_lt_0);
-        let v2_rt = _mm256_set_m128i(v2_rt_1, v2_rt_0);
-
-        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(v1, v2_up));
-        acc1 = _mm256_add_epi64(acc1, _mm256_sad_epu8(v1, v2_dn));
-        acc2 = _mm256_add_epi64(acc2, _mm256_sad_epu8(v1, v2_lt));
-        acc3 = _mm256_add_epi64(acc3, _mm256_sad_epu8(v1, v2_rt));
-
-        v2_r0 = v2_r2;
-        v2_r1 = v2_r3;
-        y += 2;
-    }
-
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn reduce256(acc: __m256i) -> i32 {
-        let lo = _mm256_castsi256_si128(acc);
-        let hi = _mm256_extracti128_si256(acc, 1);
-        let sum128 = _mm_add_epi64(lo, hi);
-        let sum_hi = _mm_srli_si128(sum128, 8);
-        _mm_cvtsi128_si32(_mm_add_epi32(sum128, sum_hi))
-    }
-
-    sad[0] = reduce256(acc0);
-    sad[1] = reduce256(acc1);
-    sad[2] = reduce256(acc2);
-    sad[3] = reduce256(acc3);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub unsafe fn sample_sad_four_16x<
-    S: RefSamples,
-    const H: usize,
-    const HW: usize,
-    const G: usize,
->(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    if crate::simd::has_avx2() {
-        unsafe { sample_sad_four_16x_avx2::<S, H, HW>(sample1, sample2, sad) };
-        return;
-    }
-    unsafe {
+    #[target_feature(enable = "sse2")]
+    fn sample_sad_four_16x_sse2<
+        S: RefSamples,
+        const H: usize,
+        const HW: usize,
+        const G: usize,
+    >(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: Sse2Token,
+    ) {
+        const { assert!(H == 8 || H == 16, "sample_sad_four_16x_sse2 supports H = 8 or 16") };
         const { assert!(H % G == 0, "the block is a whole number of G-row cuts") };
-        const {
-            assert!(
-                HW == H + 2,
-                "the probe span is two rows taller than the block"
-            )
-        };
+        const { assert!(HW == H + 2, "the probe span is two rows taller than the block") };
+        let s1 = sample1.span::<16, H>(0, 0);
+        let s2 = sample2.span::<18, HW>(-1, -1);
+
         let mut acc0 = _mm_setzero_si128();
         let mut acc1 = _mm_setzero_si128();
         let mut acc2 = _mm_setzero_si128();
         let mut acc3 = _mm_setzero_si128();
 
-        let s1 = sample1.span::<16, H>(0, 0);
-        let s2 = sample2.span::<18, HW>(-1, -1);
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
+        let (r0_m, (r1_l, r1_m, r1_r), p2, st2) = split_probe_header::<_, 16, 18, H>(&s2);
+        let mut v2_up = ld16(&r0_m);
+        let mut v2_mid = ld16(&r1_m);
+        let mut v2_lt = ld16(&r1_l);
+        let mut v2_rt = ld16(&r1_r);
 
-        let mut v2_up = _mm_loadu_si128(p2.add(1) as *const __m128i);
-        let mut v2_mid = _mm_loadu_si128(p2.add(stride2 + 1) as *const __m128i);
-
-        for y in 0..H {
-            let v1 = _mm_loadu_si128(p1.add(y * stride1) as *const __m128i);
-            let p2_mid = p2.add((y + 1) * stride2);
-            let v2_dn = _mm_loadu_si128(p2.add((y + 2) * stride2 + 1) as *const __m128i);
-            let v2_lt = _mm_loadu_si128(p2_mid as *const __m128i);
-            let v2_rt = _mm_loadu_si128(p2_mid.add(2) as *const __m128i);
-
-            acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(v1, v2_up));
-            acc1 = _mm_add_epi64(acc1, _mm_sad_epu8(v1, v2_dn));
-            acc2 = _mm_add_epi64(acc2, _mm_sad_epu8(v1, v2_lt));
-            acc3 = _mm_add_epi64(acc3, _mm_sad_epu8(v1, v2_rt));
-
-            v2_up = v2_mid;
-            v2_mid = v2_dn;
-        }
-        #[inline(always)]
-        unsafe fn reduce16(acc: __m128i) -> i32 {
-            unsafe {
-                let hi = _mm_srli_si128(acc, 8);
-                let sum = _mm_add_epi32(acc, hi);
-                _mm_cvtsi128_si32(sum)
+        if H == 16 {
+            let (qs1, st1) = s1.all_4_quads::<16>();
+            let q2_2 = S::Span::split_suffix(p2, 8 * st2);
+            let q2_1 = S::Span::split_suffix(p2, 4 * st2);
+            let q2_3 = S::Span::split_suffix(q2_2, 4 * st2);
+            for (q1, q2) in qs1.into_iter().zip([p2, q2_1, q2_2, q2_3]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<16>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(q2, st2);
+                sad_four_sse2_step!(ld16, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
+        } else {
+            let (qs1, st1) = s1.all_2_quads::<16>();
+            let q2_1 = S::Span::split_suffix(p2, 4 * st2);
+            for (q1, q2) in qs1.into_iter().zip([p2, q2_1]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<16>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(q2, st2);
+                sad_four_sse2_step!(ld16, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld16, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
             }
         }
 
@@ -274,107 +320,259 @@ pub unsafe fn sample_sad_four_16x<
         sad[2] = reduce16(acc2);
         sad[3] = reduce16(acc3);
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub unsafe fn sample_sad_four_8x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    unsafe {
+    #[target_feature(enable = "sse2")]
+    fn sample_sad_four_8x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: Sse2Token,
+    ) {
+        const { assert!(H == 4 || H == 8 || H == 16, "sample_sad_four_8x supports H = 4, 8, 16") };
         const { assert!(H % G == 0, "the block is a whole number of G-row cuts") };
-        const {
-            assert!(
-                HW == H + 2,
-                "the probe span is two rows taller than the block"
-            )
-        };
-        let mut acc0 = _mm_setzero_si128();
-        let mut acc1 = _mm_setzero_si128();
-        let mut acc2 = _mm_setzero_si128();
-        let mut acc3 = _mm_setzero_si128();
-
+        const { assert!(HW == H + 2, "the probe span is two rows taller than the block") };
         let s1 = sample1.span::<8, H>(0, 0);
         let s2 = sample2.span::<10, HW>(-1, -1);
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
 
-        let mut v2_up = _mm_loadl_epi64(p2.add(1) as *const __m128i);
-        let mut v2_mid = _mm_loadl_epi64(p2.add(stride2 + 1) as *const __m128i);
-
-        for y in 0..H {
-            let v1 = _mm_loadl_epi64(p1.add(y * stride1) as *const __m128i);
-            let p2_mid = p2.add((y + 1) * stride2);
-            let v2_dn = _mm_loadl_epi64(p2.add((y + 2) * stride2 + 1) as *const __m128i);
-            let v2_lt = _mm_loadl_epi64(p2_mid as *const __m128i);
-            let v2_rt = _mm_loadl_epi64(p2_mid.add(2) as *const __m128i);
-
-            acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(v1, v2_up));
-            acc1 = _mm_add_epi64(acc1, _mm_sad_epu8(v1, v2_dn));
-            acc2 = _mm_add_epi64(acc2, _mm_sad_epu8(v1, v2_lt));
-            acc3 = _mm_add_epi64(acc3, _mm_sad_epu8(v1, v2_rt));
-
-            v2_up = v2_mid;
-            v2_mid = v2_dn;
-        }
-        sad[0] = _mm_cvtsi128_si32(acc0);
-        sad[1] = _mm_cvtsi128_si32(acc1);
-        sad[2] = _mm_cvtsi128_si32(acc2);
-        sad[3] = _mm_cvtsi128_si32(acc3);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub unsafe fn sample_sad_four_4x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
-    sample1: &S,
-    sample2: &S,
-    sad: &mut [i32; 4],
-) {
-    unsafe {
-        const { assert!(H % G == 0, "the block is a whole number of G-row cuts") };
-        const {
-            assert!(
-                HW == H + 2,
-                "the probe span is two rows taller than the block"
-            )
-        };
         let mut acc0 = _mm_setzero_si128();
         let mut acc1 = _mm_setzero_si128();
         let mut acc2 = _mm_setzero_si128();
         let mut acc3 = _mm_setzero_si128();
 
-        let s1 = sample1.span::<4, H>(0, 0);
-        let s2 = sample2.span::<6, HW>(-1, -1);
-        let (p1, stride1) = s1.as_ptr_and_stride();
-        let (p2, stride2) = s2.as_ptr_and_stride();
+        let (r0_m, (r1_l, r1_m, r1_r), p2, st2) = split_probe_header::<_, 8, 10, H>(&s2);
+        let mut v2_up = ld8(&r0_m);
+        let mut v2_mid = ld8(&r1_m);
+        let mut v2_lt = ld8(&r1_l);
+        let mut v2_rt = ld8(&r1_r);
 
-        let mut v2_up = _mm_cvtsi32_si128((p2.add(1) as *const i32).read_unaligned());
-        let mut v2_mid = _mm_cvtsi32_si128((p2.add(stride2 + 1) as *const i32).read_unaligned());
-
-        for y in 0..H {
-            let v1 = _mm_cvtsi32_si128((p1.add(y * stride1) as *const i32).read_unaligned());
-            let p2_mid = p2.add((y + 1) * stride2);
-            let v2_dn =
-                _mm_cvtsi32_si128((p2.add((y + 2) * stride2 + 1) as *const i32).read_unaligned());
-            let v2_lt = _mm_cvtsi32_si128((p2_mid as *const i32).read_unaligned());
-            let v2_rt = _mm_cvtsi32_si128((p2_mid.add(2) as *const i32).read_unaligned());
-
-            acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(v1, v2_up));
-            acc1 = _mm_add_epi64(acc1, _mm_sad_epu8(v1, v2_dn));
-            acc2 = _mm_add_epi64(acc2, _mm_sad_epu8(v1, v2_lt));
-            acc3 = _mm_add_epi64(acc3, _mm_sad_epu8(v1, v2_rt));
-
-            v2_up = v2_mid;
-            v2_mid = v2_dn;
+        if H == 16 {
+            let (qs1, st1) = s1.all_4_quads::<8>();
+            let q2_2 = S::Span::split_suffix(p2, 8 * st2);
+            let q2_1 = S::Span::split_suffix(p2, 4 * st2);
+            let q2_3 = S::Span::split_suffix(q2_2, 4 * st2);
+            for (q1, q2) in qs1.into_iter().zip([p2, q2_1, q2_2, q2_3]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<8, 10>(q2, st2);
+                sad_four_sse2_step!(ld8, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
+        } else if H == 8 {
+            let (qs1, st1) = s1.all_2_quads::<8>();
+            let q2_1 = S::Span::split_suffix(p2, 4 * st2);
+            for (q1, q2) in qs1.into_iter().zip([p2, q2_1]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<8, 10>(q2, st2);
+                sad_four_sse2_step!(ld8, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
+        } else {
+            let (q1, st1) = s1.all_1_quad::<8>();
+            for (q1, q2) in [q1].into_iter().zip([p2]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<8>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<8, 10>(q2, st2);
+                sad_four_sse2_step!(ld8, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld8, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
         }
+
         sad[0] = _mm_cvtsi128_si32(acc0);
         sad[1] = _mm_cvtsi128_si32(acc1);
         sad[2] = _mm_cvtsi128_si32(acc2);
         sad[3] = _mm_cvtsi128_si32(acc3);
     }
+
+    #[target_feature(enable = "sse2")]
+    fn sample_sad_four_4x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: Sse2Token,
+    ) {
+        const { assert!(H == 4 || H == 8, "sample_sad_four_4x supports H = 4 or 8") };
+        const { assert!(H % G == 0, "the block is a whole number of G-row cuts") };
+        const { assert!(HW == H + 2, "the probe span is two rows taller than the block") };
+        let s1 = sample1.span::<4, H>(0, 0);
+        let s2 = sample2.span::<6, HW>(-1, -1);
+
+        let mut acc0 = _mm_setzero_si128();
+        let mut acc1 = _mm_setzero_si128();
+        let mut acc2 = _mm_setzero_si128();
+        let mut acc3 = _mm_setzero_si128();
+
+        let (r0_m, (r1_l, r1_m, r1_r), p2, st2) = split_probe_header::<_, 4, 6, H>(&s2);
+        let mut v2_up = ld4(&r0_m);
+        let mut v2_mid = ld4(&r1_m);
+        let mut v2_lt = ld4(&r1_l);
+        let mut v2_rt = ld4(&r1_r);
+
+        if H == 8 {
+            let (qs1, st1) = s1.all_2_quads::<4>();
+            let q2_1 = S::Span::split_suffix(p2, 4 * st2);
+            for (q1, q2) in qs1.into_iter().zip([p2, q2_1]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<4>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<4, 6>(q2, st2);
+                sad_four_sse2_step!(ld4, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
+        } else {
+            let (q1, st1) = s1.all_1_quad::<4>();
+            for (q1, q2) in [q1].into_iter().zip([p2]) {
+                let (a0, a1, a2, a3) = S::Span::read_quad::<4>(q1, st1);
+                let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<4, 6>(q2, st2);
+                sad_four_sse2_step!(ld4, a0, p2_0, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a1, p2_1, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a2, p2_2, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+                sad_four_sse2_step!(ld4, a3, p2_3, acc0, acc1, acc2, acc3, v2_up, v2_mid, v2_lt, v2_rt);
+            }
+        }
+
+        sad[0] = _mm_cvtsi128_si32(acc0);
+        sad[1] = _mm_cvtsi128_si32(acc1);
+        sad[2] = _mm_cvtsi128_si32(acc2);
+        sad[3] = _mm_cvtsi128_si32(acc3);
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn sad_16x_avx2<S: RefSamples, const H: usize>(
+        sample1: &S,
+        sample2: &S,
+        _token: Avx2Token,
+    ) -> i32 {
+        const {
+            assert!(
+                H == 8 || H == 16,
+                "sad_16x_avx2 supports H = 8 or 16"
+            )
+        };
+        let (s1, s2) = (sample1.span::<16, H>(0, 0), sample2.span::<16, H>(0, 0));
+        let (raw1, st1) = s1.raw_parts();
+        let (raw2, st2) = s2.raw_parts();
+        let (st1, st2) = (st1 as usize, st2 as usize);
+        let mut acc = _mm256_setzero_si256();
+        if H == 16 {
+            let q1_0 = S::Span::slice_prefix(raw1, 15 * st1 + 16);
+            let q2_0 = S::Span::slice_prefix(raw2, 15 * st2 + 16);
+            sad_16x_avx2_quad!(S, q1_0, st1, q2_0, st2, acc);
+            sad_16x_avx2_quad!(S, S::Span::split_suffix(q1_0, 4 * st1), st1, S::Span::split_suffix(q2_0, 4 * st2), st2, acc);
+            let q1_2 = S::Span::split_suffix(q1_0, 8 * st1);
+            let q2_2 = S::Span::split_suffix(q2_0, 8 * st2);
+            sad_16x_avx2_quad!(S, q1_2, st1, q2_2, st2, acc);
+            sad_16x_avx2_quad!(S, S::Span::split_suffix(q1_2, 4 * st1), st1, S::Span::split_suffix(q2_2, 4 * st2), st2, acc);
+        } else {
+            let q1_0 = S::Span::slice_prefix(raw1, 7 * st1 + 16);
+            let q2_0 = S::Span::slice_prefix(raw2, 7 * st2 + 16);
+            sad_16x_avx2_quad!(S, q1_0, st1, q2_0, st2, acc);
+            sad_16x_avx2_quad!(S, S::Span::split_suffix(q1_0, 4 * st1), st1, S::Span::split_suffix(q2_0, 4 * st2), st2, acc);
+        }
+        reduce256(acc)
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn sample_sad_four_16x_avx2<
+        S: RefSamples,
+        const H: usize,
+        const HW: usize,
+        const G: usize,
+    >(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+        _token: Avx2Token,
+    ) {
+        const { assert!(H == 8 || H == 16, "sample_sad_four_16x_avx2 supports H = 8 or 16") };
+        const { assert!(G % 2 == 0 && H % G == 0, "the block is a whole number of even G-row cuts") };
+        const { assert!(HW == H + 2, "HW must equal H + 2") };
+        let s1 = sample1.span::<16, H>(0, 0);
+        let s2 = sample2.span::<18, HW>(-1, -1);
+
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
+
+        let (r0_m, (r1_l, r1_m, r1_r), p2, st2) = split_probe_header::<_, 16, 18, H>(&s2);
+        let mut v2_r0 = ld16(&r0_m);
+        let mut v2_r1 = ld16(&r1_m);
+        let mut v2_lt_0 = ld16(&r1_l);
+        let mut v2_rt_0 = ld16(&r1_r);
+
+        let (raw1, st1) = s1.raw_parts();
+        let st1 = st1 as usize;
+        if H == 16 {
+            let q1_0 = S::Span::slice_prefix(raw1, 15 * st1 + 16);
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(q1_0, st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(p2, st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(S::Span::split_suffix(q1_0, 4 * st1), st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(S::Span::split_suffix(p2, 4 * st2), st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+
+            let q1_2 = S::Span::split_suffix(q1_0, 8 * st1);
+            let q2_2 = S::Span::split_suffix(p2, 8 * st2);
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(q1_2, st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(q2_2, st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(S::Span::split_suffix(q1_2, 4 * st1), st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(S::Span::split_suffix(q2_2, 4 * st2), st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(last a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+        } else {
+            let q1_0 = S::Span::slice_prefix(raw1, 7 * st1 + 16);
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(q1_0, st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(p2, st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+
+            let (a0, a1, a2, a3) = S::Span::read_quad::<16>(S::Span::split_suffix(q1_0, 4 * st1), st1);
+            let (p2_0, p2_1, p2_2, p2_3) = S::Span::read_quad3::<16, 18>(S::Span::split_suffix(p2, 4 * st2), st2);
+            sad_four_avx2_pair!(a0, a1, p2_0, p2_1, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+            sad_four_avx2_pair!(last a2, a3, p2_2, p2_3, acc0, acc1, acc2, acc3, v2_r0, v2_r1, v2_lt_0, v2_rt_0);
+        }
+
+        sad[0] = reduce256(acc0);
+        sad[1] = reduce256(acc1);
+        sad[2] = reduce256(acc2);
+        sad[3] = reduce256(acc3);
+    }
+}
+
+#[inline(always)]
+fn sample_sad_four_16x<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+    sample1: &S,
+    sample2: &S,
+    sad: &mut [i32; 4],
+) {
+    #[cold]
+    #[inline(never)]
+    fn fallback<S: RefSamples, const H: usize, const HW: usize, const G: usize>(
+        sample1: &S,
+        sample2: &S,
+        sad: &mut [i32; 4],
+    ) {
+        if let Some(token) = Avx2Token::try_new_enabled() {
+            sample_sad_four_16x_avx2::<S, H, HW, G>(sample1, sample2, sad, token);
+        } else {
+            sample_sad_four_16x_sse2::<S, H, HW, G>(sample1, sample2, sad, sse2_token());
+        }
+    }
+    if let Some(token) = Avx2Token::try_fast_enabled() {
+        sample_sad_four_16x_avx2::<S, H, HW, G>(sample1, sample2, sad, token);
+        return;
+    }
+    fallback::<S, H, HW, G>(sample1, sample2, sad);
 }
 
 // ============================================================================
@@ -383,96 +581,98 @@ pub unsafe fn sample_sad_four_4x<S: RefSamples, const H: usize, const HW: usize,
 
 #[inline(always)]
 pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_16x::<S, 16>(sample1, sample2, 0, 0) }
+    sad_16x::<S, 16>(sample1, sample2, 0, 0, sse2_token())
 }
 
-/// `sad_16x_avx2` runs `vpsadbw` with no feature test of its own, so the caller must
-/// have established AVX2 support. The one caller,
-/// `encoder::sample::WelsInitSampleSadFunc`, installs this into `pfSampleSad` only
-/// under `uiCpuFlag & WELS_CPU_AVX2 && simd::has_avx2()`.
+struct Sad16xKernel<const H: usize>;
+impl<const H: usize> Avx2RecSadKernel for Sad16xKernel<H> {
+    #[inline(always)]
+    fn run(a: &RecCursor<'_>, b: &RecCursor<'_>, token: Avx2Token) -> i32 {
+        sad_16x_avx2::<RecCursor<'_>, H>(a, b, token)
+    }
+}
+
+/// Returns a direct `sad_16x_avx2` function pointer when AVX2 is available on the host,
+/// amortizing the capability check at table-init time (`WelsInitSampleSadFunc`).
 // Dead in a kernel set no dispatch site aliases.
 #[allow(dead_code)]
-#[inline(always)]
-pub(crate) fn sample_sad_16x16_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    // SAFETY: the caller established AVX2 support before installing this; see above.
-    unsafe { sad_16x_avx2::<S, 16>(sample1, sample2) }
+#[inline]
+pub(crate) fn sample_sad_16x16_avx2() -> Option<fn(&RecCursor<'_>, &RecCursor<'_>) -> i32> {
+    Avx2Token::try_new().map(Avx2Token::into_rec_sad_fn::<Sad16xKernel<16>>)
 }
 
 #[inline(always)]
 pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_16x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_16x::<S, 8>(sample1, sample2, 0, 0, sse2_token())
 }
 
-/// `sad_16x_avx2` runs `vpsadbw` with no feature test of its own, so the caller must
-/// have established AVX2 support. The one caller,
-/// `encoder::sample::WelsInitSampleSadFunc`, installs this into `pfSampleSad` only
-/// under `uiCpuFlag & WELS_CPU_AVX2 && simd::has_avx2()`.
+/// Returns a direct `sad_16x_avx2` function pointer when AVX2 is available on the host,
+/// amortizing the capability check at table-init time (`WelsInitSampleSadFunc`).
 // Dead in a kernel set no dispatch site aliases.
 #[allow(dead_code)]
-#[inline(always)]
-pub(crate) fn sample_sad_16x8_avx2<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    // SAFETY: the caller established AVX2 support before installing this; see above.
-    unsafe { sad_16x_avx2::<S, 8>(sample1, sample2) }
+#[inline]
+pub(crate) fn sample_sad_16x8_avx2() -> Option<fn(&RecCursor<'_>, &RecCursor<'_>) -> i32> {
+    Avx2Token::try_new().map(Avx2Token::into_rec_sad_fn::<Sad16xKernel<8>>)
 }
 
 #[inline(always)]
 pub fn sample_sad_8x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 16>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 16>(sample1, sample2, 0, 0, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_8x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 8>(sample1, sample2, 0, 0, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_4x4<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_4x::<S, 4>(sample1, sample2, 0, 0) }
+    sad_4x::<S, 4>(sample1, sample2, 0, 0, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_8x4<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_8x::<S, 4>(sample1, sample2, 0, 0) }
+    sad_8x::<S, 4>(sample1, sample2, 0, 0, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_4x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
-    unsafe { sad_4x::<S, 8>(sample1, sample2, 0, 0) }
+    sad_4x::<S, 8>(sample1, sample2, 0, 0, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_four_16x16<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_16x::<S, 16, 18, 4>(sample1, sample2, sad) }
+    sample_sad_four_16x::<S, 16, 18, 4>(sample1, sample2, sad)
 }
 
 #[inline(always)]
 pub fn sample_sad_four_16x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_16x::<S, 8, 10, 4>(sample1, sample2, sad) }
+    sample_sad_four_16x::<S, 8, 10, 4>(sample1, sample2, sad)
 }
 
 #[inline(always)]
 pub fn sample_sad_four_8x16<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_8x::<S, 16, 18, 8>(sample1, sample2, sad) }
+    sample_sad_four_8x::<S, 16, 18, 8>(sample1, sample2, sad, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_four_8x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_8x::<S, 8, 10, 8>(sample1, sample2, sad) }
+    sample_sad_four_8x::<S, 8, 10, 8>(sample1, sample2, sad, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_four_4x4<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_4x::<S, 4, 6, 4>(sample1, sample2, sad) }
+    sample_sad_four_4x::<S, 4, 6, 4>(sample1, sample2, sad, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_four_8x4<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_8x::<S, 4, 6, 4>(sample1, sample2, sad) }
+    sample_sad_four_8x::<S, 4, 6, 4>(sample1, sample2, sad, sse2_token())
 }
 
 #[inline(always)]
 pub fn sample_sad_four_4x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i32; 4]) {
-    unsafe { sample_sad_four_4x::<S, 8, 10, 8>(sample1, sample2, sad) }
+    sample_sad_four_4x::<S, 8, 10, 8>(sample1, sample2, sad, sse2_token())
 }
 
 // ============================================================================
@@ -524,12 +724,13 @@ mod tests {
         let c1 = PlaneCursor::new(&p1, 64 * 8 + 8, 64);
         let c2 = PlaneCursor::new(&p2, 64 * 8 + 8, 64);
 
+        let token = Avx2Token::try_new().expect("avx2 available");
         assert_eq!(
-            sample_sad_16x16_avx2(&c1, &c2),
+            sad_16x_avx2::<_, 16>(&c1, &c2, token),
             sample_sad::<16, 16, _>(&c1, &c2)
         );
         assert_eq!(
-            sample_sad_16x8_avx2(&c1, &c2),
+            sad_16x_avx2::<_, 8>(&c1, &c2, token),
             sample_sad::<16, 8, _>(&c1, &c2)
         );
     }
@@ -714,18 +915,19 @@ mod tests {
             );
             return;
         }
+        let token = Avx2Token::try_new().expect("avx2 available");
         for (name, p1, p2) in input_pairs(64, 64) {
             for anchor in ANCHORS {
                 let c1 = PlaneCursor::new(&p1, anchor, 64);
                 let c2 = PlaneCursor::new(&p2, anchor, 64);
                 let at = format!("{name} @ {anchor}");
                 assert_eq!(
-                    sample_sad_16x16_avx2(&c1, &c2),
+                    sad_16x_avx2::<_, 16>(&c1, &c2, token),
                     sample_sad::<16, 16, _>(&c1, &c2),
                     "16x16 avx2 {at}"
                 );
                 assert_eq!(
-                    sample_sad_16x8_avx2(&c1, &c2),
+                    sad_16x_avx2::<_, 8>(&c1, &c2, token),
                     sample_sad::<16, 8, _>(&c1, &c2),
                     "16x8 avx2 {at}"
                 );

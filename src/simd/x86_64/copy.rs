@@ -2,142 +2,93 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE_CHROMIUM file.
 
-//! x86_64 SSE2 fixed-shape macroblock copies.
+//! Fixed-shape macroblock copies for the x86_64 kernel table (`codec/common/x86/mb_copy.asm`).
 //!
-//! C++: `codec/common/x86/mb_copy.asm`. These fill the encoder's `pfCopyNxM` slots,
-//! whose scalar bodies go through
+//! These fill the encoder's `pfCopyNxM` slots, whose scalar bodies go through
 //! [`copy_rows_shared`](crate::encoder::rec_view::copy_rows_shared).
 //!
-//! Each kernel takes the block's whole span through
-//! [`RecCursor::block_span`](crate::encoder::rec_view::RecCursor::block_span) — one
-//! bounds check per operand for the whole block, rather than two per row per side —
-//! and strides through it itself.
-//!
-//! A Rust slice carries no 16-byte alignment guarantee, so the aligned and unaligned
-//! `Copy16x16` slots both get the unaligned form; `movdqu` on aligned data matches
-//! `movdqa` on any CPU that runs this code.
-//!
-//! The 8-wide rows use `movq` in its SSE2 encoding (`_mm_loadl_epi64` /
-//! `_mm_storel_epi64`), which touches no MMX state and needs no `emms`.
+//! Each kernel cuts the block's span once per operand through [`RefSamples::span`] —
+//! one bounds check per operand for the whole block rather than per row — and walks rows
+//! via [`CellSpan::split_cell_rows`](crate::encoder::rec_view::CellSpan::split_cell_rows)
+//! so LLVM lowers the constant-width cell loops directly to unaligned vector loads and
+//! stores (`movups` / `movq`) with zero `unsafe` blocks.
 
-#![allow(unsafe_code)]
-
-use core::arch::x86_64::*;
+#![forbid(unsafe_code)]
 
 use crate::encoder::rec_view::RecCursor;
+use crate::safe::plane::{BlockRows, RefSamples};
 
-/// Copies `h` rows of 16 bytes from `src` to `dst`, each walking its own stride.
+#[cold]
+#[inline(never)]
+fn copy_narrow_stride<const W: usize, const H: usize>(dst: &RecCursor<'_>, src: &RecCursor<'_>) {
+    let s = RefSamples::span::<W, H>(src, 0, 0);
+    let d = RefSamples::span::<W, H>(dst, 0, 0);
+    for y in 0..H {
+        d.set_row::<W>(y, &s.row::<W>(y, 0));
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn copy_slice_narrow_stride<const W: usize, const H: usize>(dst: &RecCursor<'_>, src: &[u8]) {
+    let d = RefSamples::span::<W, H>(dst, 0, 0);
+    let (rows, _) = src[..W * H].as_chunks::<W>();
+    for (y, r) in rows.iter().enumerate() {
+        d.set_row::<W>(y, r);
+    }
+}
+
+/// Copies `H` rows of `W` bytes from `src` to `dst`, each walking its own stride.
 ///
 /// The strides may differ: `WelsMdBackgroundMbEnc` copies the stride-16
 /// mode-decision scratch into a picture plane.
 ///
-/// # Safety
-/// Each span must cover `(h - 1) * its own stride + 16` bytes, which is what
-/// [`RecCursor::block_span`] guarantees for the same `(16, h)`.
-///
-/// Overlapping operands are allowed: a row is read whole before any of it is
-/// written back.
-#[inline(always)]
-unsafe fn copy_rows16<const H: usize>(
-    d: *mut u8,
-    dst_stride: usize,
-    s: *const u8,
-    src_stride: usize,
-) {
-    let mut y = 0;
-    while y + 4 <= H {
-        unsafe {
-            let s0 = s.add(y * src_stride);
-            let d0 = d.add(y * dst_stride);
-            let v0 = _mm_loadu_si128(s0 as *const __m128i);
-            let v1 = _mm_loadu_si128(s0.add(src_stride) as *const __m128i);
-            let v2 = _mm_loadu_si128(s0.add(src_stride * 2) as *const __m128i);
-            let v3 = _mm_loadu_si128(s0.add(src_stride * 3) as *const __m128i);
-            _mm_storeu_si128(d0 as *mut __m128i, v0);
-            _mm_storeu_si128(d0.add(dst_stride) as *mut __m128i, v1);
-            _mm_storeu_si128(d0.add(dst_stride * 2) as *mut __m128i, v2);
-            _mm_storeu_si128(d0.add(dst_stride * 3) as *mut __m128i, v3);
-        }
-        y += 4;
-    }
-    while y + 2 <= H {
-        unsafe {
-            let s0 = s.add(y * src_stride);
-            let d0 = d.add(y * dst_stride);
-            let v0 = _mm_loadu_si128(s0 as *const __m128i);
-            let v1 = _mm_loadu_si128(s0.add(src_stride) as *const __m128i);
-            _mm_storeu_si128(d0 as *mut __m128i, v0);
-            _mm_storeu_si128(d0.add(dst_stride) as *mut __m128i, v1);
-        }
-        y += 2;
-    }
-    while y < H {
-        unsafe {
-            let v = _mm_loadu_si128(s.add(y * src_stride) as *const __m128i);
-            _mm_storeu_si128(d.add(y * dst_stride) as *mut __m128i, v);
-        }
-        y += 1;
-    }
-}
-
-/// The 8-wide form of [`copy_rows16`]; same contract with `8` for `16`.
-#[inline(always)]
-unsafe fn copy_rows8<const H: usize>(
-    d: *mut u8,
-    dst_stride: usize,
-    s: *const u8,
-    src_stride: usize,
-) {
-    let mut y = 0;
-    while y + 4 <= H {
-        unsafe {
-            let s0 = s.add(y * src_stride);
-            let d0 = d.add(y * dst_stride);
-            let v0 = _mm_loadl_epi64(s0 as *const __m128i);
-            let v1 = _mm_loadl_epi64(s0.add(src_stride) as *const __m128i);
-            let v2 = _mm_loadl_epi64(s0.add(src_stride * 2) as *const __m128i);
-            let v3 = _mm_loadl_epi64(s0.add(src_stride * 3) as *const __m128i);
-            _mm_storel_epi64(d0 as *mut __m128i, v0);
-            _mm_storel_epi64(d0.add(dst_stride) as *mut __m128i, v1);
-            _mm_storel_epi64(d0.add(dst_stride * 2) as *mut __m128i, v2);
-            _mm_storel_epi64(d0.add(dst_stride * 3) as *mut __m128i, v3);
-        }
-        y += 4;
-    }
-    while y + 2 <= H {
-        unsafe {
-            let s0 = s.add(y * src_stride);
-            let d0 = d.add(y * dst_stride);
-            let v0 = _mm_loadl_epi64(s0 as *const __m128i);
-            let v1 = _mm_loadl_epi64(s0.add(src_stride) as *const __m128i);
-            _mm_storel_epi64(d0 as *mut __m128i, v0);
-            _mm_storel_epi64(d0.add(dst_stride) as *mut __m128i, v1);
-        }
-        y += 2;
-    }
-    while y < H {
-        unsafe {
-            let v = _mm_loadl_epi64(s.add(y * src_stride) as *const __m128i);
-            _mm_storel_epi64(d.add(y * dst_stride) as *mut __m128i, v);
-        }
-        y += 1;
-    }
-}
-
-/// `W` bytes of each of `H` rows, from one shared cursor to another.
-///
-/// Panics through `block_span` if either block leaves its buffer, before any
-/// pointer is formed, so the kernels below run only over a validated span.
+/// Overlapping operands in the same `SharedPlane` behave identically to
+/// `copy_rows_shared`: each row `y` (`0..H`) is read into `[u8; W]` immediately before
+/// row `y` of `dst` is written.
 #[inline(always)]
 fn copy_block<const W: usize, const H: usize>(dst: &RecCursor<'_>, src: &RecCursor<'_>) {
-    let s = src.block_span(0, 0, W, H);
-    let d = dst.block_span(0, 0, W, H);
-    let s_ptr = s.as_ptr() as *const u8;
-    let d_ptr = d.as_ptr() as *mut u8;
-    match W {
-        16 => unsafe { copy_rows16::<H>(d_ptr, dst.stride(), s_ptr, src.stride()) },
-        8 => unsafe { copy_rows8::<H>(d_ptr, dst.stride(), s_ptr, src.stride()) },
-        _ => unreachable!("only the 8- and 16-wide rows have kernels"),
+    let s = RefSamples::span::<W, H>(src, 0, 0);
+    let d = RefSamples::span::<W, H>(dst, 0, 0);
+    if let (Some((sh, st)), Some((dh, dt))) =
+        (s.split_cell_rows::<W, H>(), d.split_cell_rows::<W, H>())
+    {
+        for (sc, dc) in sh.zip(dh) {
+            let row: [u8; W] = std::array::from_fn(|i| sc[i].get());
+            for (c, b) in dc.iter().zip(row) {
+                c.set(b);
+            }
+        }
+        let row: [u8; W] = std::array::from_fn(|i| st[i].get());
+        for (c, b) in dt.iter().zip(row) {
+            c.set(b);
+        }
+    } else {
+        copy_narrow_stride::<W, H>(dst, src);
+    }
+}
+
+/// Copies a packed `W * H` slice from `src` into `dst`.
+#[inline(always)]
+fn copy_slice<const W: usize, const H: usize>(dst: &RecCursor<'_>, src: &[u8]) {
+    let (rows, _) = src[..W * H].as_chunks::<W>();
+    let Some((last_row, head_rows)) = rows.split_last() else {
+        return;
+    };
+    let d = RefSamples::span::<W, H>(dst, 0, 0);
+    if let Some((dh, dt)) = d.split_cell_rows::<W, H>() {
+        for (sr, dc) in head_rows.iter().zip(dh) {
+            let row = *sr;
+            for (c, b) in dc.iter().zip(row) {
+                c.set(b);
+            }
+        }
+        let row = *last_row;
+        for (c, b) in dt.iter().zip(row) {
+            c.set(b);
+        }
+    } else {
+        copy_slice_narrow_stride::<W, H>(dst, src);
     }
 }
 
@@ -160,25 +111,19 @@ pub fn copy_8x16(dst: &RecCursor<'_>, src: &RecCursor<'_>) {
 }
 
 /// Upstream asm: `WelsCopy8x8_sse2` in `codec/common/x86/mb_copy.asm`.
-#[inline]
+#[inline(always)]
 pub fn copy_8x8(dst: &RecCursor<'_>, src: &RecCursor<'_>) {
     copy_block::<8, 8>(dst, src);
 }
 
-#[inline]
+#[inline(always)]
 pub fn copy_16x16_slice(dst: &RecCursor<'_>, src: &[u8]) {
-    let s = &src[..16 * 16];
-    let d = dst.block_span(0, 0, 16, 16);
-    // SAFETY: `s` covers 16 packed rows of 16 bytes and `d` covers 16 rows at `dst.stride()`.
-    unsafe { copy_rows16::<16>(d.as_ptr() as *mut u8, dst.stride(), s.as_ptr(), 16) }
+    copy_slice::<16, 16>(dst, src);
 }
 
-#[inline]
+#[inline(always)]
 pub fn copy_8x8_slice(dst: &RecCursor<'_>, src: &[u8]) {
-    let s = &src[..8 * 8];
-    let d = dst.block_span(0, 0, 8, 8);
-    // SAFETY: `s` covers 8 packed rows of 8 bytes and `d` covers 8 rows at `dst.stride()`.
-    unsafe { copy_rows8::<8>(d.as_ptr() as *mut u8, dst.stride(), s.as_ptr(), 8) }
+    copy_slice::<8, 8>(dst, src);
 }
 
 // ============================================================================
@@ -277,10 +222,9 @@ mod tests {
         }
     }
 
-    /// The span's length is the whole of the kernels' bounds safety, since they
-    /// stride from `as_ptr()`. A block that overruns its buffer by less than one
-    /// row's width still panics: a span that omitted the last row's width would
-    /// accept it.
+    /// `RefSamples::span` validates `(H - 1) * stride + W` bytes up front. A block
+    /// that overruns its buffer by less than one row's width still panics: a span
+    /// that omitted the last row's width would accept it.
     #[test]
     #[should_panic(expected = "out of range")]
     fn copy_rejects_a_block_whose_last_row_overruns() {
@@ -293,8 +237,8 @@ mod tests {
         copy_16x16(&d, &s);
     }
 
-    /// `block_span` turns an out-of-range block into a panic rather than a pointer
-    /// that reads past the plane.
+    /// `RefSamples::span` turns an out-of-range block into a panic rather than
+    /// reading or writing past the plane.
     #[test]
     #[should_panic(expected = "out of range")]
     fn copy_panics_rather_than_running_off_the_plane() {
@@ -303,6 +247,32 @@ mod tests {
         let s = RecCursor::over_owned(&mut src, 0, 16);
         let d = RecCursor::over_owned(&mut buf, 0, 16).advance(0, 8);
         copy_16x16(&d, &s);
+    }
+
+    #[test]
+    fn copy_matches_scalar_on_same_plane_overlap() {
+        let stride = 32usize;
+        for &(dx, dy) in &[(2isize, 0isize), (-2, 0), (0, 1), (0, -1), (2, 1), (-1, 2)] {
+            for (name, scalar, simd) in [
+                (
+                    "16x16",
+                    WelsCopy16x16_c as fn(&RecCursor, &RecCursor),
+                    copy_16x16 as fn(&RecCursor, &RecCursor),
+                ),
+                ("16x8", WelsCopy16x8_c, copy_16x8),
+                ("8x16", WelsCopy8x16_c, copy_8x16),
+                ("8x8", WelsCopy8x8_c, copy_8x8),
+            ] {
+                let mut want = plane(stride, 24, 17);
+                let mut got = want.clone();
+                for (buf, f) in [(&mut want, scalar), (&mut got, simd)] {
+                    let base = RecCursor::over_owned(&mut buf[..], 0, stride).advance(4, 4);
+                    let dc = base.advance(dx, dy);
+                    f(&dc, &base);
+                }
+                assert_eq!(got, want, "{name} overlap ({dx}, {dy})");
+            }
+        }
     }
 
     #[test]
