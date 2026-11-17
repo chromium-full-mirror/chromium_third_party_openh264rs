@@ -426,6 +426,9 @@ impl<'a> CellSpan<'a> {
     }
 
     /// Writes `W` bytes into row `y` of this span.
+    // Called only from `simd::x86_64` and `simd::aarch64`, so scalar-only
+    // targets such as 32-bit `arm` compile it without intra-crate callers.
+    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn set_row<const W: usize>(&self, y: usize, src: &[u8; W]) {
         let off = y * (self.stride as usize);

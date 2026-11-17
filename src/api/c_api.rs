@@ -1251,7 +1251,10 @@ pub(crate) mod abi_test_driver {
         unsafe {
             {
                 let mut p_decoder: *mut ISVCDecoder = ptr::null_mut();
-                assert_eq!(WelsCreateDecoder(&mut p_decoder), CM_RESULT_SUCCESS as i64);
+                assert_eq!(
+                    WelsCreateDecoder(&mut p_decoder),
+                    CM_RESULT_SUCCESS as c_long
+                );
                 assert!(!p_decoder.is_null());
                 let vtbl = (*p_decoder).lpVtbl;
 
@@ -1261,7 +1264,7 @@ pub(crate) mod abi_test_driver {
                 dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
                 assert_eq!(
                     ((*vtbl).Initialize)(p_decoder, &dec_param as *const SDecodingParam),
-                    CM_RESULT_SUCCESS as i64
+                    CM_RESULT_SUCCESS as c_long
                 );
 
                 let mut frames = 0;
@@ -1691,7 +1694,10 @@ mod f23_boundary_provenance {
         unsafe {
             // --- the decoder half -------------------------------------------
             let mut p_decoder = ptr::null_mut();
-            assert_eq!(WelsCreateDecoder(&mut p_decoder), CM_RESULT_SUCCESS as i64);
+            assert_eq!(
+                WelsCreateDecoder(&mut p_decoder),
+                CM_RESULT_SUCCESS as c_long
+            );
             assert!(!p_decoder.is_null());
 
             let mut dec_param = SDecodingParam::default();
@@ -1702,7 +1708,7 @@ mod f23_boundary_provenance {
             // stores `*pParam` into `SWelsDecoderContext::pParam` via `core.initialize()`.
             assert_eq!(
                 ISVCDecoder::Initialize(p_decoder, &dec_param),
-                CM_RESULT_SUCCESS as i64
+                CM_RESULT_SUCCESS as c_long
             );
 
             // `bEndOfStream` lives further out still, and this pair writes then reads
@@ -1723,7 +1729,7 @@ mod f23_boundary_provenance {
 
             assert_eq!(
                 ISVCDecoder::Uninitialize(p_decoder),
-                CM_RESULT_SUCCESS as i64
+                CM_RESULT_SUCCESS as c_long
             );
             WelsDestroyDecoder(p_decoder);
 
@@ -1843,7 +1849,7 @@ mod send_verdict {
         dec_param.uiTargetDqLayer = u8::MAX;
         dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
         dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        assert_eq!(dec.initialize(&dec_param), CM_RESULT_SUCCESS as i64);
+        assert_eq!(dec.initialize(&dec_param), CM_RESULT_SUCCESS as c_long);
 
         let bitstream = std::thread::spawn(move || {
             let y = [128u8; 64 * 64];
@@ -1880,7 +1886,7 @@ mod send_verdict {
             assert_eq!(dst_info.iBufferStatus, 1);
             assert!(dst_info.yuv_planes(&dec).is_some());
             let sys = *dst_info.UsrData.sys();
-            assert_eq!(dec.uninitialize(), CM_RESULT_SUCCESS as i64);
+            assert_eq!(dec.uninitialize(), CM_RESULT_SUCCESS as c_long);
             (sys.iWidth, sys.iHeight)
         })
         .join()
@@ -1905,14 +1911,14 @@ mod abi_panic_guard {
     fn a_panic_inside_a_decoder_thunk_becomes_dsbitstreamerror() {
         unsafe {
             let mut decoder: *mut ISVCDecoder = ptr::null_mut();
-            assert_eq!(WelsCreateDecoder(&mut decoder), CM_RESULT_SUCCESS as i64);
+            assert_eq!(WelsCreateDecoder(&mut decoder), CM_RESULT_SUCCESS as c_long);
             let param = SDecodingParam {
                 uiTargetDqLayer: u8::MAX,
                 ..SDecodingParam::default()
             };
             assert_eq!(
                 ISVCDecoder::Initialize(decoder, &param as *const SDecodingParam),
-                CM_RESULT_SUCCESS as i64
+                CM_RESULT_SUCCESS as c_long
             );
 
             let mut p_dst: [*mut u8; 3] = [ptr::null_mut(); 3];
