@@ -845,9 +845,7 @@ impl Decoder {
             return DECODING_STATE::dsErrorFree;
         };
         if p_ctx.bEndOfStreamFlag && p_ctx.pPictReoderingStatus.iNumOfPicts > 0 {
-            // `false`: drain the slot list without touching the live pool. See
-            // `pool_for`.
-            ReleaseBufferedReadyPictureReorder(&mut *p_ctx, false, ppDst, pDstInfo, true);
+            ReleaseBufferedReadyPictureReorder(&mut *p_ctx, ppDst, pDstInfo, true);
             if pDstInfo.iBufferStatus == 1 {
                 self.last_output_dst = pDstInfo.pDst.map(|p| p as usize);
             }
@@ -1395,7 +1393,7 @@ fn EmitOnFullPictInfoList(
     // Force the smallest waiting picture out, which frees its slot, buffer the
     // current picture into it, and hand the freed picture to the caller.
     let sCurrent = *pDstInfo;
-    ReleaseBufferedReadyPictureReorder(pCtx, true, ppDst, pDstInfo, true);
+    ReleaseBufferedReadyPictureReorder(pCtx, ppDst, pDstInfo, true);
     let sEmitted = *pDstInfo;
     let pEmitted = *ppDst;
     *pDstInfo = sCurrent;
@@ -1471,7 +1469,6 @@ fn DiscardBufferedPictures(pCtx: &mut crate::decoder::decoder_core::SWelsDecoder
 /// `welsDecoderExt.cpp`.
 fn EmitBufferedPicture(
     pCtx: &mut crate::decoder::decoder_core::SWelsDecoderContext,
-    bUsePool: bool,
     ppDst: &mut [*mut u8; 3],
     pDstInfo: &mut SBufferInfo,
 ) {
@@ -1481,19 +1478,20 @@ fn EmitBufferedPicture(
     pCtx.pPictInfoList[idx].iPOC = crate::decoder::decoder_context::IMinInt32;
     let iPicBuffIdx = pCtx.pPictInfoList[idx].iPicBuffIdx;
     // The pool is resolved here, not by the caller: the borrow is taken — and ended —
-    // inside this block. `FlushFrame` passes `bUsePool = false` to emit the buffered
-    // picture's planes without decrementing its pool reference count (`welsDecoderExt.cpp`).
+    // inside this block. Every emission (`DecodeFrame2` and `FlushFrame` alike) drops
+    // the reordering-buffer `iRefCount` hold taken in [`StoreReadyPicture`] so a
+    // `Decoder` drained at end-of-stream can recycle its pool slots on subsequent
+    // sequences; pictures still in `sRefPic` remain pinned by `bUsedAsRef` until
+    // evicted or reset.
     if let Some(pPicBuff) = pic_pool_ptr(&mut pCtx.pPicBuff) {
         // `slot_at_mut` carries the `>= 0 && < iCapacity` range test, so a failed test
         // is its `None`.
         if let Some(pPic) = pPicBuff.slot_at_mut(iPicBuffIdx) {
             crate::decoder::decoder_core::stamp_dst_planes(pPic, &sFrameCrop, ppDst, pDstInfo);
-            if bUsePool {
-                pPic.iRefCount -= 1;
-                if pPic.iRefCount <= 0 {
-                    if let Some(set_unref) = pPic.pSetUnRef {
-                        set_unref(pPic);
-                    }
+            pPic.iRefCount -= 1;
+            if pPic.iRefCount <= 0 {
+                if let Some(set_unref) = pPic.pSetUnRef {
+                    set_unref(pPic);
                 }
             }
         }
@@ -1522,7 +1520,6 @@ fn EmitBufferedPicture(
 ///   a VUI down to what its encoder promised.
 fn ReleaseBufferedReadyPictureReorder(
     pCtx: &mut crate::decoder::decoder_core::SWelsDecoderContext,
-    bUsePool: bool,
     ppDst: &mut [*mut u8; 3],
     pDstInfo: &mut SBufferInfo,
     isFlush: bool,
@@ -1578,7 +1575,7 @@ fn ReleaseBufferedReadyPictureReorder(
         if isReady {
             pCtx.pPictReoderingStatus.iLastWrittenPOC = pCtx.pPictReoderingStatus.iMinPOC;
             pCtx.pPictReoderingStatus.iLastWrittenSeqNum = pCtx.pPictReoderingStatus.iMinSeqNum;
-            EmitBufferedPicture(pCtx, bUsePool, ppDst, pDstInfo);
+            EmitBufferedPicture(pCtx, ppDst, pDstInfo);
             pCtx.pPictReoderingStatus.iMinPOC = IMinInt32;
         }
     }
@@ -1607,6 +1604,91 @@ fn ReorderPicturesInDisplay(
         // this cannot happen.
         EmitOnFullPictInfoList(pCtx, ppDst, pDstInfo);
     } else {
-        ReleaseBufferedReadyPictureReorder(pCtx, true, ppDst, pDstInfo, false);
+        ReleaseBufferedReadyPictureReorder(pCtx, ppDst, pDstInfo, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::manage_dec_ref::SetUnRef;
+    use crate::decoder::pic_queue::{CreatePicBuff, PicPool};
+
+    fn slot_state(pool: &PicPool, id: crate::decoder::pic_queue::PicId) -> (i8, bool, bool) {
+        let pic = pool.slot(id).expect("allocated slot");
+        (pic.iRefCount, pic.bUsedAsRef, pic.pSetUnRef.is_some())
+    }
+
+    #[test]
+    fn flush_releases_pool_ref_count_and_runs_deferred_set_unref() {
+        let mut dec = Decoder::new();
+        let mut param = SDecodingParam::default();
+        param.uiTargetDqLayer = u8::MAX;
+        assert_eq!(dec.initialize(&param), CM_RESULT_SUCCESS as c_long);
+
+        let (id0, id1) = {
+            let ctx = dec.ctx.as_deref_mut().expect("initialized context");
+            let mut pool = CreatePicBuff(false, 4, 32, 32).expect("pool allocates");
+
+            // First picture: already evicted from DPB while buffered for display
+            // (`SetUnRef` deferred teardown because `iRefCount` will be > 0).
+            let id0 = pool.prefetch_free().expect("first slot");
+            {
+                let pic0 = pool.slot_mut(id0).unwrap();
+                pic0.iFramePoc = 2;
+                pic0.bUsedAsRef = true;
+                pic0.pSetUnRef = Some(SetUnRef);
+            }
+
+            // Second picture: still active in DPB (`bUsedAsRef = true`, no deferred `SetUnRef`).
+            let id1 = pool.prefetch_free().expect("second slot");
+            {
+                let pic1 = pool.slot_mut(id1).unwrap();
+                pic1.iFramePoc = 4;
+                pic1.bUsedAsRef = true;
+            }
+
+            ctx.pPicBuff = Some(pool);
+
+            let mut info0 = SBufferInfo::default();
+            info0.iBufferStatus = 1;
+            ctx.pLastDecPicInfo.pPreviousDecodedPictureInDpb = Some(id0);
+            StoreReadyPicture(ctx, &mut info0);
+
+            let mut info1 = SBufferInfo::default();
+            info1.iBufferStatus = 1;
+            ctx.pLastDecPicInfo.pPreviousDecodedPictureInDpb = Some(id1);
+            StoreReadyPicture(ctx, &mut info1);
+            (id0, id1)
+        };
+
+        assert_eq!(dec.frames_remaining(), 2);
+        {
+            let pool = dec.ctx.as_ref().unwrap().pPicBuff.as_ref().unwrap();
+            assert_eq!(slot_state(pool, id0), (1, true, true));
+            assert_eq!(slot_state(pool, id1), (1, true, false));
+        }
+
+        dec.set_end_of_stream(true);
+        let mut out0 = SBufferInfo::default();
+        assert_eq!(dec.flush(&mut out0), DECODING_STATE::dsErrorFree);
+        assert_eq!(out0.iBufferStatus, 1);
+        assert_eq!(dec.frames_remaining(), 1);
+
+        let mut out1 = SBufferInfo::default();
+        assert_eq!(dec.flush(&mut out1), DECODING_STATE::dsErrorFree);
+        assert_eq!(out1.iBufferStatus, 1);
+        assert_eq!(dec.frames_remaining(), 0);
+
+        {
+            let pool = dec.ctx.as_ref().unwrap().pPicBuff.as_ref().unwrap();
+            // `id0` had deferred `SetUnRef`: `iRefCount` dropped to 0 and `SetUnRef`
+            // cleared `bUsedAsRef` and `pSetUnRef`, making the slot immediately free.
+            assert_eq!(slot_state(pool, id0), (0, false, false));
+            assert!(pool.slot(id0).unwrap().is_free());
+            // `id1` is still in `sRefPic`: `iRefCount` dropped to 0 while `bUsedAsRef`
+            // remains true until DPB eviction or `WelsResetRefPic`.
+            assert_eq!(slot_state(pool, id1), (0, true, false));
+        }
     }
 }

@@ -198,3 +198,118 @@ pub(crate) fn decode_frame_no_delay_matches_the_reference_on_every_axis() {
         );
     }
 }
+
+/// Runs one full pass + EOS flush on an already-initialized `Decoder`, returning
+/// `(emitted_frames, flushed_frames, yuv_sha1)`.
+fn decode_and_flush_pass(dec: &mut Decoder, data: &[u8]) -> (usize, i32, String) {
+    let mut hasher = Sha1Hasher::new();
+    let mut frames = 0usize;
+
+    let mut take = |dec: &Decoder, info: &SBufferInfo| {
+        if info.iBufferStatus != 1 {
+            return;
+        }
+        for row in info
+            .y_rows(dec)
+            .chain(info.u_rows(dec))
+            .chain(info.v_rows(dec))
+        {
+            hasher.update(row);
+        }
+        frames += 1;
+    };
+
+    for (idx, unit) in split_annexb_units(data).enumerate() {
+        let mut info = SBufferInfo::default();
+        let st = dec.decode(Some(unit), &mut info);
+        assert_eq!(st, DECODING_STATE::dsErrorFree, "decode(Some) failed at unit {idx}");
+        take(dec, &info);
+
+        let mut info = SBufferInfo::default();
+        let st = dec.decode(None, &mut info);
+        assert_eq!(st, DECODING_STATE::dsErrorFree, "decode(None) failed at unit {idx}");
+        take(dec, &info);
+    }
+
+    dec.set_end_of_stream(true);
+    let mut info = SBufferInfo::default();
+    let st = dec.decode(None, &mut info);
+    assert_eq!(st, DECODING_STATE::dsErrorFree, "EOS decode(None) failed");
+    take(dec, &info);
+
+    let remaining = dec.frames_remaining();
+    for i in 0..remaining {
+        let mut info = SBufferInfo::default();
+        let st = dec.flush(&mut info);
+        assert_eq!(st, DECODING_STATE::dsErrorFree, "flush {i} failed");
+        assert_eq!(info.iBufferStatus, 1, "flush {i} must emit a buffered picture");
+        take(dec, &info);
+    }
+    assert_eq!(dec.frames_remaining(), 0, "reordering buffer must be empty after flush");
+    dec.set_end_of_stream(false);
+
+    (frames, remaining, hasher.digest())
+}
+
+/// Regression test for https://issues.chromium.org/issues/586589228:
+/// pictures emitted by `flush()` must release their reordering-buffer reference in
+/// `PicPool` so the same `Decoder` can keep decoding across EOS boundaries without
+/// exhausting the pool (`dsOutOfMemory`).
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+fn decoder_can_be_reused_across_multiple_eos_flushes() {
+    let cases = [
+        ("CABA3_SVA_B.264", "1b811ad90ac4ce9beb034cb8c993ad4e2935f46a"),
+        ("CACQP3_Sony_D.jsv", "2ab41abd239c1c556e91ff027f47002001ee8605"),
+        (
+            "Cisco_Men_whisper_640x320_CABAC_Bframe_9.264",
+            "2b349c1bc806b6e0412008747b2463d77b576476",
+        ),
+        (
+            "Cisco_Adobe_PDF_sample_a_1024x768_CAVLC_Bframe_9.264",
+            "9d758d9e6f4dead0d7b361f3ddf2ee009d0ea190",
+        ),
+    ];
+
+    for (asset, expected_sha1) in cases {
+        let data = common::read_stream(asset);
+        let mut dec = Decoder::new();
+        let mut param = SDecodingParam::default();
+        param.uiTargetDqLayer = u8::MAX;
+        param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+        assert_eq!(dec.initialize(&param), CM_RESULT_SUCCESS as std::ffi::c_long);
+
+        let (frames0, flushed0, sha0) = decode_and_flush_pass(&mut dec, &data);
+        assert!(flushed0 > 0, "{asset}: expected non-empty EOS flush");
+        assert_eq!(sha0, expected_sha1, "{asset} pass 0 SHA-1");
+
+        // Decode two more full passes on the same `Decoder` without re-initializing,
+        // ensuring total flushed frames far exceed `PicPool` capacity.
+        for pass in 1..=2 {
+            let (frames, flushed, sha) = decode_and_flush_pass(&mut dec, &data);
+            assert_eq!(frames, frames0, "{asset} pass {pass}: frame count");
+            assert_eq!(flushed, flushed0, "{asset} pass {pass}: flushed count");
+            assert_eq!(sha, expected_sha1, "{asset} pass {pass}: SHA-1");
+        }
+
+        dec.uninitialize();
+    }
+
+    // Also verify cross-stream reuse (switching streams & resolutions after EOS flush).
+    let mut dec = Decoder::new();
+    let mut param = SDecodingParam::default();
+    param.uiTargetDqLayer = u8::MAX;
+    param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+    assert_eq!(dec.initialize(&param), CM_RESULT_SUCCESS as std::ffi::c_long);
+
+    for (asset, expected_sha1) in cases.iter().chain(cases.iter().rev()) {
+        let data = common::read_stream(asset);
+        let (_, flushed, sha) = decode_and_flush_pass(&mut dec, &data);
+        assert!(flushed > 0, "{asset}: expected non-empty EOS flush");
+        assert_eq!(sha, *expected_sha1, "cross-stream {asset}: SHA-1");
+    }
+    dec.uninitialize();
+}
+
