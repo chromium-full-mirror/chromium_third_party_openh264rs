@@ -55,3 +55,26 @@ pub fn sum_of_16x16_block_of_frame(
         pTimesOfFeatureValue,
     );
 }
+
+#[inline(always)]
+pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    svc_motion_estimate::sea_row_half_sums_c::<N>(c, a0, a1);
+}
+
+#[inline(always)]
+pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    svc_motion_estimate::sea_col_half_sums_c::<N>(c, a0, a1);
+}
+
+#[inline(always)]
+pub fn sea_bounds(
+    w0: &[u16],
+    w1: &[u16],
+    half: usize,
+    e: [u16; 4],
+    iFixedMvd: u16,
+    mvd: &[u16],
+    bound: &mut [u16],
+) {
+    svc_motion_estimate::sea_bounds_c(w0, w1, half, e, iFixedMvd, mvd, bound);
+}

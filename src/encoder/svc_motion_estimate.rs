@@ -902,6 +902,256 @@ pub fn CheckDirectionalMvFalse(
 
 // 1D Orthogonal Cross Search (ME_CROSS)
 
+// Successive elimination: the summed abs difference of quadrant sums is a lower
+// bound on SAD, so a candidate whose bound plus MV cost reaches
+// min(best, pMe.uiSadCost) is skipped. The first minimum below uiSadCost always
+// passes, so the result the caller uses is unchanged.
+
+/// Per-thread scratch for [`sea_line_search`]; grown on demand, never cleared.
+#[derive(Default)]
+struct SeaScratch {
+    a0: Vec<u16>,
+    a1: Vec<u16>,
+    w0: Vec<u16>,
+    w1: Vec<u16>,
+    bound: Vec<u16>,
+}
+
+impl SeaScratch {
+    #[inline]
+    fn reserve(&mut self, line: usize, n: usize) {
+        for v in [&mut self.a0, &mut self.a1, &mut self.w0, &mut self.w1] {
+            if v.len() < line {
+                v.resize(line, 0);
+            }
+        }
+        if self.bound.len() < n {
+            self.bound.resize(n, 0);
+        }
+    }
+}
+
+thread_local! {
+    static SEA_SCRATCH: std::cell::RefCell<SeaScratch> =
+        std::cell::RefCell::new(SeaScratch::default());
+}
+
+/// Quadrant sums `[TL, TR, BL, BR]` of the `N`x`N` block at `c`.
+#[inline(always)]
+fn sea_block_quads<const N: usize>(c: &RecCursor<'_>) -> [u16; 4] {
+    let mut q = [0u16; 4];
+    for (y, row) in c.row_windows::<N>(0, 0, N).enumerate() {
+        let (mut l, mut r) = (0u16, 0u16);
+        for (x, cell) in row.iter().enumerate() {
+            if x < N / 2 {
+                l += cell.get() as u16;
+            } else {
+                r += cell.get() as u16;
+            }
+        }
+        let k = if y < N / 2 { 0 } else { 2 };
+        q[k] += l;
+        q[k + 1] += r;
+    }
+    q
+}
+
+/// `dst[i] = src[i] + .. + src[i + H - 1]` for every `i` in `dst`.
+#[inline(always)]
+fn sea_window_sum<const H: usize>(src: &[u16], dst: &mut [u16]) {
+    let src = &src[..dst.len() + H - 1];
+    for (i, d) in dst.iter_mut().enumerate() {
+        let w = &src[i..i + H];
+        let mut s = 0u16;
+        for &v in w {
+            s += v;
+        }
+        *d = s;
+    }
+}
+
+/// Line search over `n` candidates; candidate `i`'s MV cost is `mvd[4 * i]`.
+/// Returns `(cost, index)`, matching the plain loop whenever `cost < uiAccept`.
+#[inline(never)]
+fn sea_line_search<const N: usize>(
+    sad_fn: PSampleSadSatdCostFunc,
+    cEnc: &RecCursor<'_>,
+    cRefStart: RecCursor<'_>,
+    n: usize,
+    vertical: bool,
+    iFixedMvd: u16,
+    mvd: &[u16],
+    uiAccept: u32,
+) -> (u32, usize) {
+    let half = N / 2;
+    let line = n + N - 1;
+    let [eTL, eTR, eBL, eBR] = sea_block_quads::<N>(cEnc);
+
+    SEA_SCRATCH.with_borrow_mut(|s| {
+        s.reserve(line, n);
+        let SeaScratch {
+            a0,
+            a1,
+            w0,
+            w1,
+            bound,
+        } = s;
+        let (a0, a1) = (&mut a0[..line], &mut a1[..line]);
+        let (w0, w1) = (&mut w0[..n + half], &mut w1[..n + half]);
+        let bound = &mut bound[..n];
+
+        // `w0`/`w1`: left/right (vertical) or top/bottom (horizontal) half sums
+        // over a window of `half` along the line.
+        let e;
+        if vertical {
+            kernels::me::sea_row_half_sums::<N>(&cRefStart, a0, a1);
+            e = [eTL, eBL, eTR, eBR];
+        } else {
+            kernels::me::sea_col_half_sums::<N>(&cRefStart, a0, a1);
+            e = [eTL, eTR, eBL, eBR];
+        }
+        if N == 16 {
+            sea_window_sum::<8>(a0, w0);
+            sea_window_sum::<8>(a1, w1);
+        } else {
+            sea_window_sum::<4>(a0, w0);
+            sea_window_sum::<4>(a1, w1);
+        }
+        kernels::me::sea_bounds(w0, w1, half, e, iFixedMvd, mvd, bound);
+
+        // Visit candidates in order, skipping those with bound >= min(best, uiAccept).
+        let mut uiThresh = uiAccept;
+        let mut uiBestCost = u32::MAX;
+        let mut iBest = 0usize;
+        let mut visit = |i: usize, b: u16, uiThresh: &mut u32| {
+            if (b as u32) < *uiThresh {
+                let cRef = if vertical {
+                    cRefStart.advance(0, i as isize)
+                } else {
+                    cRefStart.advance(i as isize, 0)
+                };
+                let uiCost = (sad_fn(cEnc, &cRef) as u32) + iFixedMvd as u32 + mvd[4 * i] as u32;
+                if uiCost < uiBestCost {
+                    uiBestCost = uiCost;
+                    iBest = i;
+                    *uiThresh = (*uiThresh).min(uiCost);
+                }
+            }
+        };
+        const GROUP: usize = 16;
+        let (groups, rest) = bound.as_chunks::<GROUP>();
+        for (g, group) in groups.iter().enumerate() {
+            let mut mask = 0u32;
+            for (j, &b) in group.iter().enumerate() {
+                mask |= (((b as u32) < uiThresh) as u32) << j;
+            }
+            while mask != 0 {
+                let j = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                visit(g * GROUP + j, group[j], &mut uiThresh);
+            }
+        }
+        let base = n - rest.len();
+        for (j, &b) in rest.iter().enumerate() {
+            visit(base + j, b, &mut uiThresh);
+        }
+        (uiBestCost, iBest)
+    })
+}
+
+/// Left/right half sums of each `N`-wide row at `c`, one row per entry of `a0`.
+#[inline(always)]
+pub fn sea_row_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    let rows = a0.len();
+    let a1 = &mut a1[..rows];
+    for ((row, l), r) in c
+        .row_windows::<N>(0, 0, rows)
+        .zip(a0.iter_mut())
+        .zip(a1.iter_mut())
+    {
+        let (mut sl, mut sr) = (0u16, 0u16);
+        for (x, cell) in row.iter().enumerate() {
+            if x < N / 2 {
+                sl += cell.get() as u16;
+            } else {
+                sr += cell.get() as u16;
+            }
+        }
+        *l = sl;
+        *r = sr;
+    }
+}
+
+/// Top/bottom half sums of each `N`-tall column at `c`, one column per entry of `a0`.
+#[inline(always)]
+pub fn sea_col_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    let cols = a0.len();
+    let a1 = &mut a1[..cols];
+    // A ragged tail overlaps the previous chunk rather than reading past the end.
+    let chunk = |x0: usize, a0: &mut [u16], a1: &mut [u16]| {
+        let (mut t, mut b) = ([0u16; 16], [0u16; 16]);
+        for (y, row) in c.row_windows::<16>(0, x0 as isize, N).enumerate() {
+            let acc = if y < N / 2 { &mut t } else { &mut b };
+            for (s, cell) in acc.iter_mut().zip(row.iter()) {
+                *s += cell.get() as u16;
+            }
+        }
+        a0[x0..x0 + 16].copy_from_slice(&t);
+        a1[x0..x0 + 16].copy_from_slice(&b);
+    };
+    let mut x = 0usize;
+    while x + 16 <= cols {
+        chunk(x, a0, a1);
+        x += 16;
+    }
+    if x < cols {
+        if cols >= 16 {
+            chunk(cols - 16, a0, a1);
+        } else {
+            for x in x..cols {
+                let (mut t, mut b) = (0u16, 0u16);
+                for y in 0..N {
+                    let v = c.at(x as isize, y as isize) as u16;
+                    if y < N / 2 {
+                        t += v;
+                    } else {
+                        b += v;
+                    }
+                }
+                a0[x] = t;
+                a1[x] = b;
+            }
+        }
+    }
+}
+
+/// Per-candidate cost lower bound: quadrant abs diffs plus MV cost, saturated.
+#[inline(always)]
+pub fn sea_bounds_c(
+    w0: &[u16],
+    w1: &[u16],
+    half: usize,
+    e: [u16; 4],
+    iFixedMvd: u16,
+    mvd: &[u16],
+    bound: &mut [u16],
+) {
+    let n = bound.len();
+    if n == 0 {
+        return;
+    }
+    let (w0a, w0b) = (&w0[..n], &w0[half..half + n]);
+    let (w1a, w1b) = (&w1[..n], &w1[half..half + n]);
+    let mvd = &mvd[..4 * (n - 1) + 1];
+    for i in 0..n {
+        let lb = w0a[i].abs_diff(e[0])
+            + w0b[i].abs_diff(e[1])
+            + w1a[i].abs_diff(e[2])
+            + w1b[i].abs_diff(e[3]);
+        bound[i] = lb.saturating_add(iFixedMvd.saturating_add(mvd[4 * i]));
+    }
+}
+
 pub fn LineFullSearch_c(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
@@ -922,20 +1172,20 @@ pub fn LineFullSearch_c(
 
     let iMinPos: i32;
     let iMaxPos: i32;
-    let iFixedMvd: i32;
+    let iFixedMvd: u16;
     let iCurMeBlockPix: i32;
     let mut pMvdCost: MvdCostCursor<'_>;
 
     if bVerticalSearch {
         iMinPos = kiCurMeBlockPixY + iMinMv as i32;
         iMaxPos = kiCurMeBlockPixY + iMaxMv as i32;
-        iFixedMvd = pMvdTable.at(-(pMe.sMvp.iMvX as i32)) as i32;
+        iFixedMvd = pMvdTable.at(-(pMe.sMvp.iMvX as i32));
         iCurMeBlockPix = kiCurMeBlockPixY;
         pMvdCost = pMvdTable.offset((iMinMv as i32 * 4) - pMe.sMvp.iMvY as i32);
     } else {
         iMinPos = kiCurMeBlockPixX + iMinMv as i32;
         iMaxPos = kiCurMeBlockPixX + iMaxMv as i32;
-        iFixedMvd = pMvdTable.at(-(pMe.sMvp.iMvY as i32)) as i32;
+        iFixedMvd = pMvdTable.at(-(pMe.sMvp.iMvY as i32));
         iCurMeBlockPix = kiCurMeBlockPixX;
         pMvdCost = pMvdTable.offset((iMinMv as i32 * 4) - pMe.sMvp.iMvX as i32);
     }
@@ -947,12 +1197,50 @@ pub fn LineFullSearch_c(
     let mut uiBestCost: u32 = 0xFFFF_FFFF;
     let mut iBestPos: i32 = 0;
 
-    if bVerticalSearch {
+    let iCands = (iMaxPos - iMinPos) as usize;
+    let sea = match (pSad, block_size) {
+        (Some(sad_fn), BLOCK_16x16) => Some((sad_fn, 16usize)),
+        (Some(sad_fn), BLOCK_8x8) => Some((sad_fn, 8usize)),
+        _ => None,
+    };
+    if let Some((sad_fn, iBlock)) = sea {
+        let cRefStart = if bVerticalSearch {
+            pRefPlane.cursor(kiX, iMinPos as isize)
+        } else {
+            pRefPlane.cursor(iMinPos as isize, kiY)
+        };
+        let mvd = pMvdCost.run(4 * (iCands - 1) + 1);
+        let (uiCost, iBest) = if iBlock == 16 {
+            sea_line_search::<16>(
+                sad_fn,
+                &cEnc,
+                cRefStart,
+                iCands,
+                bVerticalSearch,
+                iFixedMvd,
+                mvd,
+                pMe.uiSadCost,
+            )
+        } else {
+            sea_line_search::<8>(
+                sad_fn,
+                &cEnc,
+                cRefStart,
+                iCands,
+                bVerticalSearch,
+                iFixedMvd,
+                mvd,
+                pMe.uiSadCost,
+            )
+        };
+        uiBestCost = uiCost;
+        iBestPos = iMinPos + iBest as i32;
+    } else if bVerticalSearch {
         let mut cRef = pRefPlane.cursor(kiX, iMinPos as isize);
         if let Some(sad_fn) = pSad {
             for iTargetPos in iMinPos..iMaxPos {
                 let uiSadCost =
-                    (sad_fn(&cEnc, &cRef) as u32) + (iFixedMvd + pMvdCost.at(0) as i32) as u32;
+                    (sad_fn(&cEnc, &cRef) as u32) + iFixedMvd as u32 + pMvdCost.at(0) as u32;
                 if uiSadCost < uiBestCost {
                     uiBestCost = uiSadCost;
                     iBestPos = iTargetPos;
@@ -962,7 +1250,7 @@ pub fn LineFullSearch_c(
             }
         } else {
             for iTargetPos in iMinPos..iMaxPos {
-                let uiSadCost = (iFixedMvd + pMvdCost.at(0) as i32) as u32;
+                let uiSadCost = iFixedMvd as u32 + pMvdCost.at(0) as u32;
                 if uiSadCost < uiBestCost {
                     uiBestCost = uiSadCost;
                     iBestPos = iTargetPos;
@@ -975,7 +1263,7 @@ pub fn LineFullSearch_c(
         if let Some(sad_fn) = pSad {
             for iTargetPos in iMinPos..iMaxPos {
                 let uiSadCost =
-                    (sad_fn(&cEnc, &cRef) as u32) + (iFixedMvd + pMvdCost.at(0) as i32) as u32;
+                    (sad_fn(&cEnc, &cRef) as u32) + iFixedMvd as u32 + pMvdCost.at(0) as u32;
                 if uiSadCost < uiBestCost {
                     uiBestCost = uiSadCost;
                     iBestPos = iTargetPos;
@@ -985,7 +1273,7 @@ pub fn LineFullSearch_c(
             }
         } else {
             for iTargetPos in iMinPos..iMaxPos {
-                let uiSadCost = (iFixedMvd + pMvdCost.at(0) as i32) as u32;
+                let uiSadCost = iFixedMvd as u32 + pMvdCost.at(0) as u32;
                 if uiSadCost < uiBestCost {
                     uiBestCost = uiSadCost;
                     iBestPos = iTargetPos;
@@ -2338,5 +2626,212 @@ mod tests {
         // In-bounds feature with missing planes returns false rather than panicking.
         search_in.iFeatureOfCurrent = 0;
         assert!(!FeatureSearchOne(&search_in, 0, 4, &mut out));
+    }
+}
+
+#[cfg(test)]
+mod sea_tests {
+    use super::*;
+    use crate::safe::prng::Prng;
+
+    /// Biased toward 0 and 255 to stress the `u16` sums.
+    fn pixels(rng: &mut Prng, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|_| match rng.below(6) {
+                0 => 0,
+                1 | 2 => 255,
+                _ => rng.next_u8(),
+            })
+            .collect()
+    }
+
+    fn sad<const N: usize>(a: &RecCursor<'_>, b: &RecCursor<'_>) -> i32 {
+        let mut s = 0i32;
+        for y in 0..N as isize {
+            for x in 0..N as isize {
+                s += (a.at(x, y) as i32 - b.at(x, y) as i32).abs();
+            }
+        }
+        s
+    }
+
+    /// The unpruned loop.
+    fn plain<const N: usize>(
+        cEnc: &RecCursor<'_>,
+        cRefStart: RecCursor<'_>,
+        n: usize,
+        vertical: bool,
+        iFixedMvd: u16,
+        mvd: &[u16],
+    ) -> (u32, usize) {
+        let (mut best, mut at) = (u32::MAX, 0usize);
+        for i in 0..n {
+            let c = if vertical {
+                cRefStart.advance(0, i as isize)
+            } else {
+                cRefStart.advance(i as isize, 0)
+            };
+            let cost = sad::<N>(cEnc, &c) as u32 + iFixedMvd as u32 + mvd[4 * i] as u32;
+            if cost < best {
+                best = cost;
+                at = i;
+            }
+        }
+        (best, at)
+    }
+
+    /// Exact-fit buffers, so any over-read panics.
+    #[test]
+    fn sea_kernels_match_scalar_over_exact_fit_buffers() {
+        let mut rng = Prng::new(0x5EA_0001);
+        fn rows<const N: usize>(rng: &mut Prng) {
+            for rows in 0..=41usize {
+                for stride in [N, N + 3, 64] {
+                    let len = if rows == 0 {
+                        0
+                    } else {
+                        (rows - 1) * stride + N
+                    };
+                    let mut buf = pixels(rng, len.max(1));
+                    let c = RecCursor::over_owned(&mut buf, 0, stride);
+                    let (mut w0, mut w1) = (vec![0u16; rows], vec![0u16; rows]);
+                    let (mut g0, mut g1) = (vec![1u16; rows], vec![1u16; rows]);
+                    sea_row_half_sums_c::<N>(&c, &mut w0, &mut w1);
+                    kernels::me::sea_row_half_sums::<N>(&c, &mut g0, &mut g1);
+                    assert_eq!((g0, g1), (w0, w1), "rows N={N} rows={rows} stride={stride}");
+                }
+            }
+        }
+        fn cols<const N: usize>(rng: &mut Prng) {
+            for cols in 1..=50usize {
+                for stride in [cols, cols + 5, 80] {
+                    let len = (N - 1) * stride + cols;
+                    let mut buf = pixels(rng, len);
+                    let c = RecCursor::over_owned(&mut buf, 0, stride);
+                    let (mut w0, mut w1) = (vec![0u16; cols], vec![0u16; cols]);
+                    let (mut g0, mut g1) = (vec![1u16; cols], vec![1u16; cols]);
+                    sea_col_half_sums_c::<N>(&c, &mut w0, &mut w1);
+                    kernels::me::sea_col_half_sums::<N>(&c, &mut g0, &mut g1);
+                    assert_eq!((g0, g1), (w0, w1), "cols N={N} cols={cols} stride={stride}");
+                }
+            }
+        }
+        rows::<16>(&mut rng);
+        rows::<8>(&mut rng);
+        cols::<16>(&mut rng);
+        cols::<8>(&mut rng);
+
+        for half in [4usize, 8] {
+            sea_bounds_c(&[], &[], half, [0; 4], 0, &[], &mut []);
+            kernels::me::sea_bounds(&[], &[], half, [0; 4], 0, &[], &mut []);
+        }
+
+        for n in 1..=70usize {
+            for half in [4usize, 8] {
+                for _ in 0..4 {
+                    let lim = (half * half * 255) as u32 + 1;
+                    let w0: Vec<u16> = (0..n + half).map(|_| rng.below(lim) as u16).collect();
+                    let w1: Vec<u16> = (0..n + half).map(|_| rng.below(lim) as u16).collect();
+                    let e = [0; 4].map(|_: u16| rng.below(lim) as u16);
+                    let mvd: Vec<u16> = (0..4 * (n - 1) + 1)
+                        .map(|_| {
+                            if rng.below(8) == 0 {
+                                0xFFF0
+                            } else {
+                                rng.below(3000) as u16
+                            }
+                        })
+                        .collect();
+                    let fixed = [0u16, 7, 1234, u16::MAX][rng.below(4) as usize];
+                    let mut want = vec![0u16; n];
+                    let mut got = vec![1u16; n];
+                    sea_bounds_c(&w0, &w1, half, e, fixed, &mvd, &mut want);
+                    kernels::me::sea_bounds(&w0, &w1, half, e, fixed, &mvd, &mut got);
+                    assert_eq!(got, want, "bounds n={n} half={half}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sea_line_search_matches_the_plain_loop() {
+        let mut rng = Prng::new(0x5EA_0002);
+        fn case<const N: usize>(rng: &mut Prng, n: usize, vertical: bool) {
+            let mut enc = pixels(rng, N * N);
+            // Copies of the block create ties; the first must win.
+            let (rows, cols) = if vertical {
+                (n + N - 1, N)
+            } else {
+                (N, n + N - 1)
+            };
+            let stride = cols + rng.below(3) as usize;
+            let len = (rows - 1) * stride + cols;
+            let mut refb = pixels(rng, len);
+            let flat = rng.next_u8();
+            for _ in 0..3 {
+                let at = rng.below(n as u32) as usize;
+                let (ox, oy) = if vertical { (0, at) } else { (at, 0) };
+                let jitter = rng.below(3) == 0;
+                for y in 0..N {
+                    for x in 0..N {
+                        let v = enc[y * N + x];
+                        refb[(oy + y) * stride + ox + x] = if jitter && (x + y) % 5 == 0 {
+                            v.wrapping_add(1)
+                        } else {
+                            v
+                        };
+                    }
+                }
+            }
+            if rng.below(2) == 0 {
+                let at = rng.below(n as u32) as usize;
+                for y in 0..N {
+                    for x in 0..N {
+                        let (px, py) = if vertical { (x, at + y) } else { (at + x, y) };
+                        if py < rows && px < cols {
+                            refb[py * stride + px] = flat;
+                        }
+                    }
+                }
+            }
+            let mvd: Vec<u16> = match rng.below(3) {
+                0 => vec![0; 4 * (n - 1) + 1],
+                1 => (0..4 * (n - 1) + 1).map(|k| (k as u16 / 4) * 3).collect(),
+                _ => (0..4 * (n - 1) + 1)
+                    .map(|_| rng.below(400) as u16)
+                    .collect(),
+            };
+            let fixed = rng.below(50) as u16;
+            let cEnc = RecCursor::over_owned(&mut enc, 0, N);
+            let cRef = RecCursor::over_owned(&mut refb, 0, stride);
+            let want = plain::<N>(&cEnc, cRef, n, vertical, fixed, &mvd);
+            for accept in [
+                u32::MAX,
+                want.0 + 1,
+                want.0,
+                want.0 / 2,
+                rng.next_u32() % 70_000,
+            ] {
+                let sad_fn: PSampleSadSatdCostFunc = sad::<N>;
+                let got =
+                    sea_line_search::<N>(sad_fn, &cEnc, cRef, n, vertical, fixed, &mvd, accept);
+                if want.0 < accept {
+                    assert_eq!(got, want, "N={N} n={n} vertical={vertical} accept={accept}");
+                } else {
+                    assert!(
+                        got.0 >= accept,
+                        "N={N} n={n} vertical={vertical} accept={accept}"
+                    );
+                }
+            }
+        }
+        for n in (1..=48).chain([63, 64, 65, 100, 257]) {
+            for _ in 0..3 {
+                case::<16>(&mut rng, n, true);
+                case::<16>(&mut rng, n, false);
+                case::<8>(&mut rng, n, true);
+                case::<8>(&mut rng, n, false);
+            }
+        }
     }
 }

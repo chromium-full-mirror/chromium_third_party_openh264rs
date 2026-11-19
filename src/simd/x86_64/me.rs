@@ -7,9 +7,10 @@
 
 #![deny(unsafe_code)]
 
-use super::lanes::{ld8, ld8_u16, ld16};
+use super::lanes::{ld8, ld8_u16, ld16, st8_u16};
 use super::sse2_token;
 use crate::encoder::rec_view::RecCursor;
+use crate::encoder::svc_motion_estimate;
 use crate::safe::plane::{BlockRows, RefSamples};
 use crate::simd::{
     simd_entry,
@@ -210,7 +211,7 @@ simd_entry! {
         pTimesOfFeatureValue: &mut [u32],
         _token: Avx2Token,
     ) {
-        const LIST_8X8: usize = crate::encoder::svc_motion_estimate::LIST_SIZE_SUM_8x8;
+        const LIST_8X8: usize = svc_motion_estimate::LIST_SIZE_SUM_8x8;
         if kiWidth <= 0 || kiHeight <= 0 {
             return;
         }
@@ -521,7 +522,7 @@ simd_entry! {
         pTimesOfFeatureValue: &mut [u32],
         _token: Avx2Token,
     ) {
-        const LIST_16X16: usize = crate::encoder::svc_motion_estimate::LIST_SIZE_SUM_16x16;
+        const LIST_16X16: usize = svc_motion_estimate::LIST_SIZE_SUM_16x16;
         if kiWidth <= 0 || kiHeight <= 0 {
             return;
         }
@@ -914,6 +915,200 @@ pub fn sum_of_16x16_block_of_frame(
         pFeatureOfBlock,
         pTimesOfFeatureValue,
     )
+}
+
+// Successive-elimination kernels (`svc_motion_estimate::sea_line_search`).
+
+/// Four `psadbw` results packed to `[L0, R0, .., L3, R3]` (sums never clamp).
+#[inline]
+#[target_feature(enable = "sse2")]
+fn sea_pack4(s0: __m128i, s1: __m128i, s2: __m128i, s3: __m128i) -> __m128i {
+    _mm_packs_epi32(_mm_packs_epi32(s0, s1), _mm_packs_epi32(s2, s3))
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn sea_unzip(q0: __m128i, q1: __m128i) -> (__m128i, __m128i) {
+    let lo = _mm_set1_epi32(0xFFFF);
+    let l = _mm_packs_epi32(_mm_and_si128(q0, lo), _mm_and_si128(q1, lo));
+    let r = _mm_packs_epi32(_mm_srli_epi32::<16>(q0), _mm_srli_epi32::<16>(q1));
+    (l, r)
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn sea_lanes04(v: __m128i) -> __m128i {
+    _mm_shufflelo_epi16::<0b11_01_10_00>(_mm_shuffle_epi32::<0b10_00_10_00>(v))
+}
+
+simd_entry! {
+    #[target_feature(enable = "sse2")]
+    fn sea_rows16(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
+        let rows = a0.len();
+        let a1 = &mut a1[..rows];
+        let z = _mm_setzero_si128();
+        let mut r = 0usize;
+        while r + 8 <= rows {
+            let s = c.span::<16, 8>(r as isize, 0);
+            let v = |y: usize| _mm_sad_epu8(ld16(&s.row::<16>(y, 0)), z);
+            let q0 = sea_pack4(v(0), v(1), v(2), v(3));
+            let q1 = sea_pack4(v(4), v(5), v(6), v(7));
+            let (l, rr) = sea_unzip(q0, q1);
+            st8_u16(&mut a0[r..], l);
+            st8_u16(&mut a1[r..], rr);
+            r += 8;
+        }
+        if r < rows {
+            svc_motion_estimate::sea_row_half_sums_c::<16>(
+                &c.advance(0, r as isize),
+                &mut a0[r..],
+                &mut a1[r..],
+            );
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    fn sea_rows8(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
+        let rows = a0.len();
+        let a1 = &mut a1[..rows];
+        let z = _mm_setzero_si128();
+        let mut r = 0usize;
+        while r + 8 <= rows {
+            let s = c.span::<8, 8>(r as isize, 0);
+            let v = |y: usize| _mm_sad_epu8(_mm_unpacklo_epi32(ld8(&s.row::<8>(y, 0)), z), z);
+            let q0 = sea_pack4(v(0), v(1), v(2), v(3));
+            let q1 = sea_pack4(v(4), v(5), v(6), v(7));
+            let (l, rr) = sea_unzip(q0, q1);
+            st8_u16(&mut a0[r..], l);
+            st8_u16(&mut a1[r..], rr);
+            r += 8;
+        }
+        if r < rows {
+            svc_motion_estimate::sea_row_half_sums_c::<8>(
+                &c.advance(0, r as isize),
+                &mut a0[r..],
+                &mut a1[r..],
+            );
+        }
+    }
+
+    /// A ragged tail overlaps the previous chunk rather than reading past the end.
+    #[target_feature(enable = "sse2")]
+    fn sea_cols<const N: usize>(
+        c: &RecCursor<'_>,
+        a0: &mut [u16],
+        a1: &mut [u16],
+        _token: Sse2Token,
+    ) {
+        let cols = a0.len();
+        let a1 = &mut a1[..cols];
+        if cols < 16 {
+            svc_motion_estimate::sea_col_half_sums_c::<N>(c, a0, a1);
+            return;
+        }
+        let z = _mm_setzero_si128();
+        let mut x = 0usize;
+        loop {
+            let x0 = x.min(cols - 16);
+            let s = c.span::<16, N>(0, x0 as isize);
+            let (mut t_lo, mut t_hi, mut b_lo, mut b_hi) = (z, z, z, z);
+            for y in 0..N / 2 {
+                let r = ld16(&s.row::<16>(y, 0));
+                t_lo = _mm_add_epi16(t_lo, _mm_unpacklo_epi8(r, z));
+                t_hi = _mm_add_epi16(t_hi, _mm_unpackhi_epi8(r, z));
+            }
+            for y in N / 2..N {
+                let r = ld16(&s.row::<16>(y, 0));
+                b_lo = _mm_add_epi16(b_lo, _mm_unpacklo_epi8(r, z));
+                b_hi = _mm_add_epi16(b_hi, _mm_unpackhi_epi8(r, z));
+            }
+            st8_u16(&mut a0[x0..], t_lo);
+            st8_u16(&mut a0[x0 + 8..], t_hi);
+            st8_u16(&mut a1[x0..], b_lo);
+            st8_u16(&mut a1[x0 + 8..], b_hi);
+            x = x0 + 16;
+            if x >= cols {
+                break;
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    fn sea_bounds_sse2(
+        w0: &[u16],
+        w1: &[u16],
+        half: usize,
+        e: [u16; 4],
+        iFixedMvd: u16,
+        mvd: &[u16],
+        bound: &mut [u16],
+        _token: Sse2Token,
+    ) {
+        let n = bound.len();
+        if n == 0 {
+            return;
+        }
+        let (w0a, w0b) = (&w0[..n], &w0[half..half + n]);
+        let (w1a, w1b) = (&w1[..n], &w1[half..half + n]);
+        let mvd = &mvd[..4 * (n - 1) + 1];
+        let fixed = _mm_set1_epi16(iFixedMvd as i16);
+        let (e0, e1) = (_mm_set1_epi16(e[0] as i16), _mm_set1_epi16(e[1] as i16));
+        let (e2, e3) = (_mm_set1_epi16(e[2] as i16), _mm_set1_epi16(e[3] as i16));
+        let absd = |a: __m128i, e: __m128i| _mm_or_si128(_mm_subs_epu16(a, e), _mm_subs_epu16(e, a));
+        let mut i = 0usize;
+        while 4 * i + 32 <= mvd.len() {
+            let d0 = absd(ld8_u16(&w0a[i..]), e0);
+            let d1 = absd(ld8_u16(&w0b[i..]), e1);
+            let d2 = absd(ld8_u16(&w1a[i..]), e2);
+            let d3 = absd(ld8_u16(&w1b[i..]), e3);
+            let lb = _mm_add_epi16(_mm_add_epi16(d0, d1), _mm_add_epi16(d2, d3));
+            let m = &mvd[4 * i..4 * i + 32];
+            let m01 = _mm_unpacklo_epi32(sea_lanes04(ld8_u16(&m[0..])), sea_lanes04(ld8_u16(&m[8..])));
+            let m23 =
+                _mm_unpacklo_epi32(sea_lanes04(ld8_u16(&m[16..])), sea_lanes04(ld8_u16(&m[24..])));
+            let mv = _mm_adds_epu16(_mm_unpacklo_epi64(m01, m23), fixed);
+            st8_u16(&mut bound[i..], _mm_adds_epu16(lb, mv));
+            i += 8;
+        }
+        if i < n {
+            svc_motion_estimate::sea_bounds_c(
+                &w0[i..],
+                &w1[i..],
+                half,
+                e,
+                iFixedMvd,
+                &mvd[4 * i..],
+                &mut bound[i..],
+            );
+        }
+    }
+}
+
+#[inline]
+pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    match N {
+        16 => sea_rows16(c, a0, a1, sse2_token()),
+        8 => sea_rows8(c, a0, a1, sse2_token()),
+        _ => svc_motion_estimate::sea_row_half_sums_c::<N>(c, a0, a1),
+    }
+}
+
+#[inline]
+pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    sea_cols::<N>(c, a0, a1, sse2_token());
+}
+
+#[inline]
+pub fn sea_bounds(
+    w0: &[u16],
+    w1: &[u16],
+    half: usize,
+    e: [u16; 4],
+    iFixedMvd: u16,
+    mvd: &[u16],
+    bound: &mut [u16],
+) {
+    sea_bounds_sse2(w0, w1, half, e, iFixedMvd, mvd, bound, sse2_token());
 }
 
 #[cfg(test)]

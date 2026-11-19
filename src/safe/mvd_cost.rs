@@ -89,6 +89,12 @@ impl<'a> MvdCostCursor<'a> {
         self.table[self.at.wrapping_add_signed(mvd as isize)]
     }
 
+    /// `p[0..len]` as a slice. Panics if it leaves the table.
+    #[inline(always)]
+    pub fn run(self, len: usize) -> &'a [u16] {
+        &self.table[self.at..][..len]
+    }
+
     /// `p.offset(d)` — a cursor re-parked `d` entries along, for the two consumers
     /// that walk away from the zero-MVD entry (`LineFullSearch_c`'s per-step bump
     /// and `SetFeatureSearchIn`'s per-axis rebase).

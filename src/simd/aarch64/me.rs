@@ -14,6 +14,7 @@ use core::arch::aarch64::*;
 use super::lanes::{ld8, ld8_u16, ld16, st8_u16};
 use super::neon_token;
 use crate::encoder::rec_view::RecCursor;
+use crate::encoder::svc_motion_estimate;
 use crate::safe::plane::{BlockRows, RefSamples};
 use crate::simd::{simd_entry, tokens::NeonToken};
 
@@ -315,6 +316,179 @@ pub fn sum_of_16x16_block_of_frame(
         pTimesOfFeatureValue,
         neon_token(),
     );
+}
+
+// Successive-elimination kernels (`svc_motion_estimate::sea_line_search`).
+
+simd_entry! {
+    #[target_feature(enable = "neon")]
+    fn sea_rows16(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
+        let rows = a0.len();
+        let a1 = &mut a1[..rows];
+        let mut r = 0usize;
+        while r + 8 <= rows {
+            let s = c.span::<16, 8>(r as isize, 0);
+            let v = |y: usize| vpaddlq_u8(ld16(&s.row::<16>(y, 0)));
+            let p01 = vpaddq_u16(v(0), v(1));
+            let p23 = vpaddq_u16(v(2), v(3));
+            let p45 = vpaddq_u16(v(4), v(5));
+            let p67 = vpaddq_u16(v(6), v(7));
+            let q0 = vpaddq_u16(p01, p23);
+            let q1 = vpaddq_u16(p45, p67);
+            st8_u16(&mut a0[r..], vuzp1q_u16(q0, q1));
+            st8_u16(&mut a1[r..], vuzp2q_u16(q0, q1));
+            r += 8;
+        }
+        if r < rows {
+            svc_motion_estimate::sea_row_half_sums_c::<16>(
+                &c.advance(0, r as isize),
+                &mut a0[r..],
+                &mut a1[r..],
+            );
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    fn sea_rows8(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
+        let rows = a0.len();
+        let a1 = &mut a1[..rows];
+        let mut r = 0usize;
+        while r + 8 <= rows {
+            let s = c.span::<8, 8>(r as isize, 0);
+            let v = |y: usize| {
+                vpaddlq_u8(vcombine_u8(ld8(&s.row::<8>(y, 0)), ld8(&s.row::<8>(y + 1, 0))))
+            };
+            let q0 = vpaddq_u16(v(0), v(2));
+            let q1 = vpaddq_u16(v(4), v(6));
+            st8_u16(&mut a0[r..], vuzp1q_u16(q0, q1));
+            st8_u16(&mut a1[r..], vuzp2q_u16(q0, q1));
+            r += 8;
+        }
+        if r < rows {
+            svc_motion_estimate::sea_row_half_sums_c::<8>(
+                &c.advance(0, r as isize),
+                &mut a0[r..],
+                &mut a1[r..],
+            );
+        }
+    }
+
+    /// A ragged tail overlaps the previous chunk rather than reading past the end.
+    #[target_feature(enable = "neon")]
+    fn sea_cols<const N: usize>(
+        c: &RecCursor<'_>,
+        a0: &mut [u16],
+        a1: &mut [u16],
+        _token: NeonToken,
+    ) {
+        let cols = a0.len();
+        let a1 = &mut a1[..cols];
+        if cols < 16 {
+            svc_motion_estimate::sea_col_half_sums_c::<N>(c, a0, a1);
+            return;
+        }
+        let mut x = 0usize;
+        loop {
+            let x0 = x.min(cols - 16);
+            let s = c.span::<16, N>(0, x0 as isize);
+            let z = vdupq_n_u16(0);
+            let (mut t_lo, mut t_hi, mut b_lo, mut b_hi) = (z, z, z, z);
+            for y in 0..N / 2 {
+                let r = ld16(&s.row::<16>(y, 0));
+                t_lo = vaddw_u8(t_lo, vget_low_u8(r));
+                t_hi = vaddw_high_u8(t_hi, r);
+            }
+            for y in N / 2..N {
+                let r = ld16(&s.row::<16>(y, 0));
+                b_lo = vaddw_u8(b_lo, vget_low_u8(r));
+                b_hi = vaddw_high_u8(b_hi, r);
+            }
+            st8_u16(&mut a0[x0..], t_lo);
+            st8_u16(&mut a0[x0 + 8..], t_hi);
+            st8_u16(&mut a1[x0..], b_lo);
+            st8_u16(&mut a1[x0 + 8..], b_hi);
+            x = x0 + 16;
+            if x >= cols {
+                break;
+            }
+        }
+    }
+
+    /// MV costs are every fourth `mvd` entry, gathered with two rounds of `uzp1`.
+    #[target_feature(enable = "neon")]
+    fn sea_bounds_neon(
+        w0: &[u16],
+        w1: &[u16],
+        half: usize,
+        e: [u16; 4],
+        iFixedMvd: u16,
+        mvd: &[u16],
+        bound: &mut [u16],
+        _token: NeonToken,
+    ) {
+        let n = bound.len();
+        if n == 0 {
+            return;
+        }
+        let (w0a, w0b) = (&w0[..n], &w0[half..half + n]);
+        let (w1a, w1b) = (&w1[..n], &w1[half..half + n]);
+        let mvd = &mvd[..4 * (n - 1) + 1];
+        let fixed = vdupq_n_u16(iFixedMvd);
+        let (e0, e1) = (vdupq_n_u16(e[0]), vdupq_n_u16(e[1]));
+        let (e2, e3) = (vdupq_n_u16(e[2]), vdupq_n_u16(e[3]));
+        let mut i = 0usize;
+        while 4 * i + 32 <= mvd.len() {
+            let d0 = vabdq_u16(ld8_u16(&w0a[i..]), e0);
+            let d1 = vabdq_u16(ld8_u16(&w0b[i..]), e1);
+            let d2 = vabdq_u16(ld8_u16(&w1a[i..]), e2);
+            let d3 = vabdq_u16(ld8_u16(&w1b[i..]), e3);
+            let lb = vaddq_u16(vaddq_u16(d0, d1), vaddq_u16(d2, d3));
+            let m = &mvd[4 * i..4 * i + 32];
+            let m01 = vuzp1q_u16(ld8_u16(&m[0..]), ld8_u16(&m[8..]));
+            let m23 = vuzp1q_u16(ld8_u16(&m[16..]), ld8_u16(&m[24..]));
+            let mv = vqaddq_u16(vuzp1q_u16(m01, m23), fixed);
+            st8_u16(&mut bound[i..], vqaddq_u16(lb, mv));
+            i += 8;
+        }
+        if i < n {
+            svc_motion_estimate::sea_bounds_c(
+                &w0[i..],
+                &w1[i..],
+                half,
+                e,
+                iFixedMvd,
+                &mvd[4 * i..],
+                &mut bound[i..],
+            );
+        }
+    }
+}
+
+#[inline]
+pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    match N {
+        16 => sea_rows16(c, a0, a1, neon_token()),
+        8 => sea_rows8(c, a0, a1, neon_token()),
+        _ => svc_motion_estimate::sea_row_half_sums_c::<N>(c, a0, a1),
+    }
+}
+
+#[inline]
+pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+    sea_cols::<N>(c, a0, a1, neon_token());
+}
+
+#[inline]
+pub fn sea_bounds(
+    w0: &[u16],
+    w1: &[u16],
+    half: usize,
+    e: [u16; 4],
+    iFixedMvd: u16,
+    mvd: &[u16],
+    bound: &mut [u16],
+) {
+    sea_bounds_neon(w0, w1, half, e, iFixedMvd, mvd, bound, neon_token());
 }
 
 #[cfg(test)]
