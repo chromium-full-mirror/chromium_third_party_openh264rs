@@ -1318,7 +1318,7 @@ fn StoreReadyPicture(
             pCtx.pPictInfoList[i].iPicBuffIdx = iPicBuffIdx;
             iFramePoc
         }
-        None => slice_header_of(&*pCtx).map_or(0, |sh| sh.iPicOrderCntLsb),
+        None => slice_header_of(&*pCtx).map_or(0, |sh| sh.iPicOrderCnt),
     };
     pCtx.pPictInfoList[i].iSeqNum = pCtx.pPictReoderingStatus.iOutputSeqNum;
     pCtx.pPictInfoList[i].uiDecodingTimeStamp = pCtx.uiDecodingTimeStamp;
@@ -1348,7 +1348,7 @@ fn EmitOnFullPictInfoList(
         .and_then(|id| pCtx.pPicBuff.as_deref().and_then(|p| p.slot(id)))
     {
         Some(pic) => pic.iFramePoc,
-        None => slice_header_of(&*pCtx).map_or(0, |sh| sh.iPicOrderCntLsb),
+        None => slice_header_of(&*pCtx).map_or(0, |sh| sh.iPicOrderCnt),
     };
     let mut iMinIdx: Option<usize> = None;
     for i in 0..=pCtx.pPictReoderingStatus.iLargestBufferedPicIndex {

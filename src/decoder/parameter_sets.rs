@@ -266,7 +266,10 @@ pub struct TagSps {
 
     pub iOffsetForTopToBottomField: i32,
     pub iNumRefFramesInPocCycle: i32,
-    pub iOffsetForRefFrame: [i8; 256],
+    // ITU-T H.264 7.4.2.1.1 permits `offset_for_ref_frame[i]` in
+    // `-2^31 + 1 ..= 2^31 - 1`; upstream C++ (`parameter_sets.h`) narrows this
+    // array to `int8_t`, truncating large cycle offsets.
+    pub iOffsetForRefFrame: [i32; 256],
     pub iNumRefFrames: i32,
 
     pub sFrameCrop: SPosOffset,

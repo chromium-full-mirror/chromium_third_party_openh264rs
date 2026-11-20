@@ -6,17 +6,6 @@
 mod common;
 use common::Sha1Hasher;
 use openh264rs::api::codec_api::*;
-use openh264rs::split_annexb_units;
-
-fn update_hash_from_frame(hasher: &mut Sha1Hasher, dec: &Decoder, buf_info: &SBufferInfo) {
-    for row in buf_info
-        .y_rows(dec)
-        .chain(buf_info.u_rows(dec))
-        .chain(buf_info.v_rows(dec))
-    {
-        hasher.update(row);
-    }
-}
 
 #[test]
 pub(crate) fn test_sha1_hasher_sanity() {
@@ -39,93 +28,23 @@ pub(crate) fn test_decoder_capability_query() {
     assert!(!dec_cap.bRedPicCap);
 }
 
-/// Decodes one asset and compares the SHA-1 of its output planes against the
-/// C++ decoder's.
+/// Decodes one asset via [`common::test_single_bitstream_asset_ex`] and compares the
+/// SHA-1 of its output planes against the expected reference hash.
 ///
 /// `hash_concealed` selects which frames count: `false` hashes only frames returned
 /// `dsErrorFree`, `true` hashes every frame written out (`iBufferStatus == 1`,
 /// whatever the decoding state). A stream that deliberately conceals needs `true`,
 /// or its concealed frames drop out of the hash.
 fn test_single_bitstream_asset_ex(file_name: &str, expected_hash: &str, hash_concealed: bool) {
-    let data = common::read_stream(file_name);
-    assert!(!data.is_empty(), "Bitstream asset {} is empty", file_name);
-
-    let mut decoder = Decoder::new();
-
-    let mut dec_param = SDecodingParam::default();
-    dec_param.uiTargetDqLayer = u8::MAX;
-    dec_param.eEcActiveIdc = ERROR_CON_IDC::ERROR_CON_SLICE_COPY;
-    dec_param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-
-    let init_ret = decoder.initialize(&dec_param);
-    assert_eq!(
-        init_ret, CM_RESULT_SUCCESS as std::ffi::c_long,
-        "Failed to initialize decoder for {}",
-        file_name
-    );
-
-    let mut hasher = Sha1Hasher::new();
-    let units = split_annexb_units(&data);
-    let mut decoded_frames = 0;
-
-    for unit in units {
-        let mut buf_info = SBufferInfo::default();
-        let dec_ret = decoder.decode(Some(unit), &mut buf_info);
-        if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1
-        {
-            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
-            decoded_frames += 1;
-        }
-
-        // A null `DecodeFrame2` after every NAL (`h264dec.cpp:418-430`)
-        // constructs the access unit the NAL completed instead of leaving it
-        // pending. That is observable: a same-id PPS arriving next is parked in
-        // the spare slot for `WriteBackActiveParameters` rather than overwriting
-        // `sPpsBuffer[id]` in place under the pending picture
-        // (`au_parser.cpp:1458` against `:1465`).
-        let mut buf_info = SBufferInfo::default();
-        let dec_ret = decoder.decode(None, &mut buf_info);
-        if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1
-        {
-            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
-            decoded_frames += 1;
-        }
-    }
-
-    // Flush remaining frames in decoder buffer
-    decoder.set_end_of_stream(true);
-
-    let mut buf_info = SBufferInfo::default();
-    let dec_ret = decoder.decode(None, &mut buf_info);
-    if (hash_concealed || dec_ret == DECODING_STATE::dsErrorFree) && buf_info.iBufferStatus == 1 {
-        update_hash_from_frame(&mut hasher, &decoder, &buf_info);
-        decoded_frames += 1;
-    }
-
-    let remaining_frames = decoder.frames_remaining();
-
-    for _f in 0..remaining_frames {
-        let mut buf_info = SBufferInfo::default();
-        let flush_ret = decoder.flush(&mut buf_info);
-        if (hash_concealed || flush_ret == DECODING_STATE::dsErrorFree)
-            && buf_info.iBufferStatus == 1
-        {
-            update_hash_from_frame(&mut hasher, &decoder, &buf_info);
-            decoded_frames += 1;
-        }
-    }
-
-    assert!(decoded_frames > 0, "No frames decoded for {}", file_name);
-    let calculated_hash = hasher.digest();
+    let run = common::test_single_bitstream_asset_ex(file_name, hash_concealed);
+    assert!(run.frames > 0, "No frames decoded for {}", file_name);
     // The frame count rides in the message: a count that also moved is a
     // different defect from one that held.
     assert_eq!(
-        calculated_hash, expected_hash,
-        "SHA-1 hash mismatch for bitstream asset {} ({decoded_frames} frames decoded)",
-        file_name
+        run.sha1, expected_hash,
+        "SHA-1 hash mismatch for bitstream asset {} ({} frames decoded)",
+        file_name, run.frames
     );
-
-    decoder.uninitialize();
 }
 
 #[test]

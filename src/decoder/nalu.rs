@@ -767,7 +767,7 @@ fn parse_only_write_subset_sps(pSpsBs: &mut SSpsBsInfo, pSps: &SSps) -> bool {
         BsWriteSE(buf, &mut bs, pSps.iOffsetForTopToBottomField);
         BsWriteUE(buf, &mut bs, pSps.iNumRefFramesInPocCycle as u32);
         for i in 0..pSps.iNumRefFramesInPocCycle as usize {
-            BsWriteSE(buf, &mut bs, pSps.iOffsetForRefFrame[i] as i32);
+            BsWriteSE(buf, &mut bs, pSps.iOffsetForRefFrame[i]);
         }
     }
     BsWriteUE(buf, &mut bs, pSps.iNumRefFrames as u32);
@@ -2040,7 +2040,9 @@ pub fn ParseSps(
             if BsGetSe(buf, pBsAux, &mut iCode) != ERR_NONE {
                 return ERR_INVALID_PARAMETERS;
             }
-            pSubsetSps.sSps.iOffsetForRefFrame[i] = iCode as i8;
+            // Preserve full `i32` `se(v)` range per ITU-T H.264 7.4.2.1.1 instead
+            // of upstream `au_parser.cpp`'s `int8_t` cast.
+            pSubsetSps.sSps.iOffsetForRefFrame[i] = iCode;
         }
     }
 
@@ -2232,12 +2234,14 @@ pub fn ParseSps(
                     pCtx.sSpsPpsCtx.iOverwriteFlags |= OVERWRITE_SUBSETSPS;
                 } else {
                     bytes_copy(&mut pCtx.sSpsPpsCtx.sSubsetSpsBuffer[idx], &*pSubsetSps);
+                    pCtx.sSpsPpsCtx.bump_generation();
                 }
             }
         } else {
             bytes_copy(&mut pCtx.sSpsPpsCtx.sSubsetSpsBuffer[idx], &*pSubsetSps);
             pCtx.sSpsPpsCtx.bSubspsAvailFlags[idx] = true;
             pCtx.sSpsPpsCtx.bSubspsExistAheadFlag = true;
+            pCtx.sSpsPpsCtx.bump_generation();
         }
     } else {
         if CheckSpsActive(pCtx, tmp_ref, false) {
@@ -2260,16 +2264,54 @@ pub fn ParseSps(
                     pCtx.sSpsPpsCtx.iOverwriteFlags |= OVERWRITE_SPS;
                 } else {
                     bytes_copy(&mut pCtx.sSpsPpsCtx.sSpsBuffer[idx], &pSubsetSps.sSps);
+                    pCtx.sSpsPpsCtx.bump_generation();
                 }
             }
         } else {
             bytes_copy(&mut pCtx.sSpsPpsCtx.sSpsBuffer[idx], &pSubsetSps.sSps);
             pCtx.sSpsPpsCtx.bSpsAvailFlags[idx] = true;
             pCtx.sSpsPpsCtx.bSpsExistAheadFlag = true;
+            pCtx.sSpsPpsCtx.bump_generation();
         }
     }
 
     ERR_NONE
+}
+
+/// Checks whether `iPpsId` is currently active or referenced by any parsed-but-unconstructed
+/// slice in the current access unit.
+///
+/// ITU-T H.264 7.4.1.2.1: protects a pending picture's PPS when the next access unit
+/// begins with a replacement PPS under the same id before any PPS has been activated.
+/// Departs from upstream `au_parser.cpp:1460-1471`.
+pub fn CheckPpsActive(pCtx: &SWelsDecoderContext, iPpsId: i32) -> bool {
+    if active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps).is_some_and(|p| p.iPpsId == iPpsId) {
+        return true;
+    }
+    if iPpsId < 0 || (iPpsId as usize) >= MAX_PPS_COUNT {
+        return false;
+    }
+    if !pCtx.sSpsPpsCtx.bPpsAvailFlags[iPpsId as usize] {
+        return false;
+    }
+    if let Some(pCurAu) = pCtx.access_unit.as_deref() {
+        let iNum = pCurAu.uiAvailUnitsNum as usize;
+        for i in 0..iNum {
+            if let Some(pNalUnit) = pCurAu.node(i) {
+                if pNalUnit
+                    .sNalData
+                    .sVclNal
+                    .sSliceHeaderExt
+                    .sSliceHeader
+                    .pps_id
+                    == Some(iPpsId)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Parses Picture Parameter Sets (PPS).
@@ -2462,18 +2504,20 @@ pub fn ParsePps(
     }
 
     let pps_idx = uiPpsId as usize;
-    if active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps).is_some_and(|p| p.iPpsId == pPps.iPpsId) {
-        // Re-sent PPS for the active id: only flag an overwrite when it changed.
-        let unchanged = active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps)
-            .is_some_and(|active| bytes_equal(active, pPps));
+    if CheckPpsActive(pCtx, pPps.iPpsId) {
+        // Re-sent PPS for an active or pending id: only flag an overwrite when it changed.
+        let unchanged = bytes_equal(&pCtx.sSpsPpsCtx.sPpsBuffer[pps_idx], pPps);
         if !unchanged {
             bytes_copy(&mut pCtx.sSpsPpsCtx.sPpsBuffer[MAX_PPS_COUNT], pPps);
             pCtx.sSpsPpsCtx.iOverwriteFlags |= OVERWRITE_PPS;
-            mark_au_ready(pCtx);
+            if au_has_nals(pCtx) {
+                mark_au_ready(pCtx);
+            }
         }
     } else {
         bytes_copy(&mut pCtx.sSpsPpsCtx.sPpsBuffer[pps_idx], pPps);
         pCtx.sSpsPpsCtx.bPpsAvailFlags[pps_idx] = true;
+        pCtx.sSpsPpsCtx.bump_generation();
     }
 
     // `au_parser.cpp:1471-1493` — the parse-only PPS cache, last thing in the function.

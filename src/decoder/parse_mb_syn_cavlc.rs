@@ -46,6 +46,19 @@ use crate::safe::bits::BsCursor;
 // ============================================================================
 
 pub const MAX_LEVEL_PREFIX: i32 = 15;
+/// ITU-T H.264 9.2.2.1 Note: in High-family profiles `level_prefix` may reach
+/// `11 + bit_depth` (`19` for 8-bit video), whereas Baseline, Main, and Extended
+/// cap `level_prefix` at 15 (A.2.1–A.2.3). Departs from upstream
+/// `parse_mb_syn_cavlc.cpp:48`.
+pub const MAX_LEVEL_PREFIX_HIGH: i32 = 19;
+
+#[inline(always)]
+pub const fn max_level_prefix_for_profile(profile_idc: u8) -> i32 {
+    match profile_idc {
+        100 | 110 | 122 | 244 | 44 | 86 => MAX_LEVEL_PREFIX_HIGH,
+        _ => MAX_LEVEL_PREFIX,
+    }
+}
 pub const LIST_0: usize = 0;
 pub const LIST_1: usize = 1;
 pub const LIST_A: usize = 2;
@@ -1947,8 +1960,16 @@ pub fn ParseInterBInfo(
             pSubPartCount[i] = g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iPartCount;
             pPartW[i] = g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iPartWidth;
 
-            // Refer to 7.3.5.
-            if pSubPartCount[i] > 1 {
+            // ITU-T H.264 7.3.5 / 7.3.5.2: clear `noSubMbPartSizeLessThan8x8Flag` when
+            // a sub-macroblock has more than one partition or is `B_Direct_8x8` with
+            // `direct_8x8_inference_flag == 0`. Departs from upstream
+            // `parse_mb_syn_cavlc.cpp:1563`.
+            if pSubPartCount[i] > 1
+                || (IS_DIRECT(g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iType)
+                    && !pCtx
+                        .active_sps()
+                        .is_some_and(|sps| sps.bDirect8x8InferenceFlag))
+            {
                 *pCurDqLayer
                     .grid
                     .no_sub_mb_part_size_less_than8x8_flag
@@ -2444,25 +2465,22 @@ pub fn CheckIntraNxNPredMode(pSampleAvail: &[i32], pMode: &mut i8, iIndex: i32, 
 // Inverse Quantization and Transforms (IDCT)
 // ============================================================================
 
-pub fn WelsChromaDcIdct(pBlock: &mut [i16]) {
-    const STRIDE: usize = 32;
-    const X_STRIDE: usize = 16;
-    const STRIDE1: usize = X_STRIDE + STRIDE;
-
-    let mut iA = pBlock[0] as i32;
-    let mut iB = pBlock[X_STRIDE] as i32;
-    let mut iC = pBlock[STRIDE] as i32;
-    let iD = pBlock[STRIDE1] as i32;
+/// 2x2 inverse Hadamard transform for 4:2:0 Chroma DC kept in `i64` so wide
+/// levels (e.g. High-Profile CAVLC `level_prefix` 16..=19) and their sums do
+/// not wrap in `i16` before H.264 8.5.11.2 dequantization scaling (`>> 1` / `>> 5`).
+#[inline]
+pub fn WelsChromaDcIdct(dc: &[i32; 4]) -> [i64; 4] {
+    let iA = dc[0] as i64;
+    let iB = dc[1] as i64;
+    let iC = dc[2] as i64;
+    let iD = dc[3] as i64;
 
     let iE = iA - iB;
-    iA += iB;
-    iB = iC - iD;
-    iC += iD;
+    let iA_sum = iA + iB;
+    let iB_sub = iC - iD;
+    let iC_sum = iC + iD;
 
-    pBlock[0] = (iA + iC) as i16;
-    pBlock[X_STRIDE] = (iE + iB) as i16;
-    pBlock[STRIDE] = (iA - iC) as i16;
-    pBlock[STRIDE1] = (iE - iB) as i16;
+    [iA_sum + iC_sum, iE + iB_sub, iA_sum - iC_sum, iE - iB_sub]
 }
 
 #[inline(always)]
@@ -2524,28 +2542,39 @@ pub fn GetMbResProperty(pMBproperty: &mut i32, pResidualProperty: &mut i32, bCav
     }
 }
 
-pub fn WelsLumaDcDequantIdct(pBlock: &mut [i16], uiQp: u8, pCtx: &mut SliceCtx<'_>) {
-    let kiQMul: i32 = if pCtx.bUseScalingList && pCtx.bDequantCoeff4x4Init {
-        pCtx.pDequant_coeff_buffer4x4[0][uiQp as usize][0] as i32
+/// 4x4 inverse Hadamard + dequantization for Intra-16x16 Luma DC taking unscaled
+/// `i32` levels (`dc[k]` for 4x4 sub-block `k` at `pBlock[k << 4]`), avoiding
+/// premature `as i16` narrowing before the H.264 8.5.12.1 `>> 6` shift.
+pub fn WelsLumaDcDequantIdct(
+    dc: &[i32; 16],
+    pBlock: &mut [i16],
+    uiQp: u8,
+    pCtx: &mut SliceCtx<'_>,
+) {
+    let kiQMul: i64 = if pCtx.bUseScalingList && pCtx.bDequantCoeff4x4Init {
+        pCtx.pDequant_coeff_buffer4x4[0][uiQp as usize][0] as i64
     } else {
-        (g_kuiDequantCoeff[uiQp as usize][0] as i32) << 4
+        (g_kuiDequantCoeff[uiQp as usize][0] as i64) << 4
     };
 
     const STRIDE: usize = 16;
-    let mut iTemp = [0i32; 16];
-    let kiXOffset: [usize; 4] = [0, STRIDE, STRIDE << 2, 5 * STRIDE];
-    let kiYOffset: [usize; 4] = [0, STRIDE << 1, STRIDE << 3, 10 * STRIDE];
+    const X_BLK: [usize; 4] = [0, 1, 4, 5];
+    const Y_BLK: [usize; 4] = [0, 2, 8, 10];
+    const kiXOffset: [usize; 4] = [0, STRIDE, STRIDE << 2, 5 * STRIDE];
+    const kiYOffset: [usize; 4] = [0, STRIDE << 1, STRIDE << 3, 10 * STRIDE];
 
+    let mut iTemp = [0i64; 16];
     for i in 0..4 {
-        let kiOffset = kiYOffset[i];
-        let kiX1 = kiOffset + kiXOffset[2];
-        let kiX2 = STRIDE + kiOffset;
-        let kiX3 = kiOffset + kiXOffset[3];
+        let row = Y_BLK[i];
+        let a = dc[row] as i64;
+        let b = dc[row + X_BLK[2]] as i64;
+        let c = dc[row + X_BLK[1]] as i64;
+        let d = dc[row + X_BLK[3]] as i64;
         let kiI4 = i << 2;
-        let kiZ0 = pBlock[kiOffset] as i32 + pBlock[kiX1] as i32;
-        let kiZ1 = pBlock[kiOffset] as i32 - pBlock[kiX1] as i32;
-        let kiZ2 = pBlock[kiX2] as i32 - pBlock[kiX3] as i32;
-        let kiZ3 = pBlock[kiX2] as i32 + pBlock[kiX3] as i32;
+        let kiZ0 = a + b;
+        let kiZ1 = a - b;
+        let kiZ2 = c - d;
+        let kiZ3 = c + d;
 
         iTemp[kiI4] = kiZ0 + kiZ3;
         iTemp[1 + kiI4] = kiZ1 + kiZ2;
@@ -2561,25 +2590,25 @@ pub fn WelsLumaDcDequantIdct(pBlock: &mut [i16], uiQp: u8, pCtx: &mut SliceCtx<'
         let kiZ2 = iTemp[kiI4].wrapping_sub(iTemp[8 + kiI4]);
         let kiZ3 = iTemp[kiI4].wrapping_add(iTemp[8 + kiI4]);
 
-        pBlock[kiOffset] = ((kiZ0
+        pBlock[kiOffset] = (kiZ0
             .wrapping_add(kiZ3)
             .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
+            .wrapping_add(1 << 5)
             >> 6) as i16;
-        pBlock[kiYOffset[1] + kiOffset] = ((kiZ1
+        pBlock[kiYOffset[1] + kiOffset] = (kiZ1
             .wrapping_add(kiZ2)
             .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
+            .wrapping_add(1 << 5)
             >> 6) as i16;
-        pBlock[kiYOffset[2] + kiOffset] = ((kiZ1
+        pBlock[kiYOffset[2] + kiOffset] = (kiZ1
             .wrapping_sub(kiZ2)
             .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
+            .wrapping_add(1 << 5)
             >> 6) as i16;
-        pBlock[kiYOffset[3] + kiOffset] = ((kiZ0
+        pBlock[kiYOffset[3] + kiOffset] = (kiZ0
             .wrapping_sub(kiZ3)
             .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
+            .wrapping_add(1 << 5)
             >> 6) as i16;
     }
 }
@@ -2677,6 +2706,7 @@ pub fn CavlcGetLevelVal(
     pBitsCache: &mut SReadBitsCache<'_>,
     uiTotalCoeff: u8,
     uiTrailingOnes: u8,
+    max_level_prefix: i32,
 ) -> i32 {
     let mut iUsedBits: i32 = 0;
     let t1 = (uiTrailingOnes as usize).min(3);
@@ -2692,38 +2722,61 @@ pub fn CavlcGetLevelVal(
         0
     };
 
+    // ITU-T H.264 9.2.2 / 9.2.2.1: support `level_prefix` up to `max_level_prefix`
+    // (19 in High profile for 8-bit video), refilling across the 16-bit cache boundary
+    // when needed. Departs from upstream `parse_mb_syn_cavlc.cpp:744-748`.
     for i in (uiTrailingOnes as usize)..(uiTotalCoeff as usize) {
-        if pBitsCache.uiRemainBits <= 16 {
-            SHIFT_BUFFER(pBitsCache);
-        }
-        let iPrefixBits = (pBitsCache.uiCache32Bit.leading_zeros() + 1) as i32;
-        if iPrefixBits > MAX_LEVEL_PREFIX + 1 {
-            return -1;
-        }
-        POP_BUFFER(pBitsCache, iPrefixBits as u32);
-        iUsedBits += iPrefixBits;
-        let iLevelPrefix = iPrefixBits - 1;
-        let mut iLevelCode = iLevelPrefix << iSuffixLength;
-        let mut iSuffixLengthSize = iSuffixLength;
-
-        if iLevelPrefix >= 14 {
-            if 14 == iLevelPrefix && 0 == iSuffixLength {
-                iSuffixLengthSize = 4;
-            } else if 15 == iLevelPrefix {
-                iSuffixLengthSize = 12;
-                if iSuffixLength == 0 {
-                    iLevelCode += 15;
-                }
-            }
-        }
-
-        if iSuffixLengthSize > 0 {
-            if pBitsCache.uiRemainBits <= iSuffixLengthSize as u8 {
+        let mut iLevelPrefix: i32 = 0;
+        loop {
+            if pBitsCache.uiRemainBits <= 16 {
                 SHIFT_BUFFER(pBitsCache);
             }
-            iLevelCode += (pBitsCache.uiCache32Bit >> (32 - iSuffixLengthSize)) as i32;
+            let lz = pBitsCache.uiCache32Bit.leading_zeros() as i32;
+            let avail = pBitsCache.uiRemainBits as i32;
+            if lz < avail {
+                POP_BUFFER(pBitsCache, (lz + 1) as u32);
+                iUsedBits += lz + 1;
+                iLevelPrefix += lz;
+                break;
+            }
+            if avail >= 32 {
+                return -1;
+            }
+            POP_BUFFER(pBitsCache, avail as u32);
+            iUsedBits += avail;
+            iLevelPrefix += avail;
+            if iLevelPrefix > max_level_prefix {
+                return -1;
+            }
+        }
+        if iLevelPrefix > max_level_prefix {
+            return -1;
+        }
+
+        let iSuffixLengthSize = if iLevelPrefix == 14 && iSuffixLength == 0 {
+            4
+        } else if iLevelPrefix >= 15 {
+            iLevelPrefix - 3
+        } else {
+            iSuffixLength
+        };
+
+        let mut iLevelSuffix: i32 = 0;
+        if iSuffixLengthSize > 0 {
+            if pBitsCache.uiRemainBits <= 16 {
+                SHIFT_BUFFER(pBitsCache);
+            }
+            iLevelSuffix = (pBitsCache.uiCache32Bit >> (32 - iSuffixLengthSize)) as i32;
             POP_BUFFER(pBitsCache, iSuffixLengthSize as u32);
             iUsedBits += iSuffixLengthSize;
+        }
+
+        let mut iLevelCode = (iLevelPrefix.min(15) << iSuffixLength) + iLevelSuffix;
+        if iLevelPrefix >= 15 && iSuffixLength == 0 {
+            iLevelCode += 15;
+        }
+        if iLevelPrefix >= 16 {
+            iLevelCode += (1 << (iLevelPrefix - 3)) - 4096;
         }
 
         if i == (uiTrailingOnes as usize) && uiTrailingOnes < 3 {
@@ -2932,17 +2985,19 @@ pub fn WelsResidualBlockCavlc(
     // `pCtx->pDequant_coeff4x4[iMbResProperty][uiQp]` in parse_mb_syn_cavlc.cpp: the 4x4
     // table is indexed directly by the MB residual property (0..5); only the 8x8 table
     // is biased by 6.
-    let kpDequantCoeff: &[u16] = if pCtx.bUseScalingList && pCtx.bDequantCoeff4x4Init {
-        &pCtx.pDequant_coeff_buffer4x4[iMbResProperty as usize][uiQp as usize][..]
-    } else {
-        &g_kuiDequantCoeff[uiQp as usize][..]
-    };
+    let use_custom_4x4 = pCtx.bUseScalingList && pCtx.bDequantCoeff4x4Init;
+    let custom_dequant = &pCtx.pDequant_coeff_buffer4x4[iMbResProperty as usize][uiQp as usize];
+    let default_dequant = &g_kuiDequantCoeff[uiQp as usize];
 
+    let max_level_prefix = pCtx.active_sps().map_or(MAX_LEVEL_PREFIX, |sps| {
+        max_level_prefix_for_profile(sps.uiProfileIdc)
+    });
     let res = CavlcGetLevelVal(
         &mut iLevel,
         &mut sReadBitsCache,
         uiTotalCoeff,
         uiTrailingOnes,
+        max_level_prefix,
     );
     if res == -1 {
         return GENERATE_ERROR_NO(ERR_LEVEL_MB_DATA, ERR_INFO_CAVLC_INVALID_LEVEL);
@@ -2981,41 +3036,47 @@ pub fn WelsResidualBlockCavlc(
     let mut iCoeffNum: i32 = -1;
 
     if iResidualProperty == CHROMA_DC {
+        // Keep Chroma DC levels in `i32`/`i64` through the 2x2 Hadamard and
+        // dequantization shift (`>> 1` / `>> 5`), casting `as i16` only on the
+        // final scaled output (ITU-T H.264 8.5.11).
+        let mut dc = [0i32; 4];
         for i in (0..(uiTotalCoeff as usize)).rev() {
             iCoeffNum += iRun[i] + 1;
             let j = kpZigzagTable[iCoeffNum as usize] as usize;
-            pTCoeff[j] = iLevel[i] as i16;
+            dc[j >> 4] = iLevel[i];
         }
-        WelsChromaDcIdct(pTCoeff);
-        if !pCtx.bUseScalingList {
-            for j in 0..4 {
-                let idx = kpZigzagTable[j] as usize;
-                pTCoeff[idx] = ((pTCoeff[idx] as i32 * kpDequantCoeff[0] as i32) >> 1) as i16;
-            }
+        let h = WelsChromaDcIdct(&dc);
+        let (mul0, shift) = if !use_custom_4x4 {
+            (default_dequant[0] as i64, 1)
         } else {
-            for j in 0..4 {
-                let idx = kpZigzagTable[j] as usize;
-                pTCoeff[idx] = (((pTCoeff[idx] as i64) * (kpDequantCoeff[0] as i64)) >> 5) as i16;
-            }
+            (custom_dequant[0] as i64, 5)
+        };
+        for j in 0..4 {
+            let idx = kpZigzagTable[j] as usize;
+            pTCoeff[idx] = (h[idx >> 4].wrapping_mul(mul0) >> shift) as i16;
         }
     } else if iResidualProperty == I16_LUMA_DC {
+        // Keep Intra-16x16 Luma DC levels in `i32`/`i64` through the 4x4 Hadamard
+        // and dequantization shift (`>> 6`), casting `as i16` only on the final
+        // scaled output (ITU-T H.264 8.5.12.1).
+        let mut dc = [0i32; 16];
         for i in (0..(uiTotalCoeff as usize)).rev() {
             iCoeffNum += iRun[i] + 1;
             let j = kpZigzagTable[iCoeffNum as usize] as usize;
-            pTCoeff[j] = iLevel[i] as i16;
+            dc[j >> 4] = iLevel[i];
         }
-        WelsLumaDcDequantIdct(pTCoeff, uiQp, pCtx);
-    } else if !pCtx.bUseScalingList {
+        WelsLumaDcDequantIdct(&dc, pTCoeff, uiQp, pCtx);
+    } else if !use_custom_4x4 {
         for i in (0..(uiTotalCoeff as usize)).rev() {
             iCoeffNum += iRun[i] + 1;
             let j = kpZigzagTable[iCoeffNum as usize] as usize;
-            pTCoeff[j] = (iLevel[i] * kpDequantCoeff[j & 0x07] as i32) as i16;
+            pTCoeff[j] = (iLevel[i] as i64 * default_dequant[j & 0x07] as i64) as i16;
         }
     } else {
         for i in (0..(uiTotalCoeff as usize)).rev() {
             iCoeffNum += iRun[i] + 1;
             let j = kpZigzagTable[iCoeffNum as usize] as usize;
-            pTCoeff[j] = ((iLevel[i] * kpDequantCoeff[j] as i32 + 8) >> 4) as i16;
+            pTCoeff[j] = ((iLevel[i] as i64 * custom_dequant[j] as i64 + 8) >> 4) as i16;
         }
     }
     ERR_NONE
@@ -3107,11 +3168,15 @@ pub fn WelsResidualBlockCavlc8x8(
         &g_kuiDequantCoeff8x8[uiQp as usize][..]
     };
 
+    let max_level_prefix = pCtx.active_sps().map_or(MAX_LEVEL_PREFIX, |sps| {
+        max_level_prefix_for_profile(sps.uiProfileIdc)
+    });
     let res = CavlcGetLevelVal(
         &mut iLevel,
         &mut sReadBitsCache,
         uiTotalCoeff,
         uiTrailingOnes,
+        max_level_prefix,
     );
     if res == -1 {
         return GENERATE_ERROR_NO(ERR_LEVEL_MB_DATA, ERR_INFO_CAVLC_INVALID_LEVEL);
@@ -3156,16 +3221,16 @@ pub fn WelsResidualBlockCavlc8x8(
             iCoeffNum += iRun[i] + 1;
             let j = (iCoeffNum << 2) + iIdx4x4;
             let j = kpZigzagTable[j as usize] as usize;
-            pTCoeff[j] = ((iLevel[i] * kpDequantCoeff[j] as i32) << shift) as i16;
+            pTCoeff[j] = ((iLevel[i] as i64 * kpDequantCoeff[j] as i64) << shift) as i16;
         }
     } else {
-        let round = 1 << (5 - qp_div6);
+        let round = 1i64 << (5 - qp_div6);
         let shift = 6 - qp_div6;
         for i in (0..(uiTotalCoeff as usize)).rev() {
             iCoeffNum += iRun[i] + 1;
             let j = (iCoeffNum << 2) + iIdx4x4;
             let j = kpZigzagTable[j as usize] as usize;
-            pTCoeff[j] = ((iLevel[i] * kpDequantCoeff[j] as i32 + round) >> shift) as i16;
+            pTCoeff[j] = ((iLevel[i] as i64 * kpDequantCoeff[j] as i64 + round) >> shift) as i16;
         }
     }
 
@@ -3243,25 +3308,13 @@ mod tests {
 
     #[test]
     fn test_chroma_dc_idct() {
-        let mut blk = [0i16; 64];
-        blk[0] = 10;
-        blk[16] = 2;
-        blk[32] = 4;
-        blk[48] = 1;
-
-        {
-            WelsChromaDcIdct(&mut blk);
-        }
-
         // iA=10, iB=2, iC=4, iD=1 -> iE=8, iA=12, iB=3, iC=5
-        // blk[0] = 12+5 = 17
-        // blk[16] = 8+3 = 11
-        // blk[32] = 12-5 = 7
-        // blk[48] = 8-3 = 5
-        assert_eq!(blk[0], 17);
-        assert_eq!(blk[16], 11);
-        assert_eq!(blk[32], 7);
-        assert_eq!(blk[48], 5);
+        // h = [12+5, 8+3, 12-5, 8-3] = [17, 11, 7, 5]
+        assert_eq!(WelsChromaDcIdct(&[10, 2, 4, 1]), [17, 11, 7, 5]);
+        assert_eq!(
+            WelsChromaDcIdct(&[10_000, 10_000, 10_000, 10_000]),
+            [40_000, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -3436,5 +3489,283 @@ mod tests {
             t.kpZeroTable[6].len(),
             "zero-left row 6"
         );
+    }
+
+    struct BitPacker {
+        bytes: Vec<u8>,
+        bit_pos: usize,
+    }
+
+    impl BitPacker {
+        fn new() -> Self {
+            Self {
+                bytes: vec![0u8; 64],
+                bit_pos: 0,
+            }
+        }
+
+        fn push_bits(&mut self, val: u32, count: usize) {
+            for b in (0..count).rev() {
+                let bit = ((val >> b) & 1) as u8;
+                self.bytes[self.bit_pos >> 3] |= bit << (7 - (self.bit_pos & 7));
+                self.bit_pos += 1;
+            }
+        }
+
+        fn push_prefix_and_suffix(&mut self, prefix: usize, suffix: u32, suffix_bits: usize) {
+            for _ in 0..prefix {
+                self.push_bits(0, 1);
+            }
+            self.push_bits(1, 1);
+            self.push_bits(suffix, suffix_bits);
+        }
+
+        fn cache_at(&self, start_bit: usize) -> SReadBitsCache<'_> {
+            let pBuf = &self.bytes[start_bit >> 3..];
+            let word = u32::from_be_bytes([pBuf[0], pBuf[1], pBuf[2], pBuf[3]]);
+            SReadBitsCache {
+                uiCache32Bit: word << (start_bit & 7),
+                uiRemainBits: 32 - (start_bit & 7) as u8,
+                pBuf,
+            }
+        }
+    }
+
+    #[test]
+    fn test_cavlc_get_level_val_prefixes_suffix0_and_suffix6() {
+        // suffixLength == 0 (single coefficient, trailingOnes == 0 => +2 offset).
+        let suffix0_cases = [
+            (14usize, 0b1010u32, 4usize, 14i32, 19i32),
+            (15, 0x123, 12, -162, 28),
+            (16, 0x0abc, 13, 3439, 30),
+            (19, 0x8001, 16, -47121, 36),
+        ];
+        for (prefix, suffix, suffix_bits, expected_lev, expected_bits) in suffix0_cases {
+            let mut packer = BitPacker::new();
+            packer.push_prefix_and_suffix(prefix, suffix, suffix_bits);
+            let mut cache = packer.cache_at(0);
+            let mut levels = [0i32; 16];
+            let used = CavlcGetLevelVal(&mut levels, &mut cache, 1, 0, MAX_LEVEL_PREFIX_HIGH);
+            assert_eq!(
+                used, expected_bits,
+                "used bits at prefix={prefix}, suffixLength=0"
+            );
+            assert_eq!(
+                levels[0], expected_lev,
+                "level at prefix={prefix}, suffixLength=0"
+            );
+        }
+
+        // suffixLength == 6: 5 warm-up coefficients bump suffixLength 0->2->3->4->5->6,
+        // then the 6th coefficient is decoded at suffixLength == 6.
+        let suffix6_cases = [
+            (14usize, 0b101010u32, 6usize, 470i32),
+            (15, 0x123, 12, -626),
+            (16, 0x1555, 13, -5259),
+            (19, 0x0042, 16, 31234),
+        ];
+        for (prefix, suffix, suffix_bits, expected_lev) in suffix6_cases {
+            let mut packer = BitPacker::new();
+            // i = 0 (suffixLength 0 -> 2): prefix=6 => levelCode=6+2=8 => lev=5 (> 3)
+            packer.push_prefix_and_suffix(6, 0, 0);
+            // i = 1..=4 (suffixLength s -> s+1 for s in 2..=5): prefix=6, suffix=0 => lev=(6<<(s-1))+1 > 3<<(s-1)
+            for s in 2..=5 {
+                packer.push_prefix_and_suffix(6, 0, s);
+            }
+            // i = 5 (suffixLength == 6)
+            packer.push_prefix_and_suffix(prefix, suffix, suffix_bits);
+
+            let mut cache = packer.cache_at(0);
+            let mut levels = [0i32; 16];
+            let used = CavlcGetLevelVal(&mut levels, &mut cache, 6, 0, MAX_LEVEL_PREFIX_HIGH);
+            assert_eq!(
+                used, packer.bit_pos as i32,
+                "used bits at prefix={prefix}, suffixLength=6"
+            );
+            assert_eq!(
+                levels[5], expected_lev,
+                "level at prefix={prefix}, suffixLength=6"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cavlc_get_level_val_refill_straddle_and_profile_caps() {
+        // Start at bit offset 7 (uiRemainBits == 25), consume an 8-bit first coeff
+        // (prefix=6, suffix=0 at suffixLength=0 => 7 bits? Use prefix=7 => 8 bits) so
+        // uiRemainBits == 17, then read prefix=19 (20 bits), straddling SHIFT_BUFFER.
+        let mut packer = BitPacker::new();
+        packer.push_bits(0b101_0101, 7);
+        packer.push_prefix_and_suffix(7, 0, 0); // 8 bits -> uiRemainBits drops from 25 to 17; lev=+5 => suffixLength=2
+        packer.push_prefix_and_suffix(19, 0xbeef, 16); // 20-bit prefix straddles refill + 16-bit suffix
+
+        let mut cache = packer.cache_at(7);
+        let mut levels = [0i32; 16];
+        let used = CavlcGetLevelVal(&mut levels, &mut cache, 2, 0, MAX_LEVEL_PREFIX_HIGH);
+        assert_eq!(used, 8 + 20 + 16);
+        // At suffixLength == 2, prefix=19, suffix=0xbeef (48879):
+        // levelCode = (15 << 2) + 48879 + (65536 - 4096) = 60 + 48879 + 61440 = 110379 (odd)
+        // lev = -((110379 + 2) >> 1) = -55190.
+        assert_eq!(levels[0], -5);
+        assert_eq!(levels[1], -55190);
+
+        // Prefix 16 is rejected when the profile cap is 15 (non-High profiles).
+        let mut p16 = BitPacker::new();
+        p16.push_prefix_and_suffix(16, 0, 13);
+        let mut cache_non_high = p16.cache_at(0);
+        assert_eq!(
+            CavlcGetLevelVal(
+                &mut levels,
+                &mut cache_non_high,
+                1,
+                0,
+                max_level_prefix_for_profile(66)
+            ),
+            -1
+        );
+        assert_eq!(max_level_prefix_for_profile(77), 15);
+        assert_eq!(max_level_prefix_for_profile(100), 19);
+
+        // Prefix 20 (> 19) is rejected even in High profile.
+        let mut p20 = BitPacker::new();
+        p20.push_prefix_and_suffix(20, 0, 16);
+        let mut cache_over = p20.cache_at(0);
+        assert_eq!(
+            CavlcGetLevelVal(&mut levels, &mut cache_over, 1, 0, MAX_LEVEL_PREFIX_HIGH),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_cavlc_dc_blocks_no_premature_i16_truncation() {
+        use crate::decoder::decode_slice::{g_kuiChromaDcScan, g_kuiLumaDcZigzagScan};
+        use crate::decoder::decoder_context::SpsRef;
+
+        let mut vlc_table = SVlcTable {
+            kpCoeffTokenVlcTable: [[&[]; 8]; 4],
+            kpChromaCoeffTokenVlcTable: &[],
+            kpZeroTable: [&[]; 7],
+            kpTotalZerosTable: [[&[]; 15]; 2],
+        };
+        InitVlcTable(&mut vlc_table);
+
+        let make_ctx = || {
+            let mut ctx = SWelsDecoderContext::new_boxed();
+            ctx.sSpsPpsCtx.sSpsBuffer[0].uiProfileIdc = 100; // High profile
+            ctx.active_sps = Some(SpsRef {
+                id: 0,
+                subset: false,
+            });
+            ctx.bUseScalingList = true;
+            ctx.bDequantCoeff4x4Init = true;
+            // QP = 0 with custom scaling-list entry 1 -> `mul0 = 1 * 10 = 10`.
+            ctx.pDequant_coeff_buffer4x4[0][0][0] = 10; // I16_LUMA_DC
+            ctx.pDequant_coeff_buffer4x4[1][0][0] = 10; // CHROMA_DC_U
+            ctx
+        };
+
+        // 1. I16_LUMA_DC: single level -47,121 (prefix=19, suffix=0x8001) at QP=0, mul0=10.
+        // Exact H.264 8.5.12.1 scaled DC is (-47121 * 10 + 32) >> 6 == -7363 (not +2877).
+        {
+            let mut packer = BitPacker::new();
+            packer.push_bits(0b000101, 6); // nC=0 coeff_token: TotalCoeff=1, TrailingOnes=0
+            packer.push_prefix_and_suffix(19, 0x8001, 16); // iLevel[0] = -47121
+            packer.push_bits(0b1, 1); // total_zeros = 0 (TotalCoeff=1)
+            let mut bs = BsCursor::init(&packer.bytes, (packer.bytes.len() * 8) as i32).unwrap();
+            bs.start_cavlc();
+
+            let mut ctx = make_ctx();
+            let mut view = crate::decoder::decoder_context::test_slice_ctx(&mut ctx, &vlc_table);
+            let mut nzc = [0u8; 48];
+            let mut coeffs = [0i16; 256];
+            let ret = WelsResidualBlockCavlc(
+                view.pVlcTable,
+                &mut nzc,
+                &packer.bytes,
+                &mut bs,
+                0,
+                16,
+                &g_kuiLumaDcZigzagScan,
+                I16_LUMA_DC,
+                &mut coeffs,
+                0,
+                &mut view,
+            );
+            assert_eq!(ret, ERR_NONE);
+            for blk in 0..16 {
+                assert_eq!(coeffs[blk << 4], -7363, "luma DC block {blk}");
+            }
+        }
+
+        // 2. CHROMA_DC: single level -47,121 (prefix=19, suffix=0x8001) at QP=0, mul0=10.
+        // Exact H.264 8.5.11 scaled DC is (-47121 * 10) >> 5 == -14726 (not +5754).
+        {
+            let mut packer = BitPacker::new();
+            packer.push_bits(0b000111, 6); // Chroma DC coeff_token: TotalCoeff=1, TrailingOnes=0
+            packer.push_prefix_and_suffix(19, 0x8001, 16); // iLevel[0] = -47121
+            packer.push_bits(0b1, 1); // Chroma DC total_zeros = 0 (TotalCoeff=1)
+            let mut bs = BsCursor::init(&packer.bytes, (packer.bytes.len() * 8) as i32).unwrap();
+            bs.start_cavlc();
+
+            let mut ctx = make_ctx();
+            let mut view = crate::decoder::decoder_context::test_slice_ctx(&mut ctx, &vlc_table);
+            let mut nzc = [0u8; 48];
+            let mut coeffs = [0i16; 64];
+            let ret = WelsResidualBlockCavlc(
+                view.pVlcTable,
+                &mut nzc,
+                &packer.bytes,
+                &mut bs,
+                16,
+                4,
+                &g_kuiChromaDcScan,
+                CHROMA_DC_U,
+                &mut coeffs,
+                0,
+                &mut view,
+            );
+            assert_eq!(ret, ERR_NONE);
+            for &idx in &g_kuiChromaDcScan {
+                assert_eq!(coeffs[idx as usize], -14726, "chroma DC slot {idx}");
+            }
+        }
+
+        // 3. CHROMA_DC: four levels of +10,000 (prefix=17) whose 2x2 Hadamard sum
+        // 40,000 overflows `i16` before `>> 5`, yet scales cleanly to (40000 * 10) >> 5 == 12500.
+        {
+            let mut packer = BitPacker::new();
+            packer.push_bits(0b000010, 6); // Chroma DC coeff_token: TotalCoeff=4, TrailingOnes=0
+            // suffixLength progresses 0 -> 2 -> 3 -> 4; each encodes levelCode 19998 -> +10000.
+            packer.push_prefix_and_suffix(17, 7678, 14);
+            packer.push_prefix_and_suffix(17, 7650, 14);
+            packer.push_prefix_and_suffix(17, 7590, 14);
+            packer.push_prefix_and_suffix(17, 7470, 14);
+            // TotalCoeff == 4 (iMaxNumCoeff), so total_zeros and run_before are omitted.
+            let mut bs = BsCursor::init(&packer.bytes, (packer.bytes.len() * 8) as i32).unwrap();
+            bs.start_cavlc();
+
+            let mut ctx = make_ctx();
+            let mut view = crate::decoder::decoder_context::test_slice_ctx(&mut ctx, &vlc_table);
+            let mut nzc = [0u8; 48];
+            let mut coeffs = [0i16; 64];
+            let ret = WelsResidualBlockCavlc(
+                view.pVlcTable,
+                &mut nzc,
+                &packer.bytes,
+                &mut bs,
+                16,
+                4,
+                &g_kuiChromaDcScan,
+                CHROMA_DC_U,
+                &mut coeffs,
+                0,
+                &mut view,
+            );
+            assert_eq!(ret, ERR_NONE);
+            assert_eq!(coeffs[0], 12500);
+            assert_eq!(coeffs[16], 0);
+            assert_eq!(coeffs[32], 0);
+            assert_eq!(coeffs[48], 0);
+        }
     }
 }

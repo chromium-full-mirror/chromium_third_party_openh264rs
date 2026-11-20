@@ -667,13 +667,13 @@ pub fn ComputeColocatedTemporalScaling(
                             .sSliceInLayer
                             .sSliceHeaderExt
                             .sSliceHeader
-                            .iPicOrderCntLsb;
-                        let td = WELS_CLIP3(poc1 - poc0, -128, 127);
+                            .iPicOrderCnt;
+                        let td = ((poc1 as i64) - (poc0 as i64)).clamp(-128, 127) as i32;
                         if td == 0 {
                             pCurDqLayer.sLayerInfo.sSliceInLayer.iMvScale[LIST_0][i as usize] =
                                 1 << 8;
                         } else {
-                            let tb = WELS_CLIP3(poc - poc0, -128, 127);
+                            let tb = ((poc as i64) - (poc0 as i64)).clamp(-128, 127) as i32;
                             let tx = (16384 + (td.abs() >> 1)) / td;
                             pCurDqLayer.sLayerInfo.sSliceInLayer.iMvScale[LIST_0][i as usize] =
                                 WELS_CLIP3((tb * tx + 32) >> 6, -1024, 1023) as i16;
@@ -686,17 +686,30 @@ pub fn ComputeColocatedTemporalScaling(
     }
 }
 
-pub fn WelsCalcDeqCoeffScalingList(pCtx: &mut SWelsDecoderContext) -> i32 {
+pub fn WelsCalcDeqCoeffScalingList(
+    pCtx: &mut SWelsDecoderContext,
+    pCurDqLayer: Option<&DqLayerState>,
+) -> i32 {
+    let (sps_ref, pps_id) = match pCurDqLayer.or(pCtx.pDqLayersList.as_deref()) {
+        Some(dq) => (
+            dq.sLayerInfo
+                .sSliceInLayer
+                .sSliceHeaderExt
+                .sSliceHeader
+                .sps_ref
+                .or(pCtx.active_sps),
+            dq.sLayerInfo.pps_id.or(pCtx.active_pps),
+        ),
+        None => (pCtx.active_sps, pCtx.active_pps),
+    };
     let ps = &pCtx.sSpsPpsCtx;
-    let (Some(sps), Some(pps)) = (
-        active_sps(ps, pCtx.active_sps),
-        active_pps(ps, pCtx.active_pps),
-    ) else {
+    let (Some(sps), Some(pps)) = (active_sps(ps, sps_ref), active_pps(ps, pps_id)) else {
         return ERR_NONE;
     };
     let bPicScaling = pps.bPicScalingMatrixPresentFlag;
     let bAnyScaling = sps.bSeqScalingMatrixPresentFlag || bPicScaling;
     let iPpsId = pps.iPpsId;
+    let cache_key = (ps.uiParamSetGeneration, iPpsId, sps_ref);
     let (kList4x4, kList8x8) = if bPicScaling {
         (pps.iScalingList4x4, pps.iScalingList8x8)
     } else {
@@ -706,13 +719,20 @@ pub fn WelsCalcDeqCoeffScalingList(pCtx: &mut SWelsDecoderContext) -> i32 {
     if bAnyScaling {
         pCtx.bUseScalingList = true;
 
-        if !pCtx.bDequantCoeff4x4Init || pCtx.iDequantCoeffPpsid != iPpsId {
+        // ITU-T H.264 7.4.1.2.1 / 7.4.2.2: key the dequantization cache by parameter-set
+        // generation, PPS id, and SPS ref so a PPS or SPS replaced under the same id
+        // rebuilds its scaling-list tables. Departs from upstream
+        // `decode_slice.cpp:1490, 1508`.
+        if !pCtx.bDequantCoeff4x4Init || pCtx.dequant_cache_key != Some(cache_key) {
             for i in 0..6 {
                 for q in 0..52 {
                     for x in 0..16 {
                         let scale4 = kList4x4[i][x] as u32;
+                        // ITU-T H.264 8.5.9 / 8.5.12.1: keep full 32-bit product
+                        // (reaches 255 * 5888 = 1,501,440 at QP 51). Departs from
+                        // upstream `decoder_context.h:506` / `decode_slice.cpp:1500`.
                         pCtx.pDequant_coeff_buffer4x4[i][q][x] =
-                            (scale4 * (g_kuiDequantCoeff[q][x & 0x07] as u32)) as u16;
+                            scale4 * (g_kuiDequantCoeff[q][x & 0x07] as u32);
                     }
                     for y in 0..64 {
                         let scale8 = kList8x8[i][y] as u32;
@@ -723,6 +743,7 @@ pub fn WelsCalcDeqCoeffScalingList(pCtx: &mut SWelsDecoderContext) -> i32 {
             }
             pCtx.bDequantCoeff4x4Init = true;
             pCtx.iDequantCoeffPpsid = iPpsId;
+            pCtx.dequant_cache_key = Some(cache_key);
         }
     } else {
         pCtx.bUseScalingList = false;
@@ -2578,6 +2599,41 @@ fn DecodeMbCavlcPcm(
     }
 }
 
+/// Resets the per-macroblock 8x8 partition and transform flags to their H.264 7.3.5
+/// defaults (`noSubMbPartSizeLessThan8x8Flag = 1`, `transform_size_8x8_flag = 0`).
+///
+/// Both arrays persist across pictures in `DqLayerState::grid`, so every macroblock
+/// entry point resets them before parsing or skipping the macroblock
+/// (`decode_slice.cpp:2470-2471`).
+#[inline]
+fn reset_mb_8x8_flags(dq: &mut DqLayerState, iMbXy: usize) {
+    *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
+    *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+}
+
+/// ITU-T H.264 7.3.5: whether `transform_size_8x8_flag` is present in the macroblock
+/// residual header after `coded_block_pattern` is parsed.
+///
+/// Departs from upstream (`decode_slice.cpp:950, 1190, 2292, 2846`), which omits the
+/// `mb_type != B_Direct_16x16 || direct_8x8_inference_flag` term and uses numeric
+/// comparisons on bitmask `mb_type` values in CAVLC.
+#[inline]
+fn should_parse_transform_size_8x8_flag(
+    transform_8x8_mode_flag: bool,
+    cbp_luma: u32,
+    mb_type: u32,
+    no_sub_mb_part_size_less_than_8x8: bool,
+    direct_8x8_inference_flag: bool,
+) -> bool {
+    transform_8x8_mode_flag
+        && cbp_luma > 0
+        && !IS_INTRANxN(mb_type)
+        && !IS_INTRA16x16(mb_type)
+        && mb_type != MB_TYPE_INTRA_PCM
+        && no_sub_mb_part_size_less_than_8x8
+        && (!IS_DIRECT(mb_type) || direct_8x8_inference_flag)
+}
+
 /// Matches `WelsActualDecodeMbCavlcISlice` in `decode_slice.cpp`.
 pub fn WelsActualDecodeMbCavlcISlice(
     pCtx: &mut SliceCtx<'_>,
@@ -2609,8 +2665,7 @@ pub fn WelsActualDecodeMbCavlcISlice(
             .sSliceHeaderExt
             .bDefaultResidualPredFlag as i8;
 
-        *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
-        *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+        reset_mb_8x8_flags(dq, iMbXy);
 
         let ret = BsGetUe(buf, pBs, &mut uiCode);
         if ret != 0 {
@@ -3280,13 +3335,14 @@ pub fn WelsActualDecodeMbCavlcPSlice(
             uiCbpL = uiCbp & 15;
 
             let mb_type = *pDec.pMbType.get(iMbXy);
-            let bNeedParseTransformSize8x8Flag = ((mb_type >= MB_TYPE_16x16
-                && mb_type <= MB_TYPE_8x16)
-                || *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy))
-                && mb_type != MB_TYPE_INTRA8x8
-                && mb_type != MB_TYPE_INTRA4x4
-                && uiCbpL > 0
-                && pCtx.bTransform8x8ModeFlag();
+            let bNeedParseTransformSize8x8Flag = should_parse_transform_size_8x8_flag(
+                pCtx.bTransform8x8ModeFlag(),
+                uiCbpL,
+                mb_type,
+                *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy),
+                pCtx.active_sps()
+                    .is_some_and(|sps| sps.bDirect8x8InferenceFlag),
+            );
 
             if bNeedParseTransformSize8x8Flag {
                 let ret = BsGetOneBit(buf, pBs, &mut uiCode);
@@ -3384,6 +3440,8 @@ pub fn WelsDecodeMbCavlcPSlice(
         let (buf, pBs) = pNalCur.sNalData.sVclNal.sSliceBitsRead.split(pCtx.sRawData);
         let iMbXy = dq.iMbXyIndex as usize;
         let mut uiCode = 0u32;
+
+        reset_mb_8x8_flags(dq, iMbXy);
 
         // A P macroblock's unused list 1 gets its defined value here rather than the
         // pooled picture's leftovers (8.4.2.1), as in `WelsDecodeMbCabacPSlice`.
@@ -3670,13 +3728,14 @@ pub fn WelsActualDecodeMbCavlcBSlice(
             uiCbpL = uiCbp & 15;
 
             let mb_type = *pDec.pMbType.get(iMbXy);
-            let bNeedParseTransformSize8x8Flag = ((mb_type >= MB_TYPE_16x16
-                && mb_type <= MB_TYPE_8x16)
-                || *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy))
-                && mb_type != MB_TYPE_INTRA8x8
-                && mb_type != MB_TYPE_INTRA4x4
-                && uiCbpL > 0
-                && pCtx.bTransform8x8ModeFlag();
+            let bNeedParseTransformSize8x8Flag = should_parse_transform_size_8x8_flag(
+                pCtx.bTransform8x8ModeFlag(),
+                uiCbpL,
+                mb_type,
+                *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy),
+                pCtx.active_sps()
+                    .is_some_and(|sps| sps.bDirect8x8InferenceFlag),
+            );
 
             if bNeedParseTransformSize8x8Flag {
                 let ret = BsGetOneBit(buf, pBs, &mut uiCode);
@@ -3777,8 +3836,7 @@ pub fn WelsDecodeMbCavlcBSlice(
         let iMbXy = dq.iMbXyIndex as usize;
         let mut uiCode = 0u32;
 
-        *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
-        *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+        reset_mb_8x8_flags(dq, iMbXy);
 
         if dq.sLayerInfo.sSliceInLayer.iMbSkipRun == -1 {
             // mb_skip_run
@@ -4380,15 +4438,14 @@ fn WelsDecodeMbCabacResidualHelper(
 
         if uiCbp != 0 || mb_type == MB_TYPE_INTRA16x16 {
             if mb_type != MB_TYPE_INTRA16x16 {
-                let bNeedParseTransformSize8x8Flag = (IS_INTER_16x16(mb_type)
-                    || IS_DIRECT(mb_type)
-                    || IS_INTER_16x8(mb_type)
-                    || IS_INTER_8x16(mb_type)
-                    || *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy))
-                    && mb_type != MB_TYPE_INTRA8x8
-                    && mb_type != MB_TYPE_INTRA4x4
-                    && (uiCbp & 0x0F) > 0
-                    && pps_layer_transform8x8;
+                let bNeedParseTransformSize8x8Flag = should_parse_transform_size_8x8_flag(
+                    pps_layer_transform8x8,
+                    uiCbp & 0x0F,
+                    mb_type,
+                    *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get(iMbXy),
+                    pCtx.active_sps()
+                        .is_some_and(|sps| sps.bDirect8x8InferenceFlag),
+                );
 
                 if bNeedParseTransformSize8x8Flag {
                     let mut bTransformSize8x8Flag = false;
@@ -4692,8 +4749,7 @@ pub fn WelsDecodeMbCabacISliceBaseMode0(
         let mut pIntraPredMode = [0i8; 48];
         let mut uiMbType = 0u32;
 
-        *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
-        *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+        reset_mb_8x8_flags(dq, iMbXy);
         *dq.grid.residual_pred_flag.get_mut(iMbXy) = dq
             .sLayerInfo
             .sSliceInLayer
@@ -4941,8 +4997,7 @@ pub fn WelsDecodeMbCabacPSlice(
         *dq.grid.cbp.get_mut(iMbXy) = 0;
         *dq.grid.cbf_dc.get_mut(iMbXy) = 0;
         *dq.grid.chroma_pred_mode.get_mut(iMbXy) = C_PRED_DC as i8;
-        *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
-        *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+        reset_mb_8x8_flags(dq, iMbXy);
 
         // 8.4.2.1 gives a P macroblock no list-1 prediction, and neither the skip
         // short-cut below nor the inter paths write `pRefIndex[LIST_1]` or
@@ -5166,8 +5221,7 @@ pub fn WelsDecodeMbCabacBSlice(
         *dq.grid.cbp.get_mut(iMbXy) = 0;
         *dq.grid.cbf_dc.get_mut(iMbXy) = 0;
         *dq.grid.chroma_pred_mode.get_mut(iMbXy) = C_PRED_DC as i8;
-        *dq.grid.no_sub_mb_part_size_less_than8x8_flag.get_mut(iMbXy) = true;
-        *dq.grid.transform_size8x8_flag.get_mut(iMbXy) = false;
+        reset_mb_8x8_flags(dq, iMbXy);
 
         GetNeighborAvailMbType(&mut sNeighAvail, Some(&*dq), Some(&*pDec));
         let mut ret = ParseSkipFlagCabac(pCtx, &sNeighAvail, &mut uiCode);
@@ -5392,7 +5446,7 @@ pub fn WelsDecodeSlice(
             return err;
         }
     }
-    WelsCalcDeqCoeffScalingList(pCtx);
+    WelsCalcDeqCoeffScalingList(pCtx, Some(&*pCurDqLayer));
 
     let (pDec, pRefs, mut view, nal) = slice_split(pCtx, nal_idx);
     let Some(pNalCur) = nal else {
@@ -5557,14 +5611,14 @@ mod tests {
                     subset: false,
                 });
                 ctx.active_pps = Some(1);
-                let res = WelsCalcDeqCoeffScalingList(&mut ctx);
+                let res = WelsCalcDeqCoeffScalingList(&mut ctx, None);
                 assert_eq!(res, ERR_NONE);
                 assert!(ctx.bUseScalingList);
                 assert!(ctx.bDequantCoeff4x4Init);
                 assert_eq!(ctx.iDequantCoeffPpsid, 1);
                 assert_eq!(
                     ctx.pDequant_coeff_buffer4x4[0][51][0],
-                    16 * g_kuiDequantCoeff[51][0]
+                    16 * g_kuiDequantCoeff[51][0] as u32
                 );
                 assert_eq!(
                     ctx.pDequant_coeff_buffer8x8[0][51][0],
@@ -5572,6 +5626,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_dequant_4x4_scaling_list_max_entries_no_u16_truncation() {
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.sSpsPpsCtx.sSpsBuffer[0].bSeqScalingMatrixPresentFlag = true;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iScalingList4x4 = [[255u8; 16]; 6];
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iPpsId = 0;
+        ctx.active_sps = Some(SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_pps = Some(0);
+
+        assert_eq!(WelsCalcDeqCoeffScalingList(&mut ctx, None), ERR_NONE);
+        for list in 0..6 {
+            for qp in 0..52 {
+                for x in 0..16 {
+                    let expected = 255u32 * (g_kuiDequantCoeff[qp][x & 0x07] as u32);
+                    assert_eq!(
+                        ctx.pDequant_coeff_buffer4x4[list][qp][x], expected,
+                        "mismatch at list={list}, qp={qp}, x={x}"
+                    );
+                }
+            }
+        }
+        assert!(ctx.pDequant_coeff_buffer4x4[0][51][0] > u16::MAX as u32);
+    }
+
+    #[test]
+    fn test_dequant_tables_rebuild_when_same_pps_id_changes_scaling_lists() {
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iPpsId = 0;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].bPicScalingMatrixPresentFlag = true;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iScalingList4x4 = [[20u8; 16]; 6];
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iScalingList8x8 = [[25u8; 64]; 6];
+        ctx.active_sps = Some(SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_pps = Some(0);
+
+        assert_eq!(WelsCalcDeqCoeffScalingList(&mut ctx, None), ERR_NONE);
+        assert_eq!(
+            ctx.pDequant_coeff_buffer4x4[0][26][0],
+            20u32 * g_kuiDequantCoeff[26][0] as u32
+        );
+        assert_eq!(
+            ctx.pDequant_coeff_buffer8x8[0][26][0],
+            25u16 * g_kuiMatrixV[26 % 6][0][0] as u16
+        );
+
+        // Simulate replacing active PPS 0 via the parked slot + WriteBackActiveParameters.
+        let mut replacement = ctx.sSpsPpsCtx.sPpsBuffer[0];
+        replacement.iScalingList4x4 = [[40u8; 16]; 6];
+        replacement.iScalingList8x8 = [[50u8; 64]; 6];
+        ctx.sSpsPpsCtx.sPpsBuffer[crate::decoder::parameter_sets::MAX_PPS_COUNT] = replacement;
+        ctx.sSpsPpsCtx.iOverwriteFlags = crate::decoder::decoder_context::OVERWRITE_PPS;
+        crate::decoder::decoder_core::WriteBackActiveParameters(&mut ctx);
+
+        assert_eq!(WelsCalcDeqCoeffScalingList(&mut ctx, None), ERR_NONE);
+        assert_eq!(
+            ctx.pDequant_coeff_buffer4x4[0][26][0],
+            40u32 * g_kuiDequantCoeff[26][0] as u32
+        );
+        assert_eq!(
+            ctx.pDequant_coeff_buffer8x8[0][26][0],
+            50u16 * g_kuiMatrixV[26 % 6][0][0] as u16
+        );
+    }
+
+    #[test]
+    fn test_dequant_tables_use_passed_dq_layer_when_context_layer_is_taken() {
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iPpsId = 0;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].bPicScalingMatrixPresentFlag = true;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iScalingList4x4 = [[16u8; 16]; 6];
+        ctx.sSpsPpsCtx.sPpsBuffer[1].iPpsId = 1;
+        ctx.sSpsPpsCtx.sPpsBuffer[1].bPicScalingMatrixPresentFlag = true;
+        ctx.sSpsPpsCtx.sPpsBuffer[1].iScalingList4x4 = [[32u8; 16]; 6];
+        let sps_ref = Some(SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+        ctx.active_pps = Some(0);
+        // Mirror `DecodeCurrentAccessUnit`: `pDqLayersList` is taken out of `ctx`.
+        assert!(ctx.pDqLayersList.is_none());
+
+        let mut dq = DqLayerState::for_grid(crate::safe::mb_grid::MbDims::none());
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .sps_ref = sps_ref;
+        dq.sLayerInfo.pps_id = Some(1);
+
+        assert_eq!(WelsCalcDeqCoeffScalingList(&mut ctx, Some(&dq)), ERR_NONE);
+        assert_eq!(ctx.iDequantCoeffPpsid, 1);
+        assert_eq!(
+            ctx.pDequant_coeff_buffer4x4[0][26][0],
+            32u32 * g_kuiDequantCoeff[26][0] as u32
+        );
     }
 
     /// A stream that has neighbours.
@@ -5674,5 +5831,73 @@ mod tests {
         let (_frames, _dims, states) = drive_decoder_over(truncated);
         // Truncated I_PCM must not be reported as a clean decode.
         assert_ne!(states, 0, "truncated I_PCM must report error states");
+    }
+
+    #[test]
+    fn test_should_parse_transform_size_8x8_flag_truth_table() {
+        // Requires transform_8x8_mode_flag and cbp_luma > 0.
+        assert!(!should_parse_transform_size_8x8_flag(
+            false,
+            0x0F,
+            MB_TYPE_16x16 | MB_TYPE_P0L0,
+            true,
+            true
+        ));
+        assert!(!should_parse_transform_size_8x8_flag(
+            true,
+            0,
+            MB_TYPE_16x16 | MB_TYPE_P0L0,
+            true,
+            true
+        ));
+
+        // Never parsed after CBP for Intra NxN, Intra 16x16, or I_PCM.
+        for intra in [
+            MB_TYPE_INTRA4x4,
+            MB_TYPE_INTRA8x8,
+            MB_TYPE_INTRA16x16,
+            MB_TYPE_INTRA_PCM,
+        ] {
+            assert!(!should_parse_transform_size_8x8_flag(
+                true, 0x0F, intra, true, true
+            ));
+        }
+
+        // Standard inter partitions (16x16, 16x8, 8x16) with no sub-MB < 8x8.
+        for inter in [
+            MB_TYPE_16x16 | MB_TYPE_P0L0,
+            MB_TYPE_16x8 | MB_TYPE_P0L0 | MB_TYPE_P1L1,
+            MB_TYPE_8x16 | MB_TYPE_P0L1 | MB_TYPE_P1L0,
+        ] {
+            assert!(should_parse_transform_size_8x8_flag(
+                true, 1, inter, true, false
+            ));
+        }
+
+        // P_8x8 / B_8x8 depend on no_sub_mb_part_size_less_than_8x8, not direct_8x8_inference_flag
+        // directly (for B_8x8, B_Direct_8x8 clears no_sub_mb_part_size_less_than_8x8 in the sub-MB loop).
+        let b_8x8 = g_ksInterBMbTypeInfo[22].iType;
+        assert!(!IS_DIRECT(b_8x8));
+        assert!(should_parse_transform_size_8x8_flag(
+            true, 1, b_8x8, true, false
+        ));
+        assert!(!should_parse_transform_size_8x8_flag(
+            true, 1, b_8x8, false, true
+        ));
+
+        // B_Direct_16x16 (including after GetColocatedMb ORs shape/list bits into mb_type)
+        // requires direct_8x8_inference_flag == true.
+        for direct in [
+            MB_TYPE_DIRECT,
+            MB_TYPE_DIRECT | MB_TYPE_16x16 | MB_TYPE_L0 | MB_TYPE_L1,
+            MB_TYPE_DIRECT | MB_TYPE_8x8 | MB_TYPE_L0 | MB_TYPE_L1,
+        ] {
+            assert!(!should_parse_transform_size_8x8_flag(
+                true, 1, direct, true, false
+            ));
+            assert!(should_parse_transform_size_8x8_flag(
+                true, 1, direct, true, true
+            ));
+        }
     }
 }

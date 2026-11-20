@@ -374,6 +374,7 @@ impl PicPool {
         match self.slots.get_mut(id) {
             Some(pic) => {
                 pic.iPicBuffIdx = index;
+                pic.bIsNonExisting = false;
                 true
             }
             None => false,
@@ -558,6 +559,7 @@ pub fn IncreasePicBuff(
             pic.iRefCount = 0;
             pic.pSetUnRef = None;
             pic.bIsComplete = false;
+            pic.bIsNonExisting = false;
         }
     }
     ERR_NONE
@@ -668,6 +670,7 @@ fn ResetPoolPictureFlags(pool: &mut PicPool) {
             pic.iRefCount = 0;
             pic.pSetUnRef = None;
             pic.bIsComplete = false;
+            pic.bIsNonExisting = false;
         }
     }
 }

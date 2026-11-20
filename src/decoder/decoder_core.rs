@@ -151,7 +151,7 @@ pub fn GENERATE_ERROR_NO(level: i32, info: i32) -> i32 {
     (level << 16) | info
 }
 
-pub use crate::common::macros::{WELS_ABS, WELS_CLIP3, WELS_MIN};
+pub use crate::common::macros::{WELS_ABS, WELS_MIN};
 
 #[inline]
 pub fn IS_VCL_NAL(t: EWelsNalUnitType, _unused: i32) -> bool {
@@ -555,25 +555,237 @@ pub fn ComputeColocatedTemporalScaling(
 /// Decoding order is already output order, so pictures go out directly at zero
 /// latency, for three families:
 ///
-/// * the baseline and CAVLC 4:4:4 profiles, which carry no B slices and no
-///   reordering;
-/// * `pic_order_cnt_type` other than 0. Type 2 has output order equal to decoding
-///   order by definition; type 1 permits reordering but this decoder derives no POC
-///   for it (see the POC switch in [`DecodeCurrentAccessUnit`]), so there is nothing
-///   to sort by;
+/// * the baseline and scalable-baseline profiles, which are emitted in decode order
+///   by design;
+/// * `pic_order_cnt_type == 2`, whose output order equals decoding order by
+///   definition (ITU-T H.264 8.2.1.3 — upstream C++ also excluded type 1 because
+///   it did not derive type 1 POCs);
 /// * a VUI whose `max_num_reorder_frames` is 0 (E.2.1): the encoder has stated that
 ///   no picture precedes another in output order that follows it in decoding order.
 pub fn NeedsPictureReordering(kpSps: &SSps) -> bool {
     if kpSps.uiProfileIdc == 66 || kpSps.uiProfileIdc == 83 {
         return false;
     }
-    if kpSps.uiPocType != 0 {
+    if kpSps.uiPocType == 2 {
         return false;
     }
     if kpSps.sVui.bBitstreamRestrictionFlag && kpSps.sVui.uiMaxNumReorderFrames == 0 {
         return false;
     }
     true
+}
+
+/// Derives `(TopFieldOrderCnt, BottomFieldOrderCnt, PicOrderCnt)` for one picture per
+/// ITU-T H.264 clause 8.2.1 (types 0, 1, and 2), staging the current picture's POC
+/// state onto `info` without committing `prev*` until [`FinishPictureOrderCount`] runs
+/// after decoding and reference picture marking (handling MMCO 5 per 8.2.1 Note 1).
+///
+/// Departs from upstream C++ (`decoder_core.cpp`), which derived POC only for type 0
+/// during slice-header parsing and added `delta_pic_order_cnt_bottom` without `Min`.
+pub fn DerivePictureOrderCount(
+    kpSps: &SSps,
+    kpSh: &SSliceHeader,
+    bIsIdr: bool,
+    uiNalRefIdc: u8,
+    info: &mut crate::decoder::decoder_context::SWelsLastDecPicInfo,
+) -> (i32, i32, i32) {
+    // Reserve `<= IMinInt32` (`-0x7FFFFFFF`), which `pPictInfoList` and
+    // `ReleaseBufferedReadyPictureReorder` use as the empty-slot sentinel.
+    let clamp_poc = |v: i64| v.clamp((IMinInt32 + 1) as i64, i32::MAX as i64) as i32;
+    let clamp_i32 = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+
+    info.bCurPicIsIdr = bIsIdr;
+    info.uiCurPicNalRefIdc = uiNalRefIdc;
+    info.iCurPicFrameNum = kpSh.iFrameNum;
+    info.iCurPicRawPocLsb = kpSh.iPicOrderCntLsb;
+
+    let mut poc_msb_i64 = 0i64;
+    let mut fn_offset_i64 = 0i64;
+    let (top_i64, bottom_i64) = match kpSps.uiPocType {
+        0 => {
+            let (prev_msb, prev_lsb) = if bIsIdr {
+                (0i64, 0i64)
+            } else if info.bPrevRefHasMmco5 {
+                (0i64, info.iPrevPicOrderCntLsb as i64)
+            } else {
+                (
+                    info.iPrevPicOrderCntMsb as i64,
+                    info.iPrevPicOrderCntLsb as i64,
+                )
+            };
+            let max_poc_lsb = 1i64 << (kpSps.iLog2MaxPocLsb.clamp(4, 16) as u32);
+            let poc_lsb = kpSh.iPicOrderCntLsb as i64;
+            poc_msb_i64 = if poc_lsb < prev_lsb && (prev_lsb - poc_lsb) >= (max_poc_lsb / 2) {
+                prev_msb.saturating_add(max_poc_lsb)
+            } else if poc_lsb > prev_lsb && (poc_lsb - prev_lsb) > (max_poc_lsb / 2) {
+                prev_msb.saturating_sub(max_poc_lsb)
+            } else {
+                prev_msb
+            };
+            let top = poc_msb_i64.saturating_add(poc_lsb);
+            let bottom = if !kpSh.bFieldPicFlag {
+                top.saturating_add(kpSh.iDeltaPicOrderCntBottom as i64)
+            } else {
+                top
+            };
+            (top, bottom)
+        }
+        1 => {
+            let max_frame_num = 1i64 << kpSps.uiLog2MaxFrameNum.clamp(4, 16);
+            let prev_fn_offset = if info.bPrevPicHasMmco5 {
+                0i64
+            } else {
+                info.iPrevFrameNumOffset as i64
+            };
+            let prev_fn = if info.bPrevPicHasMmco5 {
+                0
+            } else {
+                info.iPrevPocFrameNum
+            };
+            fn_offset_i64 = if bIsIdr {
+                0
+            } else if prev_fn > kpSh.iFrameNum {
+                prev_fn_offset.saturating_add(max_frame_num)
+            } else {
+                prev_fn_offset
+            };
+
+            let cycle_len = kpSps.iNumRefFramesInPocCycle.clamp(0, 256) as usize;
+            let mut abs_frame_num = if cycle_len != 0 {
+                fn_offset_i64.saturating_add(kpSh.iFrameNum as i64)
+            } else {
+                0
+            };
+            if uiNalRefIdc == 0 && abs_frame_num > 0 {
+                abs_frame_num -= 1;
+            }
+
+            let mut expected_poc = if abs_frame_num > 0 && cycle_len > 0 {
+                let mut expected_delta_per_cycle = 0i64;
+                for &off in &kpSps.iOffsetForRefFrame[..cycle_len] {
+                    expected_delta_per_cycle = expected_delta_per_cycle.saturating_add(off as i64);
+                }
+                let poc_cycle_cnt = (abs_frame_num - 1) / (cycle_len as i64);
+                let fn_in_cycle = ((abs_frame_num - 1) % (cycle_len as i64)) as usize;
+                let mut acc = poc_cycle_cnt.saturating_mul(expected_delta_per_cycle);
+                for &off in &kpSps.iOffsetForRefFrame[..=fn_in_cycle] {
+                    acc = acc.saturating_add(off as i64);
+                }
+                acc
+            } else {
+                0
+            };
+            if uiNalRefIdc == 0 {
+                expected_poc = expected_poc.saturating_add(kpSps.iOffsetForNonRefPic as i64);
+            }
+
+            let top = expected_poc.saturating_add(kpSh.iDeltaPicOrderCnt[0] as i64);
+            let bottom = if !kpSh.bFieldPicFlag {
+                top.saturating_add(kpSps.iOffsetForTopToBottomField as i64)
+                    .saturating_add(kpSh.iDeltaPicOrderCnt[1] as i64)
+            } else if !kpSh.bBottomFiledFlag {
+                top
+            } else {
+                expected_poc
+                    .saturating_add(kpSps.iOffsetForTopToBottomField as i64)
+                    .saturating_add(kpSh.iDeltaPicOrderCnt[0] as i64)
+            };
+            (top, bottom)
+        }
+        2 => {
+            let max_frame_num = 1i64 << kpSps.uiLog2MaxFrameNum.clamp(4, 16);
+            let prev_fn_offset = if info.bPrevPicHasMmco5 {
+                0i64
+            } else {
+                info.iPrevFrameNumOffset as i64
+            };
+            let prev_fn = if info.bPrevPicHasMmco5 {
+                0
+            } else {
+                info.iPrevPocFrameNum
+            };
+            fn_offset_i64 = if bIsIdr {
+                0
+            } else if prev_fn > kpSh.iFrameNum {
+                prev_fn_offset.saturating_add(max_frame_num)
+            } else {
+                prev_fn_offset
+            };
+
+            let sum = fn_offset_i64.saturating_add(kpSh.iFrameNum as i64);
+            let temp_poc = if bIsIdr {
+                0
+            } else if uiNalRefIdc == 0 {
+                2i64.saturating_mul(sum).saturating_sub(1)
+            } else {
+                2i64.saturating_mul(sum)
+            };
+            (temp_poc, temp_poc)
+        }
+        _ => (0, 0),
+    };
+
+    let top = clamp_poc(top_i64);
+    let bottom = clamp_poc(bottom_i64);
+    let frame_poc = top.min(bottom);
+    info.iCurPicOrderCntMsb = clamp_i32(poc_msb_i64);
+    info.iCurTopFieldOrderCnt = top;
+    info.iCurBottomFieldOrderCnt = bottom;
+    info.iCurFrameNumOffset = clamp_i32(fn_offset_i64);
+    info.iCurFramePoc = frame_poc;
+    (top, bottom, frame_poc)
+}
+
+/// Commits the current picture's POC state to the "previous picture" fields of `info`
+/// after decoding and reference picture marking complete, applying the MMCO 5 post-decode
+/// adjustment in ITU-T H.264 8.2.1 (and Note 1).
+pub fn FinishPictureOrderCount(info: &mut crate::decoder::decoder_context::SWelsLastDecPicInfo) {
+    if info.bLastHasMmco5 {
+        let temp_poc = (info.iCurTopFieldOrderCnt as i64).min(info.iCurBottomFieldOrderCnt as i64);
+        let top_after = ((info.iCurTopFieldOrderCnt as i64) - temp_poc)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        info.iPrevPicOrderCntMsb = 0;
+        info.iPrevPicOrderCntLsb = top_after;
+        info.iPrevFrameNumOffset = 0;
+        info.iPrevPocFrameNum = 0;
+        info.iCurFramePoc = 0;
+        info.bPrevRefHasMmco5 = true;
+        info.bPrevPicHasMmco5 = true;
+    } else {
+        if info.uiCurPicNalRefIdc != 0 {
+            info.iPrevPicOrderCntMsb = info.iCurPicOrderCntMsb;
+            info.iPrevPicOrderCntLsb = info.iCurPicRawPocLsb;
+            info.bPrevRefHasMmco5 = false;
+        }
+        info.iPrevFrameNumOffset = info.iCurFrameNumOffset;
+        info.iPrevPocFrameNum = if info.bCurPicIsIdr {
+            0
+        } else {
+            info.iCurPicFrameNum
+        };
+        info.bPrevPicHasMmco5 = false;
+    }
+}
+
+fn DerivePictureOrderCountForNal(pCtx: &mut SWelsDecoderContext, nal_idx: Option<usize>) -> i32 {
+    let Some((sps_ref, sh, is_idr, nal_ref_idc)) = nal_idx
+        .and_then(|i| pCtx.access_unit.as_deref().and_then(|au| au.node(i)))
+        .map(|nal| {
+            let sh = nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+            let is_idr = nal.sNalHeaderExt.bIdrFlag
+                || nal.sNalHeaderExt.sNalUnitHeader.eNalUnitType == NAL_UNIT_CODED_SLICE_IDR;
+            let nal_ref_idc = nal.sNalHeaderExt.sNalUnitHeader.uiNalRefIdc;
+            (sh.sps_ref, sh, is_idr, nal_ref_idc)
+        })
+    else {
+        return 0;
+    };
+    let Some(sps) = sps_of(&pCtx.sSpsPpsCtx, sps_ref).copied() else {
+        return 0;
+    };
+    let (_, _, frame_poc) =
+        DerivePictureOrderCount(&sps, &sh, is_idr, nal_ref_idc, &mut pCtx.pLastDecPicInfo);
+    frame_poc
 }
 
 /// Size of the decoded picture buffer in frames — A.3.1 over Table A-1.
@@ -1355,7 +1567,7 @@ pub fn CreateImplicitWeightTable(
             .sSliceHeader;
         (
             pSliceHeader.pps_id,
-            pSliceHeader.iPicOrderCntLsb,
+            pSliceHeader.iPicOrderCnt,
             pSliceHeader.uiRefCount,
         )
     };
@@ -1391,9 +1603,10 @@ pub fn CreateImplicitWeightTable(
                         if let Some((iPoc1, bIsLongRef1)) = ref1_poc {
                             pred_weight_table.iImplicitWeight[iRef0][iRef1] = 32;
                             if !bIsLongRef0 && !bIsLongRef1 {
-                                let iTd = WELS_CLIP3(iPoc1 - iPoc0, -128, 127);
+                                let iTd = ((iPoc1 as i64) - (iPoc0 as i64)).clamp(-128, 127) as i32;
                                 if iTd != 0 {
-                                    let iTb = WELS_CLIP3(iPoc - iPoc0, -128, 127);
+                                    let iTb =
+                                        ((iPoc as i64) - (iPoc0 as i64)).clamp(-128, 127) as i32;
                                     let iTx = (16384 + (WELS_ABS(iTd) >> 1)) / iTd;
                                     let iDistScaleFactor = (iTb * iTx + 32) >> 8;
                                     if iDistScaleFactor >= -64 && iDistScaleFactor <= 128 {
@@ -1475,6 +1688,12 @@ pub fn ParseRefPicListReordering(
                     } else if kuiIdc == 2 {
                         if BsGetUe(buf, pBs, &mut uiCode) != ERR_NONE {
                             return ERR_INFO_INVALID_ACCESS;
+                        }
+                        if uiCode >= MAX_REF_PIC_COUNT as u32 {
+                            return GENERATE_ERROR_NO(
+                                ERR_LEVEL_SLICE_HEADER,
+                                ERR_INFO_INVALID_REF_REORDERING,
+                            );
                         }
                         pRefPicListReordering.sReorderingSyn[iList][iIdx].uiLongTermPicNum =
                             uiCode as u16;
@@ -1590,24 +1809,11 @@ pub fn ParseDecRefPicMarking(
                             return -1;
                         }
                         bMmco5Exist = true;
-                        {
-                            let info = &mut pCtx.pLastDecPicInfo;
-                            info.iPrevPicOrderCntLsb = 0;
-                            info.iPrevPicOrderCntMsb = 0;
-                        }
-                        pSh.iPicOrderCntLsb = 0;
-                        // `pSh` above is the layer's copy, a different object from the
-                        // NAL's own slice header, so both need the write.
-                        let nal_cur = pCtx.slice_hdr_nal;
-                        if let Some(nal) = nal_cur.and_then(|i| {
-                            cur_au(&mut pCtx.access_unit).and_then(|au| au.node_mut(i))
-                        }) {
-                            nal.sNalData
-                                .sVclNal
-                                .sSliceHeaderExt
-                                .sSliceHeader
-                                .iPicOrderCntLsb = 0;
-                        }
+                        // Do not zero `prevPicOrderCnt*` or `iPicOrderCntLsb` while
+                        // parsing the slice header: ITU-T H.264 7.4.1.2.4 needs the
+                        // coded `pic_order_cnt_lsb` for AU boundary checks, and 8.2.1
+                        // Note 1 updates POC state only after decoding the picture
+                        // (`FinishPictureOrderCount` + `WelsMarkAsRef`).
                     }
                     iIdx += 1;
                 }
@@ -1850,6 +2056,19 @@ pub fn WelsDecoderDefaults(pCtx: &mut SWelsDecoderContext, pLogCtx: Option<&SLog
         let info = &mut pCtx.pLastDecPicInfo;
         info.iPrevPicOrderCntMsb = 0;
         info.iPrevPicOrderCntLsb = 0;
+        info.iPrevFrameNumOffset = 0;
+        info.iPrevPocFrameNum = 0;
+        info.iCurPicOrderCntMsb = 0;
+        info.iCurTopFieldOrderCnt = 0;
+        info.iCurBottomFieldOrderCnt = 0;
+        info.iCurFrameNumOffset = 0;
+        info.iCurFramePoc = 0;
+        info.iCurPicFrameNum = 0;
+        info.iCurPicRawPocLsb = 0;
+        info.uiCurPicNalRefIdc = 0;
+        info.bCurPicIsIdr = false;
+        info.bPrevRefHasMmco5 = false;
+        info.bPrevPicHasMmco5 = false;
     }
 }
 
@@ -1872,6 +2091,7 @@ pub fn WelsDecoderSpsPpsDefaults(
     sSpsPpsCtx.iSubSPSInvalidNum = 0;
     sSpsPpsCtx.iSubSPSLastInvalidId = -1;
     sSpsPpsCtx.iSeqId = -1;
+    sSpsPpsCtx.bump_generation();
 }
 
 /// Fills last-decoded-picture info defaults. `WelsDecoderLastDecPicInfoDefaults` in
@@ -1881,6 +2101,19 @@ pub fn WelsDecoderLastDecPicInfoDefaults(
 ) {
     sLastDecPicInfo.iPrevPicOrderCntMsb = 0;
     sLastDecPicInfo.iPrevPicOrderCntLsb = 0;
+    sLastDecPicInfo.iPrevFrameNumOffset = 0;
+    sLastDecPicInfo.iPrevPocFrameNum = 0;
+    sLastDecPicInfo.iCurPicOrderCntMsb = 0;
+    sLastDecPicInfo.iCurTopFieldOrderCnt = 0;
+    sLastDecPicInfo.iCurBottomFieldOrderCnt = 0;
+    sLastDecPicInfo.iCurFrameNumOffset = 0;
+    sLastDecPicInfo.iCurFramePoc = 0;
+    sLastDecPicInfo.iCurPicFrameNum = 0;
+    sLastDecPicInfo.iCurPicRawPocLsb = 0;
+    sLastDecPicInfo.uiCurPicNalRefIdc = 0;
+    sLastDecPicInfo.bCurPicIsIdr = false;
+    sLastDecPicInfo.bPrevRefHasMmco5 = false;
+    sLastDecPicInfo.bPrevPicHasMmco5 = false;
     sLastDecPicInfo.pPreviousDecodedPictureInDpb = None;
     sLastDecPicInfo.iPrevFrameNum = -1;
     sLastDecPicInfo.bLastHasMmco5 = false;
@@ -2255,6 +2488,8 @@ fn parse_slice_header_into(
             pCtx.uiCurIdrPicId = uiCode as u16;
         }
 
+        pSliceHeadExt.sSliceHeader.iPicOrderCntLsb = 0;
+        pSliceHeadExt.sSliceHeader.iPicOrderCnt = 0;
         pSliceHeadExt.sSliceHeader.iDeltaPicOrderCntBottom = 0;
         pSliceHeadExt.sSliceHeader.iDeltaPicOrderCnt[0] = 0;
         pSliceHeadExt.sSliceHeader.iDeltaPicOrderCnt[1] = 0;
@@ -2262,35 +2497,15 @@ fn parse_slice_header_into(
             if BsGetBits(win!(), pBs, sps!().iLog2MaxPocLsb as u32, &mut uiCode) != ERR_NONE {
                 return ERR_INFO_INVALID_ACCESS;
             }
-            let iMaxPocLsb = 1 << sps!().iLog2MaxPocLsb;
-            let pocLsb = uiCode as i32;
-            pSliceHeadExt.sSliceHeader.iPicOrderCntLsb = pocLsb;
+            // Store the raw `pic_order_cnt_lsb` syntax element for 7.4.1.2.4 AU
+            // boundary detection; full 8.2.1 POC derivation runs once per picture in
+            // `DerivePictureOrderCount`.
+            pSliceHeadExt.sSliceHeader.iPicOrderCntLsb = uiCode as i32;
             if pps!().bPicOrderPresentFlag && !pSliceHeadExt.sSliceHeader.bFieldPicFlag {
                 if BsGetSe(win!(), pBs, &mut iCode) != ERR_NONE {
                     return ERR_INFO_INVALID_ACCESS;
                 }
                 pSliceHeadExt.sSliceHeader.iDeltaPicOrderCntBottom = iCode;
-            }
-            let prevLsb = pCtx.pLastDecPicInfo.iPrevPicOrderCntLsb;
-            let prevMsb = pCtx.pLastDecPicInfo.iPrevPicOrderCntMsb;
-            let pocMsb = if pocLsb < prevLsb && (prevLsb - pocLsb) >= (iMaxPocLsb / 2) {
-                prevMsb + iMaxPocLsb
-            } else if pocLsb > prevLsb && (pocLsb - prevLsb) > (iMaxPocLsb / 2) {
-                prevMsb - iMaxPocLsb
-            } else {
-                prevMsb
-            };
-            pSliceHeadExt.sSliceHeader.iPicOrderCntLsb = pocMsb + pocLsb;
-            if pps!().bPicOrderPresentFlag && !pSliceHeadExt.sSliceHeader.bFieldPicFlag {
-                pSliceHeadExt.sSliceHeader.iPicOrderCntLsb +=
-                    pSliceHeadExt.sSliceHeader.iDeltaPicOrderCntBottom;
-            }
-            if pNalHeaderExt.sNalUnitHeader.uiNalRefIdc != 0 {
-                {
-                    let info = &mut pCtx.pLastDecPicInfo;
-                    info.iPrevPicOrderCntLsb = pocLsb;
-                    info.iPrevPicOrderCntMsb = pocMsb;
-                }
             }
         } else if sps!().uiPocType == 1 && !sps!().bDeltaPicOrderAlwaysZeroFlag {
             if BsGetSe(win!(), pBs, &mut iCode) != ERR_NONE {
@@ -2980,19 +3195,14 @@ pub fn RefineIdxNoInterLayerPred(pCurAu: &SAccessUnit, pIdxNoInterLayerPred: &mu
         let iLastNalDependId = pNal.sNalHeaderExt.uiDependencyId;
         let iLastNalQualityId = pNal.sNalHeaderExt.uiQualityId;
         let uiLastNalTId = pNal.sNalHeaderExt.uiTemporalId;
-        let iLastNalFrameNum = pNal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iFrameNum;
-        let iLastNalPoc = pNal
-            .sNalData
-            .sVclNal
-            .sSliceHeaderExt
-            .sSliceHeader
-            .iPicOrderCntLsb;
-        let iLastNalFirstMb = pNal
-            .sNalData
-            .sVclNal
-            .sSliceHeaderExt
-            .sSliceHeader
-            .iFirstMbInSlice;
+        let iLastNalSh = &pNal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+        let iLastNalFrameNum = iLastNalSh.iFrameNum;
+        let iLastNalPocSyntax = (
+            iLastNalSh.iPicOrderCntLsb,
+            iLastNalSh.iDeltaPicOrderCntBottom,
+            iLastNalSh.iDeltaPicOrderCnt,
+        );
+        let iLastNalFirstMb = iLastNalSh.iFirstMbInSlice;
 
         let mut bMultiSliceFind = false;
         let mut iFinalIdxNoInterLayerPred = 0;
@@ -3004,30 +3214,20 @@ pub fn RefineIdxNoInterLayerPred(pCurAu: &SAccessUnit, pIdxNoInterLayerPred: &mu
                 let iCurNalDependId = pCurNal.sNalHeaderExt.uiDependencyId;
                 let iCurNalQualityId = pCurNal.sNalHeaderExt.uiQualityId;
                 let iCurNalTId = pCurNal.sNalHeaderExt.uiTemporalId;
-                let iCurNalFrameNum = pCurNal
-                    .sNalData
-                    .sVclNal
-                    .sSliceHeaderExt
-                    .sSliceHeader
-                    .iFrameNum;
-                let iCurNalPoc = pCurNal
-                    .sNalData
-                    .sVclNal
-                    .sSliceHeaderExt
-                    .sSliceHeader
-                    .iPicOrderCntLsb;
-                let iCurNalFirstMb = pCurNal
-                    .sNalData
-                    .sVclNal
-                    .sSliceHeaderExt
-                    .sSliceHeader
-                    .iFirstMbInSlice;
+                let iCurNalSh = &pCurNal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+                let iCurNalFrameNum = iCurNalSh.iFrameNum;
+                let iCurNalPocSyntax = (
+                    iCurNalSh.iPicOrderCntLsb,
+                    iCurNalSh.iDeltaPicOrderCntBottom,
+                    iCurNalSh.iDeltaPicOrderCnt,
+                );
+                let iCurNalFirstMb = iCurNalSh.iFirstMbInSlice;
 
                 if iCurNalDependId == iLastNalDependId
                     && iCurNalQualityId == iLastNalQualityId
                     && iCurNalTId == uiLastNalTId
                     && iCurNalFrameNum == iLastNalFrameNum
-                    && iCurNalPoc == iLastNalPoc
+                    && iCurNalPocSyntax == iLastNalPocSyntax
                     && iCurNalFirstMb != iLastNalFirstMb
                 {
                     bMultiSliceFind = true;
@@ -3051,22 +3251,24 @@ pub fn CheckPocOfCurValidNalUnits(pCurAu: &SAccessUnit, pIdxNoInterLayerPred: i3
     {
         let iEndIdx = pCurAu.uiEndPos as i32;
         let Some(iCurAuPoc) = pCurAu.node(pIdxNoInterLayerPred as usize).map(|n| {
-            n.sNalData
-                .sVclNal
-                .sSliceHeaderExt
-                .sSliceHeader
-                .iPicOrderCntLsb
+            let sh = &n.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+            (
+                sh.iPicOrderCntLsb,
+                sh.iDeltaPicOrderCntBottom,
+                sh.iDeltaPicOrderCnt,
+            )
         }) else {
             return true;
         };
 
         for i in (pIdxNoInterLayerPred + 1)..iEndIdx {
             let Some(iTmpPoc) = pCurAu.node(i as usize).map(|n| {
-                n.sNalData
-                    .sVclNal
-                    .sSliceHeaderExt
-                    .sSliceHeader
-                    .iPicOrderCntLsb
+                let sh = &n.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+                (
+                    sh.iPicOrderCntLsb,
+                    sh.iDeltaPicOrderCntBottom,
+                    sh.iDeltaPicOrderCnt,
+                )
             }) else {
                 continue;
             };
@@ -3300,10 +3502,12 @@ pub fn CheckNewSeqBeginAndUpdateActiveLayerSps(pCtx: &mut SWelsDecoderContext) -
 }
 
 pub fn WriteBackActiveParameters(pCtx: &mut SWelsDecoderContext) {
+    let mut updated = false;
     if (pCtx.sSpsPpsCtx.iOverwriteFlags & OVERWRITE_PPS) != 0 {
         let ppsId = pCtx.sSpsPpsCtx.sPpsBuffer[MAX_PPS_COUNT].iPpsId as usize;
         if ppsId < MAX_PPS_COUNT {
             pCtx.sSpsPpsCtx.sPpsBuffer[ppsId] = pCtx.sSpsPpsCtx.sPpsBuffer[MAX_PPS_COUNT];
+            updated = true;
         }
     }
     if (pCtx.sSpsPpsCtx.iOverwriteFlags & OVERWRITE_SPS) != 0 {
@@ -3311,6 +3515,7 @@ pub fn WriteBackActiveParameters(pCtx: &mut SWelsDecoderContext) {
         if spsId < MAX_SPS_COUNT {
             pCtx.sSpsPpsCtx.sSpsBuffer[spsId] = pCtx.sSpsPpsCtx.sSpsBuffer[MAX_SPS_COUNT];
             pCtx.bNewSeqBegin = true;
+            updated = true;
         }
     }
     if (pCtx.sSpsPpsCtx.iOverwriteFlags & OVERWRITE_SUBSETSPS) != 0 {
@@ -3319,7 +3524,11 @@ pub fn WriteBackActiveParameters(pCtx: &mut SWelsDecoderContext) {
             pCtx.sSpsPpsCtx.sSubsetSpsBuffer[spsId] =
                 pCtx.sSpsPpsCtx.sSubsetSpsBuffer[MAX_SPS_COUNT];
             pCtx.bNewSeqBegin = true;
+            updated = true;
         }
+    }
+    if updated {
+        pCtx.sSpsPpsCtx.bump_generation();
     }
     pCtx.sSpsPpsCtx.iOverwriteFlags = OVERWRITE_NONE;
 }
@@ -3832,13 +4041,34 @@ pub fn DecodeCurrentAccessUnit(
                 true
             };
 
-            if pCtx.pDec.is_none() {
-                // The prefetch hands back the slot it landed on; `None` means the pool
-                // is empty or fully held, handled by the arm below.
-                pCtx.pDec = match pic_pool_mut(pCtx) {
-                    Some(pool) => pool.prefetch_free(),
-                    None => None,
-                };
+            if pCtx.pDec.is_none() || pCtx.iTotalNumMbRec == 0 {
+                if let Some((sps_ref, iFrameNum, bIdr)) = pNalCur
+                    .and_then(|i| pCtx.access_unit.as_deref().and_then(|au| au.node(i)))
+                    .map(|nal| {
+                        let sh = &nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader;
+                        let idr = nal.sNalHeaderExt.bIdrFlag
+                            || nal.sNalHeaderExt.sNalUnitHeader.eNalUnitType
+                                == NAL_UNIT_CODED_SLICE_IDR;
+                        (sh.sps_ref, sh.iFrameNum, idr)
+                    })
+                    && !bIdr
+                {
+                    let _ = crate::decoder::manage_dec_ref::WelsFillFrameNumGaps(
+                        pCtx, sps_ref, iFrameNum,
+                    );
+                }
+
+                // Re-prefetch when `pDec` is unset or when gap filling above claimed
+                // a slot left behind by an earlier aborted picture.
+                if pCtx.pDec.is_none()
+                    || dec_pic(&mut pCtx.pPicBuff, pCtx.pDec)
+                        .is_none_or(|p| p.bUsedAsRef || p.iRefCount > 0)
+                {
+                    pCtx.pDec = match pic_pool_mut(pCtx) {
+                        Some(pool) => pool.prefetch_free(),
+                        None => None,
+                    };
+                }
                 // A fresh picture starts from zero recorded macroblocks; the zeroing
                 // precedes the null check. Without it a count left over from a dropped
                 // access unit (EC disabled, refs lost) accumulates across frames and
@@ -3851,12 +4081,7 @@ pub fn DecodeCurrentAccessUnit(
                     pCtx.iErrorCode |= dsOutOfMemory;
                     return ERR_INFO_REF_COUNT_OVERFLOW;
                 }
-                let bNewSeqBegin = pCtx.bNewSeqBegin;
-                if let Some(pDec) = dec_pic(&mut pCtx.pPicBuff, pCtx.pDec) {
-                    pDec.bNewSeqBegin = bNewSeqBegin;
-                }
-            } else if pCtx.iTotalNumMbRec == 0 {
-                // A picture already prefetched but not yet started re-takes the flag.
+                let _ = DerivePictureOrderCountForNal(pCtx, pNalCur);
                 let bNewSeqBegin = pCtx.bNewSeqBegin;
                 if let Some(pDec) = dec_pic(&mut pCtx.pPicBuff, pCtx.pDec) {
                     pDec.bNewSeqBegin = bNewSeqBegin;
@@ -3929,6 +4154,17 @@ pub fn DecodeCurrentAccessUnit(
                 if pNalCur.is_none() || dq_cur.is_none() {
                     break;
                 }
+                let iCurFramePoc = pCtx.pLastDecPicInfo.iCurFramePoc;
+                if let Some(nal_mut) = pNalCur
+                    .and_then(|i| cur_au(&mut pCtx.access_unit).and_then(|au| au.node_mut(i)))
+                {
+                    nal_mut
+                        .sNalData
+                        .sVclNal
+                        .sSliceHeaderExt
+                        .sSliceHeader
+                        .iPicOrderCnt = iCurFramePoc;
+                }
                 let Some(nal) =
                     pNalCur.and_then(|i| pCtx.access_unit.as_deref().and_then(|au| au.node(i)))
                 else {
@@ -3943,6 +4179,7 @@ pub fn DecodeCurrentAccessUnit(
                 let iCurrIdD = hdr_ext.uiDependencyId as i16;
                 // The frame_num update below wants the *last* slice header's value.
                 iLastSliceFrameNum = pSh.iFrameNum;
+                pCtx.pLastDecPicInfo.iCurPicFrameNum = pSh.iFrameNum;
                 pCtx.bRPLRError = false;
                 let bReconstructSlice =
                     CheckSliceNeedReconstruct(hdr_ext.uiLayerDqId, kuiTargetLayerDqId);
@@ -3950,7 +4187,7 @@ pub fn DecodeCurrentAccessUnit(
                 pLayerInfo.sNalHeaderExt = hdr_ext;
                 let stamp = (
                     pSh.iFrameNum,
-                    pSh.iPicOrderCntLsb,
+                    pSh.iPicOrderCnt,
                     hdr_ext.bIdrFlag,
                     pSh.eSliceType,
                 );
@@ -4094,7 +4331,7 @@ pub fn DecodeCurrentAccessUnit(
                             pCtx,
                             dq_cur.as_deref_mut(),
                             pCtx.uiNalRefIdc,
-                            pSh.iPicOrderCntLsb,
+                            pSh.iPicOrderCnt,
                         );
                         if iRet != ERR_NONE {
                             pCtx.bRPLRError = true;
@@ -4269,7 +4506,7 @@ pub fn DecodeCurrentAccessUnit(
                 }
                 pCtx.pDec = None;
 
-                // frame_num needs updating now the current frame is well decoded.
+                // frame_num and 8.2.1 POC state update now that the current frame is decoded.
                 let bStartNalIsRef = cur_au(&mut pCtx.access_unit)
                     .and_then(|au| au.node(au.uiStartPos as usize))
                     .is_some_and(|nal| nal.sNalHeaderExt.sNalUnitHeader.uiNalRefIdc > 0);
@@ -4279,10 +4516,28 @@ pub fn DecodeCurrentAccessUnit(
                         info.iPrevFrameNum = iLastSliceFrameNum;
                     }
                 }
-                {
+                let has_mmco5 = {
                     let info = &mut pCtx.pLastDecPicInfo;
+                    info.iCurPicFrameNum = iLastSliceFrameNum;
+                    FinishPictureOrderCount(info);
                     if info.bLastHasMmco5 {
                         info.iPrevFrameNum = 0;
+                    }
+                    info.bLastHasMmco5
+                };
+                if has_mmco5 {
+                    if let Some(au) = cur_au(&mut pCtx.access_unit) {
+                        let start = au.uiStartPos as usize;
+                        let end = au.uiEndPos as usize;
+                        for idx in start..=end {
+                            if let Some(nal) = au.node_mut(idx) {
+                                nal.sNalData
+                                    .sVclNal
+                                    .sSliceHeaderExt
+                                    .sSliceHeader
+                                    .iPicOrderCnt = 0;
+                            }
+                        }
                     }
                 }
             }
@@ -4429,6 +4684,7 @@ pub fn CheckAndFinishLastPic(
             }
             {
                 let info = &mut pCtx.pLastDecPicInfo;
+                FinishPictureOrderCount(info);
                 if info.bLastHasMmco5 {
                     info.iPrevFrameNum = 0;
                 }
@@ -5112,5 +5368,376 @@ mod tests {
         let dq = ctx.pDqLayersList.as_ref().unwrap();
         assert_eq!(dq.grid.dims().mb_width(), 4);
         assert_eq!(dq.grid.dims().mb_height(), 3);
+    }
+
+    #[test]
+    fn test_derive_poc_type_0_wrap_min_field_and_mmco5() {
+        let mut sps = SSps::default();
+        sps.uiPocType = 0;
+        sps.iLog2MaxPocLsb = 4; // MaxPicOrderCntLsb = 16
+        let mut info = crate::decoder::decoder_context::SWelsLastDecPicInfo::default();
+        let mut sh = SSliceHeader::default();
+
+        // IDR: POC = 0.
+        sh.iPicOrderCntLsb = 0;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, true, 3, &mut info),
+            (0, 0, 0)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Step within MaxPicOrderCntLsb / 2 (8): ref frame at lsb = 6 => poc = 6.
+        sh.iPicOrderCntLsb = 6;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (6, 6, 6)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Ref frame at lsb = 12, negative delta_bottom = -1 => top = 12, bottom = 11, frame = 11.
+        sh.iPicOrderCntLsb = 12;
+        sh.iDeltaPicOrderCntBottom = -1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (12, 11, 11)
+        );
+        FinishPictureOrderCount(&mut info);
+        sh.iDeltaPicOrderCntBottom = 0;
+
+        // Forward wrap across 16: prev_lsb = 12, poc_lsb = 2 => diff = 10 >= 8 => msb = 16, poc = 18.
+        // Non-ref picture does NOT update prev_lsb / prev_msb.
+        sh.iPicOrderCntLsb = 2;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 0, &mut info),
+            (18, 18, 18)
+        );
+        FinishPictureOrderCount(&mut info);
+        assert_eq!(
+            (info.iPrevPicOrderCntMsb, info.iPrevPicOrderCntLsb),
+            (0, 12)
+        );
+
+        // Commit the wrap on a ref picture at lsb = 2 => msb = 16, poc = 18.
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (18, 18, 18)
+        );
+        FinishPictureOrderCount(&mut info);
+        assert_eq!(
+            (info.iPrevPicOrderCntMsb, info.iPrevPicOrderCntLsb),
+            (16, 2)
+        );
+
+        // Backward wrap: prev_lsb = 2, poc_lsb = 14 => (14 - 2) = 12 > 8 => msb = 0, poc = 14.
+        sh.iPicOrderCntLsb = 14;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 0, &mut info),
+            (14, 14, 14)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Ref picture at lsb = 6 with MMCO 5 => during decode poc = 22, after MMCO 5 prev resets to (0, 0).
+        sh.iPicOrderCntLsb = 6;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (22, 22, 22)
+        );
+        info.bLastHasMmco5 = true;
+        FinishPictureOrderCount(&mut info);
+        info.bLastHasMmco5 = false;
+        assert_eq!((info.iPrevPicOrderCntMsb, info.iPrevPicOrderCntLsb), (0, 0));
+
+        // Non-ref B picture right after MMCO 5 at lsb = 14 => wraps below 0 to -2, and
+        // preserves bPrevRefHasMmco5 for the next picture.
+        sh.iPicOrderCntLsb = 14;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 0, &mut info),
+            (-2, -2, -2)
+        );
+        FinishPictureOrderCount(&mut info);
+        assert!(info.bPrevRefHasMmco5);
+    }
+
+    #[test]
+    fn test_derive_poc_type_1_large_offsets_wrap_and_mmco5() {
+        let mut sps = SSps::default();
+        sps.uiPocType = 1;
+        sps.uiLog2MaxFrameNum = 4; // MaxFrameNum = 16
+        sps.iNumRefFramesInPocCycle = 2;
+        sps.iOffsetForRefFrame[0] = 300; // > i8::MAX
+        sps.iOffsetForRefFrame[1] = 500; // cycle delta = 800
+        sps.iOffsetForNonRefPic = -150;
+        sps.iOffsetForTopToBottomField = 1;
+
+        let mut info = crate::decoder::decoder_context::SWelsLastDecPicInfo::default();
+        let mut sh = SSliceHeader::default();
+
+        // IDR (frame_num = 0): expected = 0 => top = 0, bottom = 1, frame = 0.
+        sh.iFrameNum = 0;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, true, 3, &mut info),
+            (0, 1, 0)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Ref frame_num = 1: abs_fn = 1 => cycle 0, idx 0 => expected = 300.
+        sh.iFrameNum = 1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (300, 301, 300)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Non-ref B at frame_num = 2: abs_fn = 2 - 1 = 1 => expected = 300 + (-150) = 150.
+        sh.iFrameNum = 2;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 0, &mut info),
+            (150, 151, 150)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Jump to frame_num = 15 (ref), then wrap to frame_num = 1 (ref => abs_fn = 17):
+        // (17 - 1) / 2 = 8 cycles * 800 + offset[0] (300) = 6700.
+        sh.iFrameNum = 15;
+        let _ = DerivePictureOrderCount(&sps, &sh, false, 2, &mut info);
+        FinishPictureOrderCount(&mut info);
+
+        sh.iFrameNum = 1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (6700, 6701, 6700)
+        );
+        // Apply MMCO 5 on this picture => resets FrameNumOffset and prevFrameNum to 0.
+        info.bLastHasMmco5 = true;
+        FinishPictureOrderCount(&mut info);
+        info.bLastHasMmco5 = false;
+
+        sh.iFrameNum = 1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (300, 301, 300)
+        );
+    }
+
+    #[test]
+    fn test_derive_poc_type_2_wrap_and_mmco5() {
+        let mut sps = SSps::default();
+        sps.uiPocType = 2;
+        sps.uiLog2MaxFrameNum = 4; // MaxFrameNum = 16
+        let mut info = crate::decoder::decoder_context::SWelsLastDecPicInfo::default();
+        let mut sh = SSliceHeader::default();
+
+        // IDR: tempPicOrderCnt = 0.
+        sh.iFrameNum = 0;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, true, 3, &mut info),
+            (0, 0, 0)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Non-ref frame_num = 1 => 2*(0 + 1) - 1 = 1.
+        sh.iFrameNum = 1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 0, &mut info),
+            (1, 1, 1)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Ref frame_num = 15 => 2*15 = 30.
+        sh.iFrameNum = 15;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (30, 30, 30)
+        );
+        FinishPictureOrderCount(&mut info);
+
+        // Wrap to ref frame_num = 0 => FrameNumOffset = 16 => 2*(16 + 0) = 32.
+        sh.iFrameNum = 0;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (32, 32, 32)
+        );
+        info.bLastHasMmco5 = true;
+        FinishPictureOrderCount(&mut info);
+        info.bLastHasMmco5 = false;
+
+        // After MMCO 5, ref frame_num = 1 => FrameNumOffset = 0 => 2*(0 + 1) = 2.
+        sh.iFrameNum = 1;
+        assert_eq!(
+            DerivePictureOrderCount(&sps, &sh, false, 2, &mut info),
+            (2, 2, 2)
+        );
+    }
+
+    #[test]
+    fn test_needs_picture_reordering_admits_poc_type_1() {
+        let mut sps = SSps::default();
+        sps.uiProfileIdc = 100; // High
+        sps.uiPocType = 0;
+        assert!(NeedsPictureReordering(&sps));
+
+        sps.uiPocType = 1;
+        assert!(NeedsPictureReordering(&sps));
+
+        sps.uiPocType = 2;
+        assert!(!NeedsPictureReordering(&sps));
+
+        sps.uiPocType = 1;
+        sps.uiProfileIdc = 66; // Baseline
+        assert!(!NeedsPictureReordering(&sps));
+    }
+
+    #[test]
+    fn test_temporal_scaling_and_implicit_weights_do_not_overflow_on_wide_pocs() {
+        use crate::decoder::picture::SPicture;
+
+        let mut pic0 = SPicture::default();
+        pic0.iFramePoc = i32::MIN + 10;
+        pic0.bUsedAsRef = true;
+
+        let mut pic1 = SPicture::default();
+        pic1.iFramePoc = i32::MAX - 10;
+        pic1.bUsedAsRef = true;
+
+        let pool = crate::decoder::pic_queue::PicPool::over(vec![
+            Some(Box::new(pic0)),
+            Some(Box::new(pic1)),
+        ]);
+        let (s0, s1) = (Some(pool.id(0)), Some(pool.id(1)));
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iPpsId = 0;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].uiWeightedBipredIdc = 2;
+        ctx.sSpsPpsCtx.bPpsAvailFlags[0] = true;
+        ctx.sRefPic.pRefList[LIST_0][0] = s0;
+        ctx.sRefPic.pRefList[LIST_1][0] = s1;
+        ctx.sRefPic.uiRefCount = [1, 1];
+
+        let mut dq = Box::new(DqLayerState::for_grid(MbDims::none()));
+        dq.bUseWeightedBiPredIdc = true;
+        dq.sPredWeightTable = Some(SPredWeightTable::default());
+        {
+            let sh = &mut dq.sLayerInfo.sSliceInLayer.sSliceHeaderExt.sSliceHeader;
+            sh.pps_id = Some(0);
+            sh.iDirectSpatialMvPredFlag = 0;
+            sh.uiRefCount = [1, 1];
+            sh.iPicOrderCnt = 100; // `100 - (i32::MIN + 10)` exceeds `i32::MAX`
+        }
+
+        ComputeColocatedTemporalScaling(&mut ctx, Some(&mut *dq));
+        assert_eq!(dq.sLayerInfo.sSliceInLayer.iMvScale[LIST_0][0], 256);
+
+        CreateImplicitWeightTable(&mut ctx, Some(&mut *dq));
+        assert_eq!(
+            dq.sPredWeightTable.as_ref().unwrap().iImplicitWeight[0][0],
+            0
+        );
+    }
+
+    #[test]
+    fn test_derive_poc_clamps_above_reordering_empty_slot_sentinel() {
+        let mut info = crate::decoder::decoder_context::SWelsLastDecPicInfo::default();
+
+        // POC type 0: IDR with `delta_pic_order_cnt_bottom == IMinInt32` must not land on `IMinInt32`.
+        let mut sps0 = SSps::default();
+        sps0.uiPocType = 0;
+        sps0.iLog2MaxPocLsb = 4;
+        let mut sh0 = SSliceHeader::default();
+        sh0.iDeltaPicOrderCntBottom = IMinInt32;
+        let (top0, bottom0, poc0) = DerivePictureOrderCount(&sps0, &sh0, true, 3, &mut info);
+        assert_eq!((top0, bottom0, poc0), (0, IMinInt32 + 1, IMinInt32 + 1));
+        assert!(poc0 > IMinInt32);
+
+        // POC type 1: saturating negative sum below `i32::MIN` must stay `> IMinInt32`
+        // so `ReleaseBufferedReadyPictureReorder` can always emit/flush the frame.
+        let mut sps1 = SSps::default();
+        sps1.uiPocType = 1;
+        sps1.uiLog2MaxFrameNum = 4;
+        sps1.iOffsetForNonRefPic = i32::MIN;
+        let mut sh1 = SSliceHeader::default();
+        sh1.iDeltaPicOrderCnt = [-100, -100];
+        let (top1, bottom1, poc1) = DerivePictureOrderCount(&sps1, &sh1, false, 0, &mut info);
+        assert_eq!(
+            (top1, bottom1, poc1),
+            (IMinInt32 + 1, IMinInt32 + 1, IMinInt32 + 1)
+        );
+        assert!(poc1 > IMinInt32);
+    }
+
+    #[test]
+    fn test_reused_prefetched_pdec_derives_poc_fills_gaps_and_reprefetches_claimed_slot() {
+        let pool = CreatePicBuff(false, 4, 16, 16).unwrap();
+        let (id0, id1, id2, id3) = (pool.id(0), pool.id(1), pool.id(2), pool.id(3));
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.pParam.bParseOnly = true;
+        ctx.pParam.eEcActiveIdc = ERROR_CON_DISABLE;
+        let sps_ref = Some(SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+        ctx.active_pps = Some(0);
+        {
+            let sps = &mut ctx.sSpsPpsCtx.sSpsBuffer[0];
+            sps.iSpsId = 0;
+            sps.uiPocType = 2;
+            sps.uiLog2MaxFrameNum = 4;
+            sps.bGapsInFrameNumValueAllowedFlag = true;
+            sps.iNumRefFrames = 3;
+            sps.iMbWidth = 1;
+            sps.iMbHeight = 1;
+            sps.uiTotalMbCount = 1;
+        }
+        ctx.sSpsPpsCtx.bSpsAvailFlags[0] = true;
+        ctx.sSpsPpsCtx.sPpsBuffer[0].iPpsId = 0;
+        ctx.sSpsPpsCtx.bPpsAvailFlags[0] = true;
+
+        // Seed `id0` as short-term reference `frame_num == 0`.
+        if let Some(p0) = ctx.pPicBuff.as_deref_mut().and_then(|p| p.slot_mut(id0)) {
+            p0.iFrameNum = 0;
+            p0.iFramePoc = 0;
+        }
+        crate::decoder::manage_dec_ref::AddShortTermToList(&mut ctx, false, Some(id0));
+        ctx.pLastDecPicInfo.iPrevFrameNum = 0;
+        ctx.pLastDecPicInfo.iPrevPocFrameNum = 0;
+        // Simulate an aborted picture that left `pDec == Some(id1)` with `iTotalNumMbRec == 0`
+        // and a stale `iCurFramePoc`.
+        ctx.pDec = Some(id1);
+        ctx.iTotalNumMbRec = 0;
+        ctx.pLastDecPicInfo.iCurFramePoc = 999;
+
+        ctx.pDqLayersList = Some(Box::new(DqLayerState::for_grid(MbDims::new(1, 1))));
+        let mut au = Box::new(SAccessUnit::default());
+        let mut nal = SNalUnit::default();
+        nal.sNalHeaderExt.sNalUnitHeader.eNalUnitType = NAL_UNIT_CODED_SLICE;
+        nal.sNalHeaderExt.sNalUnitHeader.uiNalRefIdc = 2;
+        nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.sps_ref = sps_ref;
+        nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.pps_id = Some(0);
+        nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iFrameNum = 3;
+        nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iMbWidth = 1;
+        nal.sNalData.sVclNal.sSliceHeaderExt.sSliceHeader.iMbHeight = 1;
+        au.nal_units.push(Box::new(nal));
+        au.uiAvailUnitsNum = 1;
+        au.uiStartPos = 0;
+        au.uiEndPos = 0;
+        ctx.access_unit = Some(au);
+
+        let mut dst = [std::ptr::null_mut(); 3];
+        let mut dst_info = SBufferInfo::default();
+        let _ = DecodeCurrentAccessUnit(&mut ctx, &mut dst, &mut dst_info);
+
+        // Missing frames 1 and 2 must be generated into `id1` and `id2` with POCs 2 and 4,
+        // and the incoming frame 3 must re-prefetch `id3` and derive POC 6 (not stale 999).
+        assert_eq!(ctx.sRefPic.uiShortRefCount[LIST_0], 3);
+        let pool_ref = ctx.pPicBuff.as_deref().unwrap();
+        assert_eq!(pool_ref.slot(id1).unwrap().iFrameNum, 1);
+        assert_eq!(pool_ref.slot(id1).unwrap().iFramePoc, 2);
+        assert_eq!(pool_ref.slot(id2).unwrap().iFrameNum, 2);
+        assert_eq!(pool_ref.slot(id2).unwrap().iFramePoc, 4);
+        assert_eq!(pool_ref.slot(id3).unwrap().iFramePoc, 6);
+        assert_ne!(ctx.pLastDecPicInfo.iCurFramePoc, 999);
     }
 }

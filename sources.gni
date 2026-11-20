@@ -141,6 +141,7 @@ openh264rs_sources = [
 
 openh264rs_test_support_sources = [
   "src/safe/prng.rs",
+  "tests/common/conformance.rs",
   "tests/common/frame_gen.rs",
   "tests/common/mod.rs",
   "tests/common/sha1.rs",
@@ -151,6 +152,7 @@ openh264rs_integration_tests = [
   "tests/api_param_bounds_test.rs",
   "tests/decoder_conformance_test.rs",
   "tests/decoder_error_reporting_parity.rs",
+  "tests/decoder_high_profile_conformance_test.rs",
   "tests/decoder_nodelay_parity_test.rs",
   "tests/decoder_numref_change_test.rs",
   "tests/decoder_options_parity_test.rs",

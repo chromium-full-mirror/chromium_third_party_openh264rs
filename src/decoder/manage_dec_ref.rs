@@ -134,6 +134,7 @@ pub extern "C" fn SetUnRef(ref_pic: &mut SPicture) {
         ref_pic.uiSpatialId = 0xFF; // -1 as u8
         ref_pic.iSpsId = -1;
         ref_pic.bIsComplete = false;
+        ref_pic.bIsNonExisting = false;
         ref_pic.iRefCount = 0;
         ref_pic.pSetUnRef = None;
 
@@ -402,28 +403,22 @@ pub fn AddLongTermToList(
     ERR_NONE
 }
 
-/// Converts a short-term reference picture to a long-term reference picture.
+/// Converts a short-term reference picture (already detached from `pShortRefList`)
+/// into a long-term reference picture.
+///
+/// ITU-T H.264 8.2.5.4.3: insert the detached short-term slot directly into
+/// `pLongRefList` instead of scanning `pRefList[LIST_0][0..uiRefCount[LIST_0]]`,
+/// which omits short-term references outside `num_ref_idx_l0_active` (or on I slices).
+/// Departs from upstream `manage_dec_ref.cpp:201-214, 773`.
 pub fn MarkAsLongTerm(
     pCtx: &mut SWelsDecoderContext,
     bTmpRefSet: bool,
-    iFrameNum: i32,
+    slot: Option<PicId>,
     iLongTermFrameIdx: i32,
     uiLongTermPicNum: u32,
 ) -> i32 {
     let _ = WelsDelLongFromListSetUnref(pCtx, bTmpRefSet, iLongTermFrameIdx as u32);
-    let mut iRet = ERR_NONE;
-    let count = ref_set(pCtx, bTmpRefSet).uiRefCount[LIST_0] as usize;
-
-    for i in 0..count {
-        let slot = ref_set(pCtx, bTmpRefSet).pRefList[LIST_0][i];
-        let matched = pool_pic(&pCtx.pPicBuff, slot)
-            .is_some_and(|p| p.iFrameNum == iFrameNum && !p.bIsLongRef);
-        if matched {
-            iRet = AddLongTermToList(pCtx, bTmpRefSet, slot, iLongTermFrameIdx, uiLongTermPicNum);
-            break;
-        }
-    }
-    iRet
+    AddLongTermToList(pCtx, bTmpRefSet, slot, iLongTermFrameIdx, uiLongTermPicNum)
 }
 
 /// Locates the long-term frame index corresponding to `iAncLTRFrameNum`.
@@ -596,6 +591,7 @@ pub fn WelsCheckAndRecoverForFutureDecoding(pCtx: &mut SWelsDecoderContext) -> i
             let (pRef, pRefs) = pic_and_refs_mut(&mut pCtx.pPicBuff, ec_slot);
             if let Some(pRef) = pRef {
                 pRef.bIsComplete = false;
+                pRef.bIsNonExisting = false;
                 if let Some(iSpsId) = sps_id {
                     pRef.iSpsId = iSpsId;
                 }
@@ -722,14 +718,24 @@ pub fn MMCOProcess(
             if iLongTermFrameIdx > ref_set(pCtx, bTmpRefSet).iMaxLongTermFrameIdx {
                 return ERR_INFO_INVALID_MMCO_LONG_TERM_IDX_EXCEED_MAX;
             }
-            if WelsDelShortFromList(pCtx, bTmpRefSet, iShortFrameNum).is_none() {
+            let short_slot = WelsDelShortFromList(pCtx, bTmpRefSet, iShortFrameNum);
+            if short_slot.is_none() {
                 WelsLog(
                     pCtx.sLogCtx,
                     WELS_LOG_WARNING,
                     "MMCO_LONG2LONG: delete an empty entry from short term list",
                 );
+            } else if pool_pic(&pCtx.pPicBuff, short_slot).is_some_and(|p| p.bIsNonExisting) {
+                // ITU-T H.264 8.2.5.4.3: a non-existing frame cannot be marked as long-term.
+                if let Some(pPic) = pool_pic_mut(&mut pCtx.pPicBuff, short_slot) {
+                    SetUnRef(pPic);
+                }
+                WelsLog(
+                    pCtx.sLogCtx,
+                    WELS_LOG_WARNING,
+                    "MMCO_SHORT2LONG: cannot mark a non-existing gap frame as long-term",
+                );
             } else {
-                WelsDelLongFromListSetUnref(pCtx, bTmpRefSet, iLongTermFrameIdx as u32);
                 pCtx.bCurAuContainLtrMarkSeFlag = true;
                 pCtx.iFrameNumOfAuMarkedLtr = iShortFrameNum;
                 WelsLog(
@@ -740,10 +746,10 @@ pub fn MMCOProcess(
                         pCtx.iFrameNumOfAuMarkedLtr
                     ),
                 );
-                MarkAsLongTerm(
+                iRet = MarkAsLongTerm(
                     pCtx,
                     bTmpRefSet,
-                    iShortFrameNum,
+                    short_slot,
                     iLongTermFrameIdx,
                     uiLongTermPicNum,
                 );
@@ -857,6 +863,212 @@ pub fn MMCO(
     ERR_NONE
 }
 
+/// ITU-T H.264 8.2.5.2: decoding process for gaps in `frame_num` when
+/// `gaps_in_frame_num_value_allowed_flag == 1`.
+///
+/// Generates non-existing short-term reference frames for each `UnusedShortTermFrameNum`
+/// between `PrevRefFrameNum` and `target_frame_num`, applying 8.2.5.3 sliding-window
+/// eviction before each insertion. Departs from upstream `decoder_core.cpp:2724`, which
+/// handles only `bGapsInFrameNumValueAllowedFlag == false`.
+pub fn WelsFillFrameNumGaps(
+    pCtx: &mut SWelsDecoderContext,
+    sps_ref: Option<crate::decoder::decoder_context::SpsRef>,
+    target_frame_num: i32,
+) -> i32 {
+    let Some(sps) = sps_of(&pCtx.sSpsPpsCtx, sps_ref).copied() else {
+        return ERR_NONE;
+    };
+    let (bGapsAllowed, uiLog2MaxFrameNum, iSpsId, iNumRefFrames) = (
+        sps.bGapsInFrameNumValueAllowedFlag,
+        sps.uiLog2MaxFrameNum,
+        sps.iSpsId,
+        sps.iNumRefFrames,
+    );
+    if !bGapsAllowed {
+        return ERR_NONE;
+    }
+
+    let prev = pCtx.pLastDecPicInfo.iPrevFrameNum;
+    if prev < 0 {
+        return ERR_NONE;
+    }
+    let max_frame_num = 1i32 << uiLog2MaxFrameNum;
+    let wrap = max_frame_num - 1;
+    let target = target_frame_num & wrap;
+    let prev_wrapped = prev & wrap;
+    if target == prev_wrapped || target == ((prev_wrapped + 1) & wrap) {
+        return ERR_NONE;
+    }
+
+    let gap_len = (target - prev_wrapped - 1) & wrap;
+    let mut unused_fn = (prev_wrapped + 1) & wrap;
+
+    // Bound work on large `frame_num` gaps: only the final `max_kept` non-existing
+    // frames can survive sliding-window eviction.
+    let long_cnt = pCtx.sRefPic.uiLongRefCount[LIST_0] as i32;
+    let max_kept = (iNumRefFrames - long_cnt).clamp(0, MAX_REF_PIC_COUNT as i32);
+    if gap_len > max_kept {
+        while pCtx.sRefPic.uiShortRefCount[LIST_0] > 0 {
+            let last_idx = (pCtx.sRefPic.uiShortRefCount[LIST_0] - 1) as usize;
+            let entry = pCtx.sRefPic.pShortRefList[LIST_0][last_idx];
+            if let Some(fnum) = pool_pic(&pCtx.pPicBuff, entry).map(|p| p.iFrameNum) {
+                let _ = WelsDelShortFromListSetUnref(pCtx, false, fnum);
+            } else {
+                break;
+            }
+        }
+        unused_fn = (target - max_kept) & wrap;
+        let skipped_last_fn = (unused_fn - 1) & wrap;
+        pCtx.pLastDecPicInfo.iPrevFrameNum = skipped_last_fn;
+        if sps.uiPocType != 0 {
+            let prev_poc_fn = if pCtx.pLastDecPicInfo.bPrevPicHasMmco5 {
+                0
+            } else {
+                pCtx.pLastDecPicInfo.iPrevPocFrameNum
+            };
+            let prev_off = if pCtx.pLastDecPicInfo.bPrevPicHasMmco5 {
+                0i64
+            } else {
+                pCtx.pLastDecPicInfo.iPrevFrameNumOffset as i64
+            };
+            let new_off = if prev_poc_fn > skipped_last_fn {
+                prev_off.saturating_add(max_frame_num as i64)
+            } else {
+                prev_off
+            };
+            pCtx.pLastDecPicInfo.iPrevFrameNumOffset =
+                new_off.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            pCtx.pLastDecPicInfo.iPrevPocFrameNum = skipped_last_fn;
+            pCtx.pLastDecPicInfo.bPrevPicHasMmco5 = false;
+        }
+    }
+
+    let pps_id = active_pps(&pCtx.sSpsPpsCtx, pCtx.active_pps).map(|p| p.iPpsId);
+    while unused_fn != target {
+        // Evict any stale short-term entry carrying `unused_fn` before sliding-window
+        // eviction so `AddShortTermToList` cannot hit `ERR_INFO_DUPLICATE_FRAME_NUM`
+        // and orphan the replaced slot with `bUsedAsRef = true`.
+        let _ = WelsDelShortFromListSetUnref(pCtx, false, unused_fn);
+        if SlidingWindow(pCtx, false) != ERR_NONE {
+            break;
+        }
+        let Some(gap_slot) = pic_pool_mut(pCtx).and_then(|pool| pool.prefetch_free()) else {
+            break;
+        };
+        // ITU-T H.264 8.2.5.2: when `pic_order_cnt_type != 0`, derive POC for each
+        // generated non-existing frame as a non-IDR reference frame (`nal_ref_idc = 1`,
+        // `delta_pic_order_cnt = [0, 0]`).
+        let gap_poc = if sps.uiPocType != 0 {
+            let mut gap_sh = SSliceHeader::default();
+            gap_sh.iFrameNum = unused_fn;
+            let (_, _, poc) = crate::decoder::decoder_core::DerivePictureOrderCount(
+                &sps,
+                &gap_sh,
+                false,
+                1,
+                &mut pCtx.pLastDecPicInfo,
+            );
+            pCtx.pLastDecPicInfo.bLastHasMmco5 = false;
+            crate::decoder::decoder_core::FinishPictureOrderCount(&mut pCtx.pLastDecPicInfo);
+            poc
+        } else {
+            0
+        };
+        let prev_pic_id = prev_dpb_id(&pCtx.pLastDecPicInfo);
+        let (pGap, pRefs) = pic_and_refs_mut(&mut pCtx.pPicBuff, Some(gap_slot));
+        if let Some(pGap) = pGap {
+            let spans = [
+                (0usize, (pGap.linesize(0) * pGap.iHeightInPixel) as usize),
+                (1, (pGap.linesize(1) * pGap.iHeightInPixel / 2) as usize),
+                (2, (pGap.linesize(2) * pGap.iHeightInPixel / 2) as usize),
+            ];
+            match pRefs.classify(prev_pic_id) {
+                RefSlot::Other(prev_pic)
+                    if pGap.iWidthInPixel == prev_pic.iWidthInPixel
+                        && pGap.iHeightInPixel == prev_pic.iHeightInPixel =>
+                {
+                    for (i, len) in spans {
+                        if pGap.plane(i).is_empty() || prev_pic.plane(i).is_empty() {
+                            continue;
+                        }
+                        let (src_base, dst_base) =
+                            (prev_pic.plane(i).origin(), pGap.plane(i).origin());
+                        let src = &prev_pic.plane(i).as_slice()[src_base..src_base + len];
+                        pGap.plane_mut(i).as_mut_slice()[dst_base..dst_base + len]
+                            .copy_from_slice(src);
+                    }
+                }
+                _ => {
+                    for (i, len) in spans {
+                        let plane = pGap.plane_mut(i);
+                        if plane.is_empty() {
+                            continue;
+                        }
+                        let base = plane.origin();
+                        plane.as_mut_slice()[base..base + len].fill(128);
+                    }
+                }
+            }
+            pGap.bIsComplete = false;
+            pGap.bIsNonExisting = true;
+            pGap.iSpsId = iSpsId;
+            if let Some(pid) = pps_id {
+                pGap.iPpsId = pid;
+            }
+            pGap.iFrameNum = unused_fn;
+            pGap.iFramePoc = gap_poc;
+            pGap.uiTemporalId = 0;
+            pGap.uiQualityId = 0;
+            pGap.bIdrFlag = false;
+            pGap.eSliceType = P_SLICE;
+            pGap.pRefPic = [[None; MAX_DPB_COUNT]; LIST_A];
+            pGap.pMbType
+                .as_mut_slice()
+                .fill(crate::decoder::mv_pred::MB_TYPE_INTRA16x16);
+            pGap.expand_as_reference();
+        }
+        if AddShortTermToList(pCtx, false, Some(gap_slot)) != ERR_NONE {
+            if let Some(pGap) = pool_pic_mut(&mut pCtx.pPicBuff, Some(gap_slot)) {
+                SetUnRef(pGap);
+            }
+            break;
+        }
+        pCtx.pLastDecPicInfo.iPrevFrameNum = unused_fn;
+        unused_fn = (unused_fn + 1) & wrap;
+    }
+
+    // If all DPB slots are occupied by long-term references (`SlidingWindow` cannot
+    // evict a short-term slot), still advance `PrevRefFrameNum` and POC state across
+    // any remaining gap frames per 8.2.5.2.
+    if unused_fn != target {
+        let last_gap_fn = (target - 1) & wrap;
+        pCtx.pLastDecPicInfo.iPrevFrameNum = last_gap_fn;
+        if sps.uiPocType != 0 {
+            let prev_poc_fn = if pCtx.pLastDecPicInfo.bPrevPicHasMmco5 {
+                0
+            } else {
+                pCtx.pLastDecPicInfo.iPrevPocFrameNum
+            };
+            let prev_off = if pCtx.pLastDecPicInfo.bPrevPicHasMmco5 {
+                0i64
+            } else {
+                pCtx.pLastDecPicInfo.iPrevFrameNumOffset as i64
+            };
+            let new_off = if prev_poc_fn > last_gap_fn {
+                prev_off.saturating_add(max_frame_num as i64)
+            } else {
+                prev_off
+            };
+            pCtx.pLastDecPicInfo.iPrevFrameNumOffset =
+                new_off.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            pCtx.pLastDecPicInfo.iPrevPocFrameNum = last_gap_fn;
+            pCtx.pLastDecPicInfo.bPrevPicHasMmco5 = false;
+        }
+    }
+
+    ERR_NONE
+}
+
 /// Populates `pRefList[LIST_0]` for standard P-slices.
 ///
 /// Matches `int32_t WelsInitRefList (PWelsDecoderContext pCtx, int32_t iPoc)` in `manage_dec_ref.cpp`.
@@ -907,6 +1119,22 @@ pub fn WelsInitBSliceRefList(
     if err != ERR_NONE {
         return err;
     }
+    // ITU-T H.264 8.2.4.2.3: when `pic_order_cnt_type == 0`, non-existing gap frames
+    // have no derived POC and are excluded from both initial B-slice reference lists.
+    let exclude_non_existing = pCurDqLayer
+        .as_deref()
+        .and_then(|dq| {
+            sps_of(
+                &pCtx.sSpsPpsCtx,
+                dq.sLayerInfo
+                    .sSliceInLayer
+                    .sSliceHeaderExt
+                    .sSliceHeader
+                    .sps_ref,
+            )
+        })
+        .or_else(|| active_sps(&pCtx.sSpsPpsCtx, pCtx.active_sps))
+        .is_some_and(|sps| sps.uiPocType == 0);
     WrapShortRefPicNum(pCtx, pCurDqLayer);
 
     for i in 0..MAX_DPB_COUNT {
@@ -921,32 +1149,29 @@ pub fn WelsInitBSliceRefList(
 
     let short_count = pCtx.sRefPic.uiShortRefCount[LIST_0] as usize;
     for i in 0..short_count {
-        let poc = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i).map(|p| p.iFramePoc);
+        let poc = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i)
+            .filter(|p| !(exclude_non_existing && p.bIsNonExisting))
+            .map(|p| p.iFramePoc);
         if matches!(poc, Some(poc) if poc < iPoc) {
             pLSCurrPocList0[iLSCurrPocCount] = pCtx.sRefPic.pShortRefList[LIST_0][i];
             iLSCurrPocCount += 1;
         }
     }
     for i in (0..short_count).rev() {
-        let poc = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i).map(|p| p.iFramePoc);
+        let poc = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i)
+            .filter(|p| !(exclude_non_existing && p.bIsNonExisting))
+            .map(|p| p.iFramePoc);
         if matches!(poc, Some(poc) if poc > iPoc) {
             pLTCurrPocList0[iLTCurrPocCount] = pCtx.sRefPic.pShortRefList[LIST_0][i];
             iLTCurrPocCount += 1;
         }
     }
 
+    // ITU-T H.264 8.2.4.2.3 / 8.2.4.1: long-term reference frames follow short-term
+    // references in ascending `LongTermPicNum` (`LongTermFrameIdx`) order, which
+    // `AddLongTermToList` already maintains. Do not sort `pLongRefList` by POC as
+    // upstream does (`manage_dec_ref.cpp:303-311`).
     let long_count = pCtx.sRefPic.uiLongRefCount[LIST_0] as usize;
-    if long_count > 1 {
-        for i in 0..long_count {
-            for j in (i + 1)..long_count {
-                let poc_j = long_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, j).map(|p| p.iFramePoc);
-                let poc_i = long_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i).map(|p| p.iFramePoc);
-                if matches!((poc_j, poc_i), (Some(pj), Some(pi)) if pj < pi) {
-                    pCtx.sRefPic.pLongRefList[LIST_0].swap(i, j);
-                }
-            }
-        }
-    }
 
     let iCurrPocCount = iLSCurrPocCount + iLTCurrPocCount;
     let mut iCount = 0usize;
@@ -1099,13 +1324,20 @@ pub fn WelsReorderRefList(
         }
 
         if reorder_syn.bRefPicListReorderingFlag[listIdx] {
-            while iReorderingIndex <= iMaxRefIdx
+            // ITU-T H.264 8.2.4.3.1 / 8.2.4.3.2: look up the target reference directly in
+            // `pShortRefList` / `pLongRefList` rather than scanning `pRefList[0..iMaxRefIdx]`,
+            // so a reference pushed past `MAX_REF_PIC_COUNT - 1` by earlier duplicate-entry
+            // commands is still found. Departs from upstream `manage_dec_ref.cpp:355-433`.
+            let short_count = pCtx.sRefPic.uiShortRefCount[LIST_0] as usize;
+            let long_count = pCtx.sRefPic.uiLongRefCount[LIST_0] as usize;
+            while iReorderingIndex < MAX_REF_PIC_COUNT
+                && iReorderingIndex <= iMaxRefIdx
                 && reorder_syn.sReorderingSyn[listIdx][iReorderingIndex].uiReorderingOfPicNumsIdc
                     != 3
             {
                 let uiReorderingOfPicNumsIdc =
                     reorder_syn.sReorderingSyn[listIdx][iReorderingIndex].uiReorderingOfPicNumsIdc;
-                let mut found_i = -1isize;
+                let mut target_slot: Option<PicId> = None;
 
                 if uiReorderingOfPicNumsIdc < 2 {
                     let iAbsDiffPicNum = (reorder_syn.sReorderingSyn[listIdx][iReorderingIndex]
@@ -1118,9 +1350,14 @@ pub fn WelsReorderRefList(
                     }
                     iPredFrameNum &= iMaxPicNum - 1;
 
-                    for i in (0..iMaxRefIdx).rev() {
-                        let cur = ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, listIdx, i)
-                            .filter(|c| c.iFrameNum == iPredFrameNum && !c.bIsLongRef)
+                    for i in 0..short_count {
+                        let slot = pCtx.sRefPic.pShortRefList[LIST_0][i];
+                        // ITU-T H.264 8.2.4.3.1: `picNumLX` shall not match a
+                        // short-term reference picture marked as "non-existing".
+                        let cur = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i)
+                            .filter(|c| {
+                                c.iFrameNum == iPredFrameNum && !c.bIsLongRef && !c.bIsNonExisting
+                            })
                             .map(|c| (c.uiQualityId, c.iSpsId));
                         if let Some((uiQualityId, iSpsId)) = cur {
                             if pCurDqLayer.sLayerInfo.sNalHeaderExt.uiQualityId == uiQualityId
@@ -1148,17 +1385,17 @@ pub fn WelsReorderRefList(
                                 );
                                 pCtx.iErrorCode = dsNoParamSets;
                                 return ERR_INFO_REFERENCE_PIC_LOST;
-                            } else {
-                                found_i = i as isize;
-                                break;
                             }
+                            target_slot = slot;
+                            break;
                         }
                     }
                 } else if uiReorderingOfPicNumsIdc == 2 {
                     let target_long = reorder_syn.sReorderingSyn[listIdx][iReorderingIndex]
                         .uiLongTermPicNum as i32;
-                    for i in (0..iMaxRefIdx).rev() {
-                        let cur = ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, listIdx, i)
+                    for i in 0..long_count {
+                        let slot = pCtx.sRefPic.pLongRefList[LIST_0][i];
+                        let cur = long_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, i)
                             .filter(|c| c.bIsLongRef && c.iLongTermFrameIdx == target_long)
                             .map(|c| (c.uiQualityId, c.iSpsId));
                         if let Some((uiQualityId, iSpsId)) = cur {
@@ -1187,36 +1424,37 @@ pub fn WelsReorderRefList(
                                 );
                                 pCtx.iErrorCode = dsNoParamSets;
                                 return ERR_INFO_REFERENCE_PIC_LOST;
-                            } else {
-                                found_i = i as isize;
-                                break;
                             }
+                            target_slot = slot;
+                            break;
                         }
                     }
                 }
 
-                if found_i < 0 {
+                let Some(pPic) = target_slot else {
                     return ERR_INFO_REFERENCE_PIC_LOST;
-                }
-                let i_idx = found_i as usize;
-                let pPic = pCtx.sRefPic.pRefList[listIdx][i_idx];
+                };
 
-                // Both arms shift the same span by one; only the length differs.
-                if i_idx != iReorderingIndex {
-                    let move_len = if i_idx > iReorderingIndex {
-                        i_idx - iReorderingIndex
-                    } else {
-                        iMaxRefIdx - iReorderingIndex
-                    };
-                    shift_dpb_entries(
-                        &mut pCtx.sRefPic.pRefList[listIdx],
-                        iReorderingIndex,
-                        1 + iReorderingIndex,
-                        move_len,
-                    );
-                }
-                pCtx.sRefPic.pRefList[listIdx][iReorderingIndex] = pPic;
+                shift_dpb_entries(
+                    &mut pCtx.sRefPic.pRefList[listIdx],
+                    iReorderingIndex,
+                    iReorderingIndex + 1,
+                    MAX_REF_PIC_COUNT - iReorderingIndex,
+                );
+                pCtx.sRefPic.pRefList[listIdx][iReorderingIndex] = Some(pPic);
                 iReorderingIndex += 1;
+
+                let mut n_idx = iReorderingIndex;
+                for c_idx in iReorderingIndex..=MAX_REF_PIC_COUNT {
+                    if pCtx.sRefPic.pRefList[listIdx][c_idx] != Some(pPic) {
+                        pCtx.sRefPic.pRefList[listIdx][n_idx] =
+                            pCtx.sRefPic.pRefList[listIdx][c_idx];
+                        n_idx += 1;
+                    }
+                }
+                for clear_idx in n_idx..=MAX_REF_PIC_COUNT {
+                    pCtx.sRefPic.pRefList[listIdx][clear_idx] = None;
+                }
             }
         }
     }
@@ -1266,29 +1504,34 @@ pub fn WelsReorderRefList2(
 
     for listIdx in 0..iListCount {
         let mut iCount = 0usize;
-        let iRefCount = pCurDqLayer
+        let iRefCount = (pCurDqLayer
             .sLayerInfo
             .sSliceInLayer
             .sSliceHeaderExt
             .sSliceHeader
-            .uiRefCount[listIdx] as usize;
+            .uiRefCount[listIdx] as usize)
+            .min(MAX_REF_PIC_COUNT);
+        if iRefCount == 0 {
+            pCtx.iErrorCode = dsNoParamSets;
+            return ERR_INFO_REFERENCE_PIC_LOST;
+        }
 
         if reorder_syn.bRefPicListReorderingFlag[listIdx] {
             let mut iPredFrameNum = iCurFrameNum;
             let mut i = 0usize;
-            while reorder_syn.sReorderingSyn[listIdx][i].uiReorderingOfPicNumsIdc != 3 {
+            while i < MAX_REF_PIC_COUNT
+                && reorder_syn.sReorderingSyn[listIdx][i].uiReorderingOfPicNumsIdc != 3
+            {
                 // 8.2.4.3 runs the commands over a list num_ref_idx_lX_active entries long,
                 // so the bound is `iRefCount` rather than `iPicQueueNumber`
                 // (num_ref_frames + 2): duplicated references can push the list past the latter.
                 if iCount >= iRefCount {
                     break;
                 }
-                for j in (iCount + 1..=iRefCount).rev() {
-                    pCtx.sRefPic.pRefList[listIdx][j] = pCtx.sRefPic.pRefList[listIdx][j - 1];
-                }
 
                 let uiReorderingOfPicNumsIdc =
                     reorder_syn.sReorderingSyn[listIdx][i].uiReorderingOfPicNumsIdc;
+                let mut target_slot: Option<PicId> = None;
                 if uiReorderingOfPicNumsIdc < 2 {
                     let iAbsDiffPicNum =
                         (reorder_syn.sReorderingSyn[listIdx][i].uiAbsDiffPicNumMinus1 + 1) as i32;
@@ -1310,48 +1553,54 @@ pub fn WelsReorderRefList2(
                     }
                     for j in 0..iShortRefCount {
                         let cur = short_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, j);
-                        if cur.is_some_and(|c| c.iFrameWrapNum == iPredFrameNum) {
-                            pCtx.sRefPic.pRefList[listIdx][iCount] =
-                                pCtx.sRefPic.pShortRefList[LIST_0][j];
-                            iCount += 1;
+                        // ITU-T H.264 8.2.4.3.1: `picNumLX` shall not match a
+                        // short-term reference picture marked as "non-existing".
+                        if cur.is_some_and(|c| {
+                            !c.bIsLongRef && !c.bIsNonExisting && c.iFrameWrapNum == iPredFrameNum
+                        }) {
+                            target_slot = pCtx.sRefPic.pShortRefList[LIST_0][j];
                             break;
                         }
                     }
-                    let k = iCount;
-                    let mut k_write = k;
-                    for j in k..=iRefCount {
-                        let cur = ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, listIdx, j);
-                        if cur.is_some_and(|c| c.bIsLongRef || c.iFrameWrapNum != iPredFrameNum) {
-                            pCtx.sRefPic.pRefList[listIdx][k_write] =
-                                pCtx.sRefPic.pRefList[listIdx][j];
-                            k_write += 1;
-                        }
-                    }
-                } else {
-                    iPredFrameNum = reorder_syn.sReorderingSyn[listIdx][i].uiLongTermPicNum as i32;
+                } else if uiReorderingOfPicNumsIdc == 2 {
+                    // ITU-T H.264 8.2.4.3.2 / 8.2.4.3.1: match `iLongTermFrameIdx`
+                    // (`LongTermPicNum` for frames) without mutating `iPredFrameNum`
+                    // (`picNumLXPred`). Departs from upstream `manage_dec_ref.cpp:495-516`.
+                    let target_long =
+                        reorder_syn.sReorderingSyn[listIdx][i].uiLongTermPicNum as i32;
                     for j in 0..iLongRefCount {
                         let cur = long_ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, j);
-                        if cur.is_some_and(|c| c.uiLongTermPicNum == iPredFrameNum as u32) {
-                            pCtx.sRefPic.pRefList[listIdx][iCount] =
-                                pCtx.sRefPic.pLongRefList[LIST_0][j];
-                            iCount += 1;
+                        if cur.is_some_and(|c| c.bIsLongRef && c.iLongTermFrameIdx == target_long) {
+                            target_slot = pCtx.sRefPic.pLongRefList[LIST_0][j];
                             break;
-                        }
-                    }
-                    let k = iCount;
-                    let mut k_write = k;
-                    for j in k..=iRefCount {
-                        let cur = ref_pic(&pCtx.pPicBuff, &pCtx.sRefPic, listIdx, j);
-                        if cur.is_some_and(|c| {
-                            !c.bIsLongRef || c.uiLongTermPicNum != iPredFrameNum as u32
-                        }) {
-                            pCtx.sRefPic.pRefList[listIdx][k_write] =
-                                pCtx.sRefPic.pRefList[listIdx][j];
-                            k_write += 1;
                         }
                     }
                 }
+
+                let Some(pPic) = target_slot else {
+                    return ERR_INFO_REFERENCE_PIC_LOST;
+                };
+
+                for j in (iCount + 1..=iRefCount).rev() {
+                    pCtx.sRefPic.pRefList[listIdx][j] = pCtx.sRefPic.pRefList[listIdx][j - 1];
+                }
+                pCtx.sRefPic.pRefList[listIdx][iCount] = Some(pPic);
+                iCount += 1;
+
+                let mut k_write = iCount;
+                for j in iCount..=iRefCount {
+                    if pCtx.sRefPic.pRefList[listIdx][j] != Some(pPic) {
+                        pCtx.sRefPic.pRefList[listIdx][k_write] = pCtx.sRefPic.pRefList[listIdx][j];
+                        k_write += 1;
+                    }
+                }
+                for clear_idx in k_write..=iRefCount {
+                    pCtx.sRefPic.pRefList[listIdx][clear_idx] = None;
+                }
                 i += 1;
+            }
+            for clear_idx in iRefCount..MAX_DPB_COUNT {
+                pCtx.sRefPic.pRefList[listIdx][clear_idx] = None;
             }
         }
 
@@ -1405,6 +1654,7 @@ pub fn WelsMarkAsRef(
         pCurDqLayer.sLayerInfo.sNalHeaderExt.uiTemporalId,
     );
     if let Some(pDec) = dec!() {
+        pDec.bIsNonExisting = false;
         pDec.uiQualityId = uiQualityId;
         pDec.uiTemporalId = uiTemporalId;
     }
@@ -1676,5 +1926,455 @@ mod tests {
         // sTmpRefPic must also be re-synced to sRefPic (cleared of stale refs)
         assert_eq!(pCtx.sTmpRefPic.uiShortRefCount[LIST_0], 0);
         assert_eq!(pCtx.sTmpRefPic.pShortRefList[LIST_0][0], None);
+    }
+
+    #[test]
+    fn test_b_slice_long_term_refs_ordered_by_long_term_idx_not_poc() {
+        // Two short-term refs straddling B-slice POC 6 so L0 and L1 start distinct,
+        // plus two long-term refs whose LongTermFrameIdx order (0 then 1) is the
+        // reverse of their POC order (POC 20 vs POC 4).
+        let mut st_before = SPicture::default();
+        st_before.iFrameNum = 0;
+        st_before.iFramePoc = 2;
+        st_before.bUsedAsRef = true;
+
+        let mut st_after = SPicture::default();
+        st_after.iFrameNum = 1;
+        st_after.iFramePoc = 10;
+        st_after.bUsedAsRef = true;
+
+        let mut lt_idx0 = SPicture::default();
+        lt_idx0.iFrameNum = 2;
+        lt_idx0.iFramePoc = 20;
+        lt_idx0.bUsedAsRef = true;
+
+        let mut lt_idx1 = SPicture::default();
+        lt_idx1.iFrameNum = 3;
+        lt_idx1.iFramePoc = 4;
+        lt_idx1.bUsedAsRef = true;
+
+        let pool = crate::decoder::pic_queue::PicPool::over(vec![
+            Some(Box::new(st_before)),
+            Some(Box::new(st_after)),
+            Some(Box::new(lt_idx0)),
+            Some(Box::new(lt_idx1)),
+        ]);
+        let (s_before, s_after, s_lt0, s_lt1) = (
+            Some(pool.id(0)),
+            Some(pool.id(1)),
+            Some(pool.id(2)),
+            Some(pool.id(3)),
+        );
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        let pCtx = &mut *ctx;
+
+        AddShortTermToList(pCtx, false, s_before);
+        AddShortTermToList(pCtx, false, s_after);
+        AddLongTermToList(pCtx, false, s_lt1, 1, 2);
+        AddLongTermToList(pCtx, false, s_lt0, 0, 2);
+
+        // Stored long-term list is in ascending LongTermFrameIdx order: [s_lt0, s_lt1].
+        assert_eq!(pCtx.sRefPic.pLongRefList[LIST_0][0], s_lt0);
+        assert_eq!(pCtx.sRefPic.pLongRefList[LIST_0][1], s_lt1);
+
+        assert_eq!(WelsInitBSliceRefList(pCtx, None, 6), ERR_NONE);
+
+        // Both B lists must place s_lt0 (idx 0, POC 20) before s_lt1 (idx 1, POC 4).
+        assert_eq!(
+            &pCtx.sRefPic.pRefList[LIST_0][..4],
+            &[s_before, s_after, s_lt0, s_lt1]
+        );
+        assert_eq!(
+            &pCtx.sRefPic.pRefList[LIST_1][..4],
+            &[s_after, s_before, s_lt0, s_lt1]
+        );
+
+        // Stored long-term list must remain unchanged afterwards.
+        assert_eq!(pCtx.sRefPic.pLongRefList[LIST_0][0], s_lt0);
+        assert_eq!(pCtx.sRefPic.pLongRefList[LIST_0][1], s_lt1);
+    }
+
+    #[test]
+    fn test_mmco_short_to_long_works_when_short_ref_is_outside_active_ref_list() {
+        let mut pic0 = SPicture::default();
+        pic0.iFrameNum = 5;
+        pic0.bUsedAsRef = true;
+
+        let mut pic1 = SPicture::default();
+        pic1.iFrameNum = 6;
+        pic1.bUsedAsRef = true;
+
+        let pool = crate::decoder::pic_queue::PicPool::over(vec![
+            Some(Box::new(pic0)),
+            Some(Box::new(pic1)),
+        ]);
+        let (s0, s1) = (Some(pool.id(0)), Some(pool.id(1)));
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        let pCtx = &mut *ctx;
+
+        AddShortTermToList(pCtx, false, s0);
+        AddShortTermToList(pCtx, false, s1);
+        pCtx.sRefPic.iMaxLongTermFrameIdx = 1;
+        // Simulate an I-slice or 1-ref P-slice where `pRefList[0][0..uiRefCount]`
+        // does not include `s0` (`iFrameNum == 5`).
+        pCtx.sRefPic.pRefList[LIST_0][0] = s1;
+        pCtx.sRefPic.uiRefCount[LIST_0] = 1;
+
+        assert_eq!(
+            MMCOProcess(pCtx, false, MMCO_SHORT2LONG, 5, 0, 0, 0),
+            ERR_NONE
+        );
+        assert_eq!(pCtx.sRefPic.uiShortRefCount[LIST_0], 1);
+        assert_eq!(pCtx.sRefPic.pShortRefList[LIST_0][0], s1);
+        assert_eq!(pCtx.sRefPic.uiLongRefCount[LIST_0], 1);
+        assert_eq!(pCtx.sRefPic.pLongRefList[LIST_0][0], s0);
+    }
+
+    #[test]
+    fn test_fill_frame_num_gaps_inserts_non_existing_short_term_refs_with_sliding_window() {
+        let pool = crate::decoder::pic_queue::PicPool::over(vec![
+            Some(Box::new(SPicture::default())),
+            Some(Box::new(SPicture::default())),
+            Some(Box::new(SPicture::default())),
+            Some(Box::new(SPicture::default())),
+            Some(Box::new(SPicture::default())),
+        ]);
+        let s_initial = Some(pool.id(0));
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iSpsId = 0;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].bGapsInFrameNumValueAllowedFlag = true;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiLog2MaxFrameNum = 4; // MaxFrameNum = 16
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iNumRefFrames = 3;
+        ctx.active_sps = Some(crate::decoder::decoder_context::SpsRef {
+            id: 0,
+            subset: false,
+        });
+        let pCtx = &mut *ctx;
+
+        if let Some(p) = pool_pic_mut(&mut pCtx.pPicBuff, s_initial) {
+            p.iFrameNum = 14;
+        }
+        AddShortTermToList(pCtx, false, s_initial);
+        pCtx.pLastDecPicInfo.iPrevFrameNum = 14;
+
+        // Jump from 14 to 2 (mod 16): missing frame_nums are 15, 0, 1.
+        // With max_num_ref_frames == 3, frame 14 is evicted and [1, 0, 15] remain.
+        let sps_ref = pCtx.active_sps;
+        assert_eq!(WelsFillFrameNumGaps(pCtx, sps_ref, 2), ERR_NONE);
+        assert_eq!(pCtx.pLastDecPicInfo.iPrevFrameNum, 1);
+        assert_eq!(pCtx.sRefPic.uiShortRefCount[LIST_0], 3);
+        let fnums: Vec<i32> = (0..3)
+            .map(|i| {
+                pool_pic(&pCtx.pPicBuff, pCtx.sRefPic.pShortRefList[LIST_0][i])
+                    .unwrap()
+                    .iFrameNum
+            })
+            .collect();
+        assert_eq!(fnums, vec![1, 0, 15]);
+    }
+
+    #[test]
+    fn test_reorder_ref_list2_long_term_idx_preserves_pred_pic_num_and_reports_missing() {
+        let mut st0 = SPicture::default();
+        st0.iFrameNum = 3;
+        st0.bUsedAsRef = true;
+
+        let mut lt0 = SPicture::default();
+        lt0.iFrameNum = 1;
+        lt0.bUsedAsRef = true;
+
+        let mut lt1 = SPicture::default();
+        lt1.iFrameNum = 2;
+        lt1.bUsedAsRef = true;
+
+        let pool = crate::decoder::pic_queue::PicPool::over(vec![
+            Some(Box::new(st0)),
+            Some(Box::new(lt0)),
+            Some(Box::new(lt1)),
+        ]);
+        let (s_st0, s_lt0, s_lt1) = (Some(pool.id(0)), Some(pool.id(1)), Some(pool.id(2)));
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.eSliceType = P_SLICE;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iSpsId = 0;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiLog2MaxFrameNum = 4;
+        let sps_ref = Some(crate::decoder::decoder_context::SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+
+        let mut dq = Box::new(DqLayerState::for_grid(crate::safe::mb_grid::MbDims::none()));
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .sps_ref = sps_ref;
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .iFrameNum = 4;
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .uiRefCount[LIST_0] = 3;
+
+        let pCtx = &mut *ctx;
+        AddShortTermToList(pCtx, false, s_st0);
+        // Match `ParseDecRefPicMarking` + `MMCO`: `uiLongTermPicNum` is left 0 on both
+        // long-term entries while `iLongTermFrameIdx` distinguishes 0 vs 1.
+        AddLongTermToList(pCtx, false, s_lt0, 0, 0);
+        AddLongTermToList(pCtx, false, s_lt1, 1, 0);
+
+        assert_eq!(WelsInitRefList(pCtx, Some(&mut *dq), 8), ERR_NONE);
+        assert_eq!(&pCtx.sRefPic.pRefList[LIST_0][..3], &[s_st0, s_lt0, s_lt1]);
+
+        // Command 0: long-term idx 1 (`s_lt1`) -> index 0.
+        // Command 1: short-term `CurrPicNum (4) - 1 = 3` (`s_st0`) -> index 1
+        //            (verifies `idc == 2` did not clobber `iPredFrameNum`).
+        // Remaining entry `s_lt0` compacts into index 2.
+        let mut syn = SRefPicListReorderSyn::default();
+        syn.bRefPicListReorderingFlag[LIST_0] = true;
+        syn.sReorderingSyn[LIST_0][0].uiReorderingOfPicNumsIdc = 2;
+        syn.sReorderingSyn[LIST_0][0].uiLongTermPicNum = 1;
+        syn.sReorderingSyn[LIST_0][1].uiReorderingOfPicNumsIdc = 0;
+        syn.sReorderingSyn[LIST_0][1].uiAbsDiffPicNumMinus1 = 0;
+        syn.sReorderingSyn[LIST_0][2].uiReorderingOfPicNumsIdc = 3;
+        dq.sRefPicListReordering = Some(syn);
+
+        assert_eq!(WelsReorderRefList2(pCtx, Some(&mut *dq)), ERR_NONE);
+        assert_eq!(&pCtx.sRefPic.pRefList[LIST_0][..3], &[s_lt1, s_st0, s_lt0]);
+        assert_eq!(pCtx.sRefPic.pRefList[LIST_0][3], None);
+
+        // Missing long-term reference reports `ERR_INFO_REFERENCE_PIC_LOST`.
+        let mut bad_syn = SRefPicListReorderSyn::default();
+        bad_syn.bRefPicListReorderingFlag[LIST_0] = true;
+        bad_syn.sReorderingSyn[LIST_0][0].uiReorderingOfPicNumsIdc = 2;
+        bad_syn.sReorderingSyn[LIST_0][0].uiLongTermPicNum = 5;
+        bad_syn.sReorderingSyn[LIST_0][1].uiReorderingOfPicNumsIdc = 3;
+        dq.sRefPicListReordering = Some(bad_syn);
+        assert_eq!(
+            WelsReorderRefList2(pCtx, Some(&mut *dq)),
+            ERR_INFO_REFERENCE_PIC_LOST
+        );
+    }
+
+    #[test]
+    fn test_fill_frame_num_gaps_full_long_term_dpb_and_clean_gap_slot_state() {
+        let pool = crate::decoder::pic_queue::CreatePicBuff(false, 3, 16, 16).unwrap();
+        let (s0, s1) = (pool.id(0), pool.id(1));
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iSpsId = 0;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].bGapsInFrameNumValueAllowedFlag = true;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiLog2MaxFrameNum = 6; // MaxFrameNum = 64
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iNumRefFrames = 1;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiPocType = 2;
+        let sps_ref = Some(crate::decoder::decoder_context::SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+
+        // Case 1: all `iNumRefFrames` (1) slots are pinned by a long-term ref (`max_kept == 0`).
+        // Both a large gap (> 32) and a small gap (<= 32) must still advance `iPrevFrameNum`
+        // and `iPrevFrameNumOffset`.
+        AddLongTermToList(&mut ctx, false, Some(s0), 0, 0);
+        ctx.pLastDecPicInfo.iPrevFrameNum = 10;
+        ctx.pLastDecPicInfo.iPrevPocFrameNum = 10;
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 50), ERR_NONE);
+        assert_eq!(ctx.pLastDecPicInfo.iPrevFrameNum, 49);
+        assert_eq!(ctx.pLastDecPicInfo.iPrevPocFrameNum, 49);
+
+        // Small wrap gap from 62 to 2 (`gap_len == 3 <= 32`) while DPB is still full of LTRs.
+        ctx.pLastDecPicInfo.iPrevFrameNum = 62;
+        ctx.pLastDecPicInfo.iPrevPocFrameNum = 62;
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 2), ERR_NONE);
+        assert_eq!(ctx.pLastDecPicInfo.iPrevFrameNum, 1);
+        assert_eq!(ctx.pLastDecPicInfo.iPrevFrameNumOffset, 64);
+
+        // Case 2: free the LTR, dirty `s1`'s colocated fields as if it had been an I-slice
+        // carrying stale `pRefPic`, and verify `WelsFillFrameNumGaps` scrubs it.
+        let _ = WelsDelLongFromListSetUnref(&mut ctx, false, 0);
+        if let Some(p1) = pool_pic_mut(&mut ctx.pPicBuff, Some(s1)) {
+            p1.eSliceType = I_SLICE;
+            p1.pRefPic[LIST_0][0] = Some(s0);
+            p1.pMbType.as_mut_slice().fill(0);
+        }
+        AddShortTermToList(&mut ctx, false, Some(s0));
+        ctx.pLastDecPicInfo.iPrevFrameNum = 5;
+        ctx.pLastDecPicInfo.iPrevPocFrameNum = 5;
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 7), ERR_NONE);
+        let gap_pic = pool_pic(&ctx.pPicBuff, pCtx_short(&ctx, 0)).unwrap();
+        assert_eq!(gap_pic.iFrameNum, 6);
+        assert!(gap_pic.bIsNonExisting);
+        assert!(!gap_pic.bIsComplete);
+        assert_eq!(gap_pic.eSliceType, P_SLICE);
+        assert_eq!(gap_pic.pRefPic[LIST_0][0], None);
+        assert!(
+            gap_pic
+                .pMbType
+                .as_slice()
+                .iter()
+                .all(|&t| t == crate::decoder::mv_pred::MB_TYPE_INTRA16x16)
+        );
+    }
+
+    #[test]
+    fn test_non_existing_gap_frames_rejected_by_rplr_and_excluded_from_b_poc0_lists() {
+        let pool = crate::decoder::pic_queue::CreatePicBuff(false, 6, 16, 16).unwrap();
+        let (s0, s1) = (pool.id(0), pool.id(1));
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iSpsId = 0;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].bGapsInFrameNumValueAllowedFlag = true;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiLog2MaxFrameNum = 4; // MaxFrameNum = 16
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iNumRefFrames = 4;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiPocType = 0;
+        let sps_ref = Some(crate::decoder::decoder_context::SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+
+        if let Some(p0) = pool_pic_mut(&mut ctx.pPicBuff, Some(s0)) {
+            p0.iFrameNum = 0;
+            p0.iFramePoc = 0;
+            p0.bIsComplete = true;
+        }
+        if let Some(p1) = pool_pic_mut(&mut ctx.pPicBuff, Some(s1)) {
+            p1.iFrameNum = 1;
+            p1.iFramePoc = 8;
+            p1.bIsComplete = true;
+        }
+        AddShortTermToList(&mut ctx, false, Some(s0));
+        AddShortTermToList(&mut ctx, false, Some(s1));
+        ctx.pLastDecPicInfo.iPrevFrameNum = 1;
+
+        // Jump from frame_num 1 to 3: creates one non-existing gap frame with frame_num 2.
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 3), ERR_NONE);
+        assert_eq!(ctx.sRefPic.uiShortRefCount[LIST_0], 3);
+        let gap_slot = ctx.sRefPic.pShortRefList[LIST_0][0];
+        let gap_pic = pool_pic(&ctx.pPicBuff, gap_slot).unwrap();
+        assert_eq!(gap_pic.iFrameNum, 2);
+        assert!(gap_pic.bIsNonExisting);
+        assert!(!gap_pic.bIsComplete);
+
+        // H.264 8.2.4.2.3: for `pic_order_cnt_type == 0`, B-slice default reference lists
+        // must exclude the non-existing gap frame (which has `iFramePoc == 0`).
+        let mut dq = Box::new(DqLayerState::for_grid(crate::safe::mb_grid::MbDims::none()));
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .sps_ref = sps_ref;
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .iFrameNum = 3;
+        dq.sLayerInfo
+            .sSliceInLayer
+            .sSliceHeaderExt
+            .sSliceHeader
+            .uiRefCount = [2, 2];
+        ctx.eSliceType = B_SLICE;
+
+        assert_eq!(WelsInitBSliceRefList(&mut ctx, Some(&mut *dq), 4), ERR_NONE);
+        assert_eq!(ctx.sRefPic.uiRefCount[LIST_0], 2);
+        assert_eq!(ctx.sRefPic.uiRefCount[LIST_1], 2);
+        assert_eq!(ctx.sRefPic.pRefList[LIST_0][..2], [Some(s0), Some(s1)]);
+        assert_eq!(ctx.sRefPic.pRefList[LIST_1][..2], [Some(s1), Some(s0)]);
+
+        // H.264 8.2.4.3.1: RPLR targeting the non-existing gap frame (`frame_num = 2`,
+        // `3 - 1 = 2`) must return `ERR_INFO_REFERENCE_PIC_LOST` in both reorderers.
+        ctx.eSliceType = P_SLICE;
+        assert_eq!(WelsInitRefList(&mut ctx, Some(&mut *dq), 4), ERR_NONE);
+        let mut syn = SRefPicListReorderSyn::default();
+        syn.bRefPicListReorderingFlag[LIST_0] = true;
+        syn.sReorderingSyn[LIST_0][0].uiReorderingOfPicNumsIdc = 0;
+        syn.sReorderingSyn[LIST_0][0].uiAbsDiffPicNumMinus1 = 0; // diff = 1 -> frame_num 2
+        syn.sReorderingSyn[LIST_0][1].uiReorderingOfPicNumsIdc = 3;
+        dq.sRefPicListReordering = Some(syn);
+
+        assert_eq!(
+            WelsReorderRefList(&mut ctx, Some(&mut *dq)),
+            ERR_INFO_REFERENCE_PIC_LOST
+        );
+        assert_eq!(
+            WelsReorderRefList2(&mut ctx, Some(&mut *dq)),
+            ERR_INFO_REFERENCE_PIC_LOST
+        );
+
+        // Targeting an existing short-term frame (`frame_num = 1`, `3 - 2 = 1`) still succeeds.
+        let mut ok_syn = SRefPicListReorderSyn::default();
+        ok_syn.bRefPicListReorderingFlag[LIST_0] = true;
+        ok_syn.sReorderingSyn[LIST_0][0].uiReorderingOfPicNumsIdc = 0;
+        ok_syn.sReorderingSyn[LIST_0][0].uiAbsDiffPicNumMinus1 = 1; // diff = 2 -> frame_num 1
+        ok_syn.sReorderingSyn[LIST_0][1].uiReorderingOfPicNumsIdc = 3;
+        dq.sRefPicListReordering = Some(ok_syn);
+
+        assert_eq!(WelsReorderRefList(&mut ctx, Some(&mut *dq)), ERR_NONE);
+        assert_eq!(ctx.sRefPic.pRefList[LIST_0][0], Some(s1));
+    }
+
+    #[test]
+    fn test_fill_frame_num_gaps_tight_bound_and_duplicate_frame_num_unrefs_old_slot() {
+        let pool = crate::decoder::pic_queue::CreatePicBuff(false, 5, 16, 16).unwrap();
+        let s0 = pool.id(0);
+
+        let mut ctx = SWelsDecoderContext::new_boxed();
+        ctx.pPicBuff = Some(pool);
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iSpsId = 0;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].bGapsInFrameNumValueAllowedFlag = true;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiLog2MaxFrameNum = 4; // MaxFrameNum = 16
+        ctx.sSpsPpsCtx.sSpsBuffer[0].iNumRefFrames = 2;
+        ctx.sSpsPpsCtx.sSpsBuffer[0].uiPocType = 2;
+        let sps_ref = Some(crate::decoder::decoder_context::SpsRef {
+            id: 0,
+            subset: false,
+        });
+        ctx.active_sps = sps_ref;
+
+        // Place a stale short-term ref with `iFrameNum = 6` while `iPrevFrameNum = 5`.
+        // Jumping to `target = 7` creates gap frame 6 and must unref `s0` rather than
+        // leaking it with `bUsedAsRef == true`.
+        if let Some(p0) = pool_pic_mut(&mut ctx.pPicBuff, Some(s0)) {
+            p0.iFrameNum = 6;
+            p0.bIsComplete = true;
+        }
+        AddShortTermToList(&mut ctx, false, Some(s0));
+        ctx.pLastDecPicInfo.iPrevFrameNum = 5;
+        ctx.pLastDecPicInfo.iPrevPocFrameNum = 5;
+
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 7), ERR_NONE);
+        assert_eq!(ctx.sRefPic.uiShortRefCount[LIST_0], 1);
+        assert_ne!(ctx.sRefPic.pShortRefList[LIST_0][0], Some(s0));
+        assert!(!pool_pic(&ctx.pPicBuff, Some(s0)).unwrap().bUsedAsRef);
+
+        // Now jump from 6 to 13 (`gap_len = 6 > max_kept = 2`, yet `<= 32`):
+        // fast-forward evicts old short-term refs and leaves only `[12, 11]`.
+        assert_eq!(WelsFillFrameNumGaps(&mut ctx, sps_ref, 13), ERR_NONE);
+        assert_eq!(ctx.sRefPic.uiShortRefCount[LIST_0], 2);
+        let fnums: Vec<i32> = (0..2)
+            .map(|i| {
+                pool_pic(&ctx.pPicBuff, ctx.sRefPic.pShortRefList[LIST_0][i])
+                    .unwrap()
+                    .iFrameNum
+            })
+            .collect();
+        assert_eq!(fnums, vec![12, 11]);
+    }
+
+    fn pCtx_short(ctx: &SWelsDecoderContext, idx: usize) -> Option<PicId> {
+        ctx.sRefPic.pShortRefList[LIST_0][idx]
     }
 }

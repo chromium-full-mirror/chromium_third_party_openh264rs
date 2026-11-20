@@ -159,3 +159,65 @@ pub(crate) fn num_ref_frame_change_resizes_the_pool_and_matches_the_reference() 
         );
     }
 }
+
+/// Dropping a referenced P-slice in a `gaps_in_frame_num_value_allowed_flag = 1`
+/// stream must still surface `dsRefLost` (and `dsDataErrorConcealed` with EC enabled,
+/// or halt output under `ERROR_CON_DISABLE`) rather than letting synthetic non-existing
+/// gap frames satisfy reference reordering as clean references.
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+pub(crate) fn dropped_ref_in_gaps_allowed_stream_reports_ref_lost() {
+    let data = common::read_stream("num_ref_change_320x192.264");
+    let units: Vec<&[u8]> = split_annexb_units(&data).collect();
+
+    let run_drop = |drop_idx: usize, ec: ERROR_CON_IDC| -> (i32, usize) {
+        let mut decoder = Decoder::new();
+        let mut param = SDecodingParam::default();
+        param.uiTargetDqLayer = u8::MAX;
+        param.eEcActiveIdc = ec;
+        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+        assert_eq!(
+            decoder.initialize(&param),
+            CM_RESULT_SUCCESS as std::ffi::c_long
+        );
+
+        let mut state_union = 0i32;
+        let mut frame_count = 0usize;
+        for (idx, unit) in units.iter().enumerate() {
+            if idx == drop_idx {
+                continue;
+            }
+            let mut buf_info = SBufferInfo::default();
+            let ret = decoder.decode(Some(unit), &mut buf_info);
+            state_union |= ret.0;
+            if buf_info.iBufferStatus == 1 {
+                frame_count += 1;
+            }
+        }
+        decoder.set_end_of_stream(true);
+        let mut buf_info = SBufferInfo::default();
+        let ret = decoder.decode(None, &mut buf_info);
+        state_union |= ret.0;
+        if buf_info.iBufferStatus == 1 {
+            frame_count += 1;
+        }
+        decoder.uninitialize();
+        (state_union, frame_count)
+    };
+
+    let expected_ec = DECODING_STATE::dsRefLost.0 | DECODING_STATE::dsDataErrorConcealed.0;
+
+    // NAL 51 is a referenced P slice in the 4-ref (`gaps_in_frame_num_allowed_flag = 1`) half.
+    let (state_ec_51, frames_ec_51) = run_drop(51, ERROR_CON_IDC::ERROR_CON_SLICE_COPY);
+    assert_eq!(state_ec_51, expected_ec);
+    assert_eq!(frames_ec_51, 47);
+
+    // Under ERROR_CON_DISABLE, decoding must report `dsRefLost` and stop emitting damaged frames.
+    let (state_no_ec_51, frames_no_ec_51) = run_drop(51, ERROR_CON_IDC::ERROR_CON_DISABLE);
+    assert_eq!(state_no_ec_51, DECODING_STATE::dsRefLost.0);
+    assert_eq!(frames_no_ec_51, 43);
+
+    // Dropping NAL 54 under EC must likewise report `dsRefLost | dsDataErrorConcealed`.
+    let (state_ec_54, _) = run_drop(54, ERROR_CON_IDC::ERROR_CON_SLICE_COPY);
+    assert_eq!(state_ec_54, expected_ec);
+}

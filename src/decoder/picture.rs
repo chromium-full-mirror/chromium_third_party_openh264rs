@@ -133,6 +133,10 @@ pub struct SPicture {
     /// `true` if all macroblocks in this picture were completely and cleanly decoded from the bitstream.
     pub bIsComplete: bool,
 
+    /// `true` if this picture is a synthetic "non-existing" short-term reference generated
+    /// to fill a `frame_num` gap (ITU-T H.264 8.2.5.2).
+    pub bIsNonExisting: bool,
+
     // =========================================================================
     // Scalable Video Coding (SVC) & Identification Tags
     // =========================================================================
@@ -253,6 +257,7 @@ impl Default for SPicture {
             iRefCount: 0,
             pSetUnRef: None,
             bIsComplete: false,
+            bIsNonExisting: false,
             uiTemporalId: 0,
             uiSpatialId: 0,
             uiQualityId: 0,

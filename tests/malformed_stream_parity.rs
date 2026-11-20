@@ -77,6 +77,9 @@ const BASE_STREAMS: &[&str] = &[
     "BA_MW_D_P_LOST.264",
     // Changes resolution mid-stream (352x288 -> 640x480 -> 352x288).
     "Error_I_P.264",
+    // High Profile CAVLC (scaling matrices + B-pyramid) and CABAC (scaling matrices + high QP).
+    "high_cavlc_cqm_bpyramid_176x144.264",
+    "high_cabac_cqm_highqp_176x144.264",
 ];
 
 // ---------------------------------------------------------------------------
@@ -552,6 +555,18 @@ pub(crate) fn malformed_narrow_16x16() {
 #[cfg_attr(not(has_test_data), ignore = "test input files not found")]
 pub(crate) fn malformed_narrow_16x16_idr_lost() {
     check_stream("narrow_16x16_idr_lost.264");
+}
+
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+pub(crate) fn malformed_high_cavlc_cqm_bpyramid() {
+    check_stream("high_cavlc_cqm_bpyramid_176x144.264");
+}
+
+#[test]
+#[cfg_attr(not(has_test_data), ignore = "test input files not found")]
+pub(crate) fn malformed_high_cabac_cqm_highqp() {
+    check_stream("high_cabac_cqm_highqp_176x144.264");
 }
 
 fn check_degenerate_case(name: &str, feed: Feed, data: Vec<u8>, expected_rets: &[i32]) {

@@ -53,18 +53,19 @@ fn collect_path_attr_deps(dir: &Path, root: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Integration tests that depend on Cargo's `cdylib` build output or host C/C++ toolchain
-/// rather than the `rust_static_library` target used in Chromium's GN build.
-const CARGO_CDYLIB_TESTS: &[&str] = &["tests/interop_test.rs"];
+/// Integration tests that depend on Cargo's `cdylib` build output or host toolchains
+/// (`cc`/`c++`, `ffmpeg`/`libx264`) rather than the `rust_static_library` target used in
+/// Chromium's GN build.
+const CARGO_ONLY_TESTS: &[&str] = &[
+    "tests/decoder_ffmpeg_parity_test.rs",
+    "tests/interop_test.rs",
+];
 
 fn c_api_only_tests(manifest_dir: &Path) -> Vec<String> {
     let cargo_toml_path = manifest_dir.join("Cargo.toml");
     let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", cargo_toml_path.display()));
-    let mut excluded: Vec<String> = CARGO_CDYLIB_TESTS
-        .iter()
-        .map(|&s| String::from(s))
-        .collect();
+    let mut excluded: Vec<String> = CARGO_ONLY_TESTS.iter().map(|&s| String::from(s)).collect();
     let mut in_test_section = false;
     let mut current_name: Option<String> = None;
     let mut requires_c_api = false;

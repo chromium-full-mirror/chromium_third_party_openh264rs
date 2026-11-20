@@ -710,86 +710,6 @@ pub fn GetMbResProperty(pMBproperty: &mut i32, pResidualProperty: &mut i32, bCav
 }
 
 // ============================================================================
-// IDCT Dequantization Primitives
-// ============================================================================
-
-pub fn WelsLumaDcDequantIdct(pBlock: &mut [i16], iQp: i32, pCtx: &mut SliceCtx<'_>) {
-    let kiQMul = if pCtx.bUseScalingList && pCtx.bDequantCoeff4x4Init {
-        pCtx.pDequant_coeff_buffer4x4[0][iQp as usize][0] as i32
-    } else {
-        (g_kuiDequantCoeff[iQp as usize][0] as i32) << 4
-    };
-
-    let mut iTemp = [0i32; 16];
-    let kiXOffset = [0usize, 16, 64, 80];
-    let kiYOffset = [0usize, 32, 128, 160];
-
-    for i in 0..4 {
-        let kiOffset = kiYOffset[i];
-        let kiX1 = kiOffset + kiXOffset[2];
-        let kiX2 = 16 + kiOffset;
-        let kiX3 = kiOffset + kiXOffset[3];
-        let kiI4 = i << 2;
-        let kiZ0 = pBlock[kiOffset] as i32 + pBlock[kiX1] as i32;
-        let kiZ1 = pBlock[kiOffset] as i32 - pBlock[kiX1] as i32;
-        let kiZ2 = pBlock[kiX2] as i32 - pBlock[kiX3] as i32;
-        let kiZ3 = pBlock[kiX2] as i32 + pBlock[kiX3] as i32;
-
-        iTemp[kiI4] = kiZ0 + kiZ3;
-        iTemp[1 + kiI4] = kiZ1 + kiZ2;
-        iTemp[2 + kiI4] = kiZ1 - kiZ2;
-        iTemp[3 + kiI4] = kiZ0 - kiZ3;
-    }
-
-    for i in 0..4 {
-        let kiOffset = kiXOffset[i];
-        let kiI4 = 4 + i;
-        let kiZ0 = iTemp[i].wrapping_add(iTemp[4 + kiI4]);
-        let kiZ1 = iTemp[i].wrapping_sub(iTemp[4 + kiI4]);
-        let kiZ2 = iTemp[kiI4].wrapping_sub(iTemp[8 + kiI4]);
-        let kiZ3 = iTemp[kiI4].wrapping_add(iTemp[8 + kiI4]);
-
-        pBlock[kiOffset] = ((kiZ0
-            .wrapping_add(kiZ3)
-            .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
-            >> 6) as i16;
-        pBlock[kiYOffset[1] + kiOffset] = ((kiZ1
-            .wrapping_add(kiZ2)
-            .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
-            >> 6) as i16;
-        pBlock[kiYOffset[2] + kiOffset] = ((kiZ1
-            .wrapping_sub(kiZ2)
-            .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
-            >> 6) as i16;
-        pBlock[kiYOffset[3] + kiOffset] = ((kiZ0
-            .wrapping_sub(kiZ3)
-            .wrapping_mul(kiQMul)
-            .wrapping_add(1 << 5))
-            >> 6) as i16;
-    }
-}
-
-pub fn WelsChromaDcIdct(pBlock: &mut [i16]) {
-    let iA = pBlock[0] as i32;
-    let iB = pBlock[16] as i32;
-    let iC = pBlock[32] as i32;
-    let iD = pBlock[48] as i32;
-
-    let iE = iA - iB;
-    let iA_sum = iA + iB;
-    let iB_sub = iC - iD;
-    let iC_sum = iC + iD;
-
-    pBlock[0] = (iA_sum + iC_sum) as i16;
-    pBlock[16] = (iE + iB_sub) as i16;
-    pBlock[32] = (iA_sum - iC_sum) as i16;
-    pBlock[48] = (iE - iB_sub) as i16;
-}
-
-// ============================================================================
 // Cache Update & Spatial Availability Helpers
 // ============================================================================
 
@@ -2831,8 +2751,16 @@ pub fn ParseInterBMotionInfoCabac(
             pSubPartCount[i] = g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iPartCount;
             pPartW[i] = g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iPartWidth;
 
-            // 7.3.5
-            if pSubPartCount[i] > 1 {
+            // ITU-T H.264 7.3.5 / 7.3.5.2: clear `noSubMbPartSizeLessThan8x8Flag` when
+            // a sub-macroblock has more than one partition or is `B_Direct_8x8` with
+            // `direct_8x8_inference_flag == 0`. Departs from upstream
+            // `parse_mb_syn_cabac.cpp:915`.
+            if pSubPartCount[i] > 1
+                || (IS_DIRECT(g_ksInterBSubMbTypeInfo[uiSubMbType as usize].iType)
+                    && !pCtx
+                        .active_sps()
+                        .is_some_and(|sps| sps.bDirect8x8InferenceFlag))
+            {
                 *pCurDqLayer
                     .grid
                     .no_sub_mb_part_size_less_than8x8_flag
@@ -3633,11 +3561,8 @@ pub fn ParseResidualBlockCabac(
     let mut iResProp = iResProperty;
     GetMbResProperty(&mut iMbResProperty, &mut iResProp, false);
 
-    let pDeQuantMul: &[u16] = if pCtx.bUseScalingList {
-        &pCtx.pDequant_coeff_buffer4x4[iMbResProperty as usize][uiQp as usize][..]
-    } else {
-        &g_kuiDequantCoeff[uiQp as usize][..]
-    };
+    let custom_dequant = &pCtx.pDequant_coeff_buffer4x4[iMbResProperty as usize][uiQp as usize];
+    let default_dequant = &g_kuiDequantCoeff[uiQp as usize];
 
     let mut err = ParseCbfInfoCabac(
         pNeighAvail,
@@ -3672,30 +3597,27 @@ pub fn ParseResidualBlockCabac(
     }
 
     if iResProp == I16_LUMA_DC {
+        let mut dc = [0i32; 16];
         for j in 0..16 {
             let scan_idx = pScanTable[j] as usize;
-            sTCoeff[scan_idx] = pSignificantMap[j] as i16;
+            dc[scan_idx >> 4] = pSignificantMap[j];
         }
-        WelsLumaDcDequantIdct(sTCoeff, uiQp as i32, pCtx);
+        super::parse_mb_syn_cavlc::WelsLumaDcDequantIdct(&dc, sTCoeff, uiQp, pCtx);
     } else if iResProp == CHROMA_DC_U || iResProp == CHROMA_DC_V {
+        let mut dc = [0i32; 4];
         for j in 0..4 {
             let scan_idx = pScanTable[j] as usize;
-            sTCoeff[scan_idx] = pSignificantMap[j] as i16;
+            dc[scan_idx >> 4] = pSignificantMap[j];
         }
-        WelsChromaDcIdct(sTCoeff);
-        let dequant_mul0 = pDeQuantMul[0] as i64;
-        if !pCtx.bUseScalingList {
-            for j in 0..4 {
-                let scan_idx = pScanTable[j] as usize;
-                let val = sTCoeff[scan_idx] as i64;
-                sTCoeff[scan_idx] = ((val * dequant_mul0) >> 1) as i16;
-            }
+        let h = super::parse_mb_syn_cavlc::WelsChromaDcIdct(&dc);
+        let (dequant_mul0, shift) = if !pCtx.bUseScalingList {
+            (default_dequant[0] as i64, 1)
         } else {
-            for j in 0..4 {
-                let scan_idx = pScanTable[j] as usize;
-                let val = sTCoeff[scan_idx] as i64;
-                sTCoeff[scan_idx] = ((val * dequant_mul0) >> 5) as i16;
-            }
+            (custom_dequant[0] as i64, 5)
+        };
+        for j in 0..4 {
+            let scan_idx = pScanTable[j] as usize;
+            sTCoeff[scan_idx] = (h[scan_idx >> 4].wrapping_mul(dequant_mul0) >> shift) as i16;
         }
     } else {
         for j in 0..16 {
@@ -3703,10 +3625,10 @@ pub fn ParseResidualBlockCabac(
                 let scan_idx = pScanTable[j] as usize;
                 let sig_val = pSignificantMap[j] as i64;
                 if !pCtx.bUseScalingList {
-                    let mul = pDeQuantMul[scan_idx & 0x07] as i32;
-                    sTCoeff[scan_idx] = pSignificantMap[j].wrapping_mul(mul) as i16;
+                    let mul = default_dequant[scan_idx & 0x07] as i64;
+                    sTCoeff[scan_idx] = (sig_val * mul) as i16;
                 } else {
-                    let mul = pDeQuantMul[scan_idx] as i64;
+                    let mul = custom_dequant[scan_idx] as i64;
                     sTCoeff[scan_idx] = (((sig_val * mul) + 8) >> 4) as i16;
                 }
             }

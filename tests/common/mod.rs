@@ -12,12 +12,18 @@
 // `#[path]`-included into several test crates, each of which uses only some helpers.
 #![allow(dead_code)]
 
+pub mod conformance;
 pub mod frame_gen;
 pub mod sha1;
 
 /// The library's deterministic PRNG, so a seed printed by a unit test replays here.
 #[path = "../../src/safe/prng.rs"]
 pub mod prng;
+#[allow(unused_imports)]
+pub use conformance::{
+    DecodeStreamResult, decode_access_units, decode_access_units_no_delay, decode_bytes_per_nal,
+    split_access_units, test_single_bitstream_asset_ex, update_hash_from_frame,
+};
 #[allow(unused_imports)]
 pub use sha1::Sha1Hasher;
 

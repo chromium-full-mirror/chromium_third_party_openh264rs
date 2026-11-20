@@ -301,9 +301,18 @@ pub struct SWelsDecoderSpsPpsCTX {
     pub iSubSPSInvalidNum: i32,
     pub iSeqId: i32,
     pub iOverwriteFlags: i32,
+    /// Monotonic counter bumped whenever an SPS, SubsetSPS, or PPS slot in
+    /// `sSpsBuffer` / `sSubsetSpsBuffer` / `sPpsBuffer` is written or reset, so
+    /// cached dequantization tables invalidate even when a parameter set is
+    /// replaced under the same id.
+    pub uiParamSetGeneration: u64,
 }
 
 impl SWelsDecoderSpsPpsCTX {
+    #[inline]
+    pub fn bump_generation(&mut self) {
+        self.uiParamSetGeneration = self.uiParamSetGeneration.wrapping_add(1);
+    }
     /// The all-zero parameter-set context, distinct from
     /// [`SWelsDecoderSpsPpsCTX::default`], where `bAvcBasedFlag` is `true` and the
     /// five `i*LastInvalidId`/`iSeqId` fields are `-1`.
@@ -333,6 +342,7 @@ impl SWelsDecoderSpsPpsCTX {
             iSubSPSInvalidNum: 0,
             iSeqId: 0,
             iOverwriteFlags: 0,
+            uiParamSetGeneration: 0,
         }
     }
 }
@@ -364,6 +374,7 @@ impl Default for SWelsDecoderSpsPpsCTX {
             iSubSPSInvalidNum: 0,
             iSeqId: -1,
             iOverwriteFlags: 0,
+            uiParamSetGeneration: 0,
         }
     }
 }
@@ -424,6 +435,23 @@ pub struct SWelsLastDecPicInfo {
     pub sLastSliceHeader: SSliceHeader,
     pub iPrevPicOrderCntMsb: i32,
     pub iPrevPicOrderCntLsb: i32,
+    /// `FrameNumOffset` of the previous picture in decoding order (8.2.1.2 / 8.2.1.3).
+    pub iPrevFrameNumOffset: i32,
+    /// `frame_num` of the previous picture in decoding order for 8.2.1 (`prevFrameNum`),
+    /// distinct from `iPrevFrameNum` (`PrevRefFrameNum`, updated only on reference pictures).
+    pub iPrevPocFrameNum: i32,
+    /// Current picture's derived 8.2.1 POC values, committed to `prev*` after picture decode.
+    pub iCurPicOrderCntMsb: i32,
+    pub iCurTopFieldOrderCnt: i32,
+    pub iCurBottomFieldOrderCnt: i32,
+    pub iCurFrameNumOffset: i32,
+    pub iCurFramePoc: i32,
+    pub iCurPicFrameNum: i32,
+    pub iCurPicRawPocLsb: i32,
+    pub uiCurPicNalRefIdc: u8,
+    pub bCurPicIsIdr: bool,
+    pub bPrevRefHasMmco5: bool,
+    pub bPrevPicHasMmco5: bool,
     /// The last picture handed to the DPB, as a slot handle — always `pDec` at the
     /// moment of the write.
     pub pPreviousDecodedPictureInDpb: Option<PicId>,
@@ -439,6 +467,19 @@ impl Default for SWelsLastDecPicInfo {
             sLastSliceHeader: SSliceHeader::default(),
             iPrevPicOrderCntMsb: 0,
             iPrevPicOrderCntLsb: 0,
+            iPrevFrameNumOffset: 0,
+            iPrevPocFrameNum: 0,
+            iCurPicOrderCntMsb: 0,
+            iCurTopFieldOrderCnt: 0,
+            iCurBottomFieldOrderCnt: 0,
+            iCurFrameNumOffset: 0,
+            iCurFramePoc: 0,
+            iCurPicFrameNum: 0,
+            iCurPicRawPocLsb: 0,
+            uiCurPicNalRefIdc: 0,
+            bCurPicIsIdr: false,
+            bPrevRefHasMmco5: false,
+            bPrevPicHasMmco5: false,
             pPreviousDecodedPictureInDpb: None,
             iPrevFrameNum: -1,
             bLastHasMmco5: false,
@@ -927,7 +968,7 @@ pub struct SliceCtx<'a> {
     /// `pCtx->pVlcTable` resolved. The table is filled once by `InitVlcTable` and
     /// never written again.
     pub pVlcTable: &'a SVlcTable,
-    pub pDequant_coeff_buffer4x4: &'a [[[u16; 16]; 52]; 6],
+    pub pDequant_coeff_buffer4x4: &'a [[[u32; 16]; 52]; 6],
     pub pDequant_coeff_buffer8x8: &'a [[[u16; 64]; 52]; 6],
     pub pGetI16x16LumaPredFunc: &'a [PGetIntraPredFunc; 7],
     pub pGetI4x4LumaPredFunc: &'a [PGetIntraPredFunc; 14],
@@ -1288,9 +1329,13 @@ pub struct SWelsDecoderContext {
     pub pECRefPic: [Option<PicId>; 16],
     pub uiTimeStamp: u64,
     pub uiDecodingTimeStamp: u32,
-    pub pDequant_coeff_buffer4x4: Box<[[[u16; 16]; 52]; 6]>,
+    /// ITU-T H.264 8.5.9 / 8.5.12.1: `scaling_list (<= 255) * level_scale (<= 5888)`
+    /// reaches 1,501,440 (21 bits), so this table uses `u32` rather than upstream's
+    /// `uint16_t` (`decoder_context.h:506`).
+    pub pDequant_coeff_buffer4x4: Box<[[[u32; 16]; 52]; 6]>,
     pub pDequant_coeff_buffer8x8: Box<[[[u16; 64]; 52]; 6]>,
     pub iDequantCoeffPpsid: i32,
+    pub dequant_cache_key: Option<(u64, i32, Option<SpsRef>)>,
     pub bDequantCoeff4x4Init: bool,
     pub bUseScalingList: bool,
     pub lastReadyHeightOffset: [[i16; MAX_REF_PIC_COUNT]; LIST_A],
@@ -1417,6 +1462,7 @@ impl Default for SWelsDecoderContext {
             pDequant_coeff_buffer4x4: boxed_array([[0; 16]; 52]),
             pDequant_coeff_buffer8x8: boxed_array([[0; 64]; 52]),
             iDequantCoeffPpsid: 0,
+            dequant_cache_key: None,
             // `WelsCalcDeqCoeffScalingList` writes both buffers and this flag
             // together.
             bDequantCoeff4x4Init: false,
