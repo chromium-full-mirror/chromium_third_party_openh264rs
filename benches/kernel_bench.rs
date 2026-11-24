@@ -36,7 +36,6 @@ use openh264rs::decoder::get_intra_predictor as dpred;
 use openh264rs::encoder::decode_mb_aux as dec_aux;
 use openh264rs::encoder::encode_mb_aux as enc_aux;
 use openh264rs::encoder::get_intra_predictor as ipred;
-use openh264rs::encoder::rec_view::RecCursor;
 use openh264rs::encoder::sample as satd_ref;
 use openh264rs::processing::vaacalc as vaa_ref;
 use openh264rs::safe::plane::{PaddedPlane, PlaneCursor, PlaneCursorMut};
@@ -666,157 +665,62 @@ fn mc_rows(rows: &mut Vec<Row>) {
             out_sum(&s1.out, c)
         }
     );
-    // The same two over the shared cell view, the operand the encoder hands them: the
-    // reference picture is reached through the reconstruction seam, and a cell row
-    // cannot be lent as `&[u8]`. The rows above read a plain slice plane and are the
-    // cheaper half of the pair.
+    // The refinement shapes: `MeRefineFracPixel` runs the two half-pel filters at
+    // `kiW + 1` by `kiH` and `kiW` by `kiH + 1` out of the reference picture, and
+    // averages the quarter-pel candidates against a block of it.
     row!(
         *rows,
-        "mc luma (0,0) 16x16 cells",
+        "mc hor_ver20 17x16",
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
-            mc::mc_luma_c(
-                &a,
-                &mut cur_mut(&mut s0.out),
-                black_box(0),
-                black_box(0),
-                16,
-                16,
-            );
-            out_sum(&s0.out, c)
-        },
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
-            isa::mc::mc_luma(
-                &a,
-                &mut cur_mut(&mut s1.out),
-                black_box(0),
-                black_box(0),
-                16,
-                16,
-            );
-            out_sum(&s1.out, c)
-        }
-    );
-    // The refinement shapes, over the shared cell view: `MeRefineFracPixel` runs the
-    // two half-pel filters at `kiW + 1` by `kiH` and `kiW` by `kiH + 1` out of the
-    // reference picture, and averages the quarter-pel candidates against a block of
-    // it. The plain-plane rows above are the decoder's shapes.
-    row!(
-        *rows,
-        "mc hor_ver20 17x16 cells",
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s0.a));
             mc::mc_hor_ver20_c(&a, &mut cur_mut(&mut s0.out), 17, 16);
             out_sum(&s0.out, c)
         },
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s1.a));
             isa::mc::mc_hor_ver20(&a, &mut cur_mut(&mut s1.out), 17, 16);
             out_sum(&s1.out, c)
         }
     );
     row!(
         *rows,
-        "mc hor_ver02 16x17 cells",
+        "mc hor_ver02 16x17",
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s0.a));
             mc::mc_hor_ver02_c(&a, &mut cur_mut(&mut s0.out), 16, 17);
             out_sum(&s0.out, c)
         },
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s1.a));
             isa::mc::mc_hor_ver02(&a, &mut cur_mut(&mut s1.out), 16, 17);
             out_sum(&s1.out, c)
         }
     );
     row!(
         *rows,
-        "mc hor_ver22 17x17 cells",
+        "mc hor_ver22 17x17",
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s0.a));
             mc::mc_hor_ver22_c(&a, &mut cur_mut(&mut s0.out), 17, 17);
             out_sum(&s0.out, c)
         },
         |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
+            let a = cur(black_box(&s1.a));
             isa::mc::mc_hor_ver22(&a, &mut cur_mut(&mut s1.out), 17, 17);
             out_sum(&s1.out, c)
         }
     );
     row!(
         *rows,
-        "mc pixel_avg 16x16 cells",
+        "mc pixel_avg 16x16",
         |c| {
-            let (a, b) = (
-                cur(black_box(&s0.b)),
-                RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE),
-            );
+            let (a, b) = (cur(black_box(&s0.b)), cur(black_box(&s0.a)));
             mc::pixel_avg_c(&mut cur_mut(&mut s0.out), &a, &b, 16, 16);
             out_sum(&s0.out, c)
         },
         |c| {
-            let (a, b) = (
-                cur(black_box(&s1.b)),
-                RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE),
-            );
+            let (a, b) = (cur(black_box(&s1.b)), cur(black_box(&s1.a)));
             isa::mc::pixel_avg(&mut cur_mut(&mut s1.out), &a, &b, 16, 16);
-            out_sum(&s1.out, c)
-        }
-    );
-    row!(
-        *rows,
-        "mc chroma (3,5) 8x8 cells",
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
-            mc::mc_chroma_c(
-                &a,
-                &mut cur_mut(&mut s0.out),
-                black_box(3),
-                black_box(5),
-                8,
-                8,
-            );
-            out_sum(&s0.out, c)
-        },
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
-            isa::mc::mc_chroma(
-                &a,
-                &mut cur_mut(&mut s1.out),
-                black_box(3),
-                black_box(5),
-                8,
-                8,
-            );
-            out_sum(&s1.out, c)
-        }
-    );
-    row!(
-        *rows,
-        "mc chroma (0,0) 8x8 cells",
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s0.a), ANCHOR, STRIDE);
-            mc::mc_chroma_c(
-                &a,
-                &mut cur_mut(&mut s0.out),
-                black_box(0),
-                black_box(0),
-                8,
-                8,
-            );
-            out_sum(&s0.out, c)
-        },
-        |c| {
-            let a = RecCursor::over_owned(black_box(&mut s1.a), ANCHOR, STRIDE);
-            isa::mc::mc_chroma(
-                &a,
-                &mut cur_mut(&mut s1.out),
-                black_box(0),
-                black_box(0),
-                8,
-                8,
-            );
             out_sum(&s1.out, c)
         }
     );
@@ -1121,27 +1025,27 @@ fn quant_rows(rows: &mut Vec<Row>) {
 fn copy_rows(rows: &mut Vec<Row>) {
     let src = noise(STRIDE * ROWS, 21);
     let mut d0 = vec![0u8; STRIDE * ROWS];
-    let mut s0 = src.clone();
+    let s0 = src.clone();
     let mut d1 = vec![0u8; STRIDE * ROWS];
-    let mut s1 = src.clone();
+    let s1 = src.clone();
     let sum = |d: &[u8], c: bool| if c { fnv(d) } else { d[ANCHOR] as u64 };
     row!(
         *rows,
         "copy 16x16",
         |c| {
-            let (d, s) = (
-                RecCursor::over_owned(&mut d0, ANCHOR, STRIDE),
-                RecCursor::over_owned(black_box(&mut s0), ANCHOR, STRIDE),
+            let (mut d, s) = (
+                PlaneCursorMut::new(&mut d0, ANCHOR, STRIDE),
+                PlaneCursor::new(black_box(&s0), ANCHOR, STRIDE),
             );
-            enc_aux::WelsCopy16x16_c(&d, &s);
+            enc_aux::WelsCopy16x16_c(&mut d, &s);
             sum(&d0, c)
         },
         |c| {
-            let (d, s) = (
-                RecCursor::over_owned(&mut d1, ANCHOR, STRIDE),
-                RecCursor::over_owned(black_box(&mut s1), ANCHOR, STRIDE),
+            let (mut d, s) = (
+                PlaneCursorMut::new(&mut d1, ANCHOR, STRIDE),
+                PlaneCursor::new(black_box(&s1), ANCHOR, STRIDE),
             );
-            isa::copy::copy_16x16(&d, &s);
+            isa::copy::copy_16x16(&mut d, &s);
             sum(&d1, c)
         }
     );
@@ -1149,36 +1053,36 @@ fn copy_rows(rows: &mut Vec<Row>) {
         *rows,
         "copy 8x8",
         |c| {
-            let (d, s) = (
-                RecCursor::over_owned(&mut d0, ANCHOR, STRIDE),
-                RecCursor::over_owned(black_box(&mut s0), ANCHOR, STRIDE),
+            let (mut d, s) = (
+                PlaneCursorMut::new(&mut d0, ANCHOR, STRIDE),
+                PlaneCursor::new(black_box(&s0), ANCHOR, STRIDE),
             );
-            enc_aux::WelsCopy8x8_c(&d, &s);
+            enc_aux::WelsCopy8x8_c(&mut d, &s);
             sum(&d0, c)
         },
         |c| {
-            let (d, s) = (
-                RecCursor::over_owned(&mut d1, ANCHOR, STRIDE),
-                RecCursor::over_owned(black_box(&mut s1), ANCHOR, STRIDE),
+            let (mut d, s) = (
+                PlaneCursorMut::new(&mut d1, ANCHOR, STRIDE),
+                PlaneCursor::new(black_box(&s1), ANCHOR, STRIDE),
             );
-            isa::copy::copy_8x8(&d, &s);
+            isa::copy::copy_8x8(&mut d, &s);
             sum(&d1, c)
         }
     );
 }
 
 fn intra_rows(rows: &mut Vec<Row>) {
-    let mut plane = noise(STRIDE * ROWS, 31);
-    let mut plane_enc = noise(STRIDE * ROWS, 42);
-    let rec = RecCursor::over_owned(&mut plane, ANCHOR, STRIDE);
-    let enc = RecCursor::over_owned(&mut plane_enc, ANCHOR, STRIDE);
+    let plane = noise(STRIDE * ROWS, 31);
+    let plane_enc = noise(STRIDE * ROWS, 42);
+    let rec = PlaneCursor::new(&plane, ANCHOR, STRIDE);
+    let enc = PlaneCursor::new(&plane_enc, ANCHOR, STRIDE);
     let s256 = |p: &[u8; 256], c: bool| if c { fnv(p) } else { p[0] as u64 };
     let s64 = |p: &[u8; 64], c: bool| if c { fnv(p) } else { p[0] as u64 };
     let s16 = |p: &[u8; 16], c: bool| if c { fnv(p) } else { p[0] as u64 };
 
     let scalar_combined3_sad = |pred: &mut [u8; 256],
-                                rec: &RecCursor<'_>,
-                                enc: &RecCursor<'_>,
+                                rec: &PlaneCursor<'_>,
+                                enc: &PlaneCursor<'_>,
                                 lambda: i32|
      -> (u8, i32) {
         let mut pred_v = [0u8; 256];
@@ -1188,9 +1092,9 @@ fn intra_rows(rows: &mut Vec<Row>) {
         ipred::WelsI16x16LumaPredH_c(&mut pred_h, rec);
         ipred::WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
 
-        let sad_v = sample_sad::<16, 16, _>(&RecCursor::over_owned(&mut pred_v, 0, 16), enc);
-        let sad_h = sample_sad::<16, 16, _>(&RecCursor::over_owned(&mut pred_h, 0, 16), enc);
-        let sad_dc = sample_sad::<16, 16, _>(&RecCursor::over_owned(&mut pred_dc, 0, 16), enc);
+        let sad_v = sample_sad::<16, 16, _>(&PlaneCursor::new(&pred_v, 0, 16), enc);
+        let sad_h = sample_sad::<16, 16, _>(&PlaneCursor::new(&pred_h, 0, 16), enc);
+        let sad_dc = sample_sad::<16, 16, _>(&PlaneCursor::new(&pred_dc, 0, 16), enc);
 
         let cost_v = sad_v + lambda * 1;
         let cost_h = sad_h + lambda * 3;
@@ -1213,14 +1117,14 @@ fn intra_rows(rows: &mut Vec<Row>) {
         (best_mode, best_cost)
     };
 
-    let mut plane_cr = noise(STRIDE * ROWS, 53);
-    let mut plane_enc_cr = noise(STRIDE * ROWS, 67);
-    let rec_cr = RecCursor::over_owned(&mut plane_cr, ANCHOR, STRIDE);
-    let enc_cr = RecCursor::over_owned(&mut plane_enc_cr, ANCHOR, STRIDE);
+    let plane_cr = noise(STRIDE * ROWS, 53);
+    let plane_enc_cr = noise(STRIDE * ROWS, 67);
+    let rec_cr = PlaneCursor::new(&plane_cr, ANCHOR, STRIDE);
+    let enc_cr = PlaneCursor::new(&plane_enc_cr, ANCHOR, STRIDE);
 
     let scalar_16x16_combined3_satd = |pred: &mut [u8; 256],
-                                       rec: &RecCursor<'_>,
-                                       enc: &RecCursor<'_>,
+                                       rec: &PlaneCursor<'_>,
+                                       enc: &PlaneCursor<'_>,
                                        lambda: i32|
      -> (u8, i32) {
         let mut pred_v = [0u8; 256];
@@ -1229,11 +1133,9 @@ fn intra_rows(rows: &mut Vec<Row>) {
         ipred::WelsI16x16LumaPredV_c(&mut pred_v, rec);
         ipred::WelsI16x16LumaPredH_c(&mut pred_h, rec);
         ipred::WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
-        let cost_v = satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_v, 0, 16), enc) + lambda;
-        let cost_h =
-            satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_h, 0, 16), enc) + lambda * 3;
-        let cost_dc =
-            satd_ref::satd_16x16(&RecCursor::over_owned(&mut pred_dc, 0, 16), enc) + lambda * 3;
+        let cost_v = satd_ref::satd_16x16(&PlaneCursor::new(&pred_v, 0, 16), enc) + lambda;
+        let cost_h = satd_ref::satd_16x16(&PlaneCursor::new(&pred_h, 0, 16), enc) + lambda * 3;
+        let cost_dc = satd_ref::satd_16x16(&PlaneCursor::new(&pred_dc, 0, 16), enc) + lambda * 3;
         if cost_dc < cost_h && cost_dc < cost_v {
             *pred = pred_dc;
             (2, cost_dc)
@@ -1247,8 +1149,8 @@ fn intra_rows(rows: &mut Vec<Row>) {
     };
 
     let scalar_4x4_combined3_satd = |pred: &mut [u8; 16],
-                                     rec: &RecCursor<'_>,
-                                     enc: &RecCursor<'_>,
+                                     rec: &PlaneCursor<'_>,
+                                     enc: &PlaneCursor<'_>,
                                      ldc: i32,
                                      lh: i32,
                                      lv: i32|
@@ -1259,9 +1161,9 @@ fn intra_rows(rows: &mut Vec<Row>) {
         ipred::WelsI4x4LumaPredDc_c(&mut pdc, rec);
         ipred::WelsI4x4LumaPredH_c(&mut ph, rec);
         ipred::WelsI4x4LumaPredV_c(&mut pv, rec);
-        let cdc = satd_ref::satd_4x4(&RecCursor::over_owned(&mut pdc, 0, 4), enc) + ldc;
-        let ch = satd_ref::satd_4x4(&RecCursor::over_owned(&mut ph, 0, 4), enc) + lh;
-        let cv = satd_ref::satd_4x4(&RecCursor::over_owned(&mut pv, 0, 4), enc) + lv;
+        let cdc = satd_ref::satd_4x4(&PlaneCursor::new(&pdc, 0, 4), enc) + ldc;
+        let ch = satd_ref::satd_4x4(&PlaneCursor::new(&ph, 0, 4), enc) + lh;
+        let cv = satd_ref::satd_4x4(&PlaneCursor::new(&pv, 0, 4), enc) + lv;
         if cdc <= ch && cdc <= cv {
             *pred = pdc;
             (2, cdc)
@@ -1275,10 +1177,10 @@ fn intra_rows(rows: &mut Vec<Row>) {
     };
 
     let scalar_chroma_combined3 = |pred: &mut [u8; 128],
-                                   rec_cb: &RecCursor<'_>,
-                                   enc_cb: &RecCursor<'_>,
-                                   rec_cr: &RecCursor<'_>,
-                                   enc_cr: &RecCursor<'_>,
+                                   rec_cb: &PlaneCursor<'_>,
+                                   enc_cb: &PlaneCursor<'_>,
+                                   rec_cr: &PlaneCursor<'_>,
+                                   enc_cr: &PlaneCursor<'_>,
                                    lambda: i32,
                                    use_satd: bool|
      -> (u8, i32) {
@@ -1301,8 +1203,8 @@ fn intra_rows(rows: &mut Vec<Row>) {
                     ipred::WelsIChromaPredDc_c(&mut cr, rec_cr);
                 }
             }
-            let c1 = RecCursor::over_owned(&mut cb, 0, 8);
-            let c2 = RecCursor::over_owned(&mut cr, 0, 8);
+            let c1 = PlaneCursor::new(&cb, 0, 8);
+            let c2 = PlaneCursor::new(&cr, 0, 8);
             let dist = if use_satd {
                 satd_ref::satd_8x8(&c1, enc_cb) + satd_ref::satd_8x8(&c2, enc_cr)
             } else {

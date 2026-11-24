@@ -64,6 +64,9 @@ struct EncodeCase {
     loop_filter_idc: i32,
     frame_skip: bool,
     slice_mode: SliceModeEnum,
+    threads: Option<u16>,
+    slice_num: Option<u32>,
+    raster_mb_counts: &'static [u32],
     denoise: bool,
     spatial_layers: i32,
     lossless: bool,
@@ -89,6 +92,9 @@ impl Default for EncodeCase {
             loop_filter_idc: 0,
             frame_skip: false,
             slice_mode: SM_SINGLE_SLICE,
+            threads: None,
+            slice_num: None,
+            raster_mb_counts: &[],
             denoise: false,
             spatial_layers: 1,
             lossless: false,
@@ -279,6 +285,79 @@ encoder_sha1_cases! {
         ltr: true,
         ..EncodeCase::ext()
     },
+
+    // --- Multithreaded MB-row slicing C++ bit-exact parity cases ---
+    // Single-threaded 720p size-limited slicing: single partition, must stay bit-exact.
+    camera_1280x720_szlim_1t => EncodeCase {
+        slice_mode: SM_SIZELIMITED_SLICE,
+        threads: Some(1),
+        ..EncodeCase::hd_720p()
+    },
+    // 720p (80x45 MBs) with 3 threads: 45 % 3 == 0 -> [15, 15, 15] rows == C++ [1200; 3] MBs.
+    camera_1280x720_szlim_3t => EncodeCase {
+        slice_mode: SM_SIZELIMITED_SLICE,
+        threads: Some(3),
+        ..EncodeCase::hd_720p()
+    },
+    // 1280x704 (80x44 MBs) with 4 threads, CABAC: 44 % 4 == 0 -> [11; 4] rows == C++ [880; 4] MBs.
+    camera_1280x704_cabac_szlim_4t => EncodeCase {
+        h: 704,
+        slice_mode: SM_SIZELIMITED_SLICE,
+        cabac: true,
+        threads: Some(4),
+        ..EncodeCase::hd_720p()
+    },
+    // 1280x704 (80x44 MBs) with 4 threads, screen content: 44 % 4 == 0 -> bit-exact with C++.
+    screen_1280x704_szlim_4t => EncodeCase {
+        usage: SCREEN_CONTENT_REAL_TIME,
+        h: 704,
+        slice_mode: SM_SIZELIMITED_SLICE,
+        threads: Some(4),
+        ..EncodeCase::hd_720p()
+    },
+    // Custom mid-row `SM_RASTER_SLICE` at 4 threads: 5 slices of 48 MBs on 20x12 (every
+    // boundary mid-row) exercises the 2-wave alternating schedule while staying C++ bit-exact.
+    camera_320x192_raster_midrow_4t => EncodeCase {
+        rc_mode: RC_OFF_MODE,
+        loop_filter_idc: 2,
+        slice_mode: SM_RASTER_SLICE,
+        threads: Some(4),
+        raster_mb_counts: &[48, 48, 48, 48, 48],
+        ..EncodeCase::ext()
+    },
+    // `RC_OFF_MODE` `SM_FIXEDSLCNUM_SLICE` (5 slices on 20x12 -> row-aligned [60,60,40,40,40])
+    // at 4 threads.
+    camera_320x192_fixed_midrow_4t => EncodeCase {
+        rc_mode: RC_OFF_MODE,
+        loop_filter_idc: 2,
+        slice_mode: SM_FIXEDSLCNUM_SLICE,
+        threads: Some(4),
+        slice_num: Some(5),
+        ..EncodeCase::ext()
+    },
+    // 8 fixed slices across 4 threads (2 contiguous slices per worker vs C++ round-robin).
+    camera_1280x720_fixed8_4t => EncodeCase {
+        frames: 5,
+        w: 1280,
+        h: 720,
+        fps: 30.0,
+        bitrate: 5_000_000,
+        loop_filter_idc: 2,
+        slice_mode: SM_FIXEDSLCNUM_SLICE,
+        threads: Some(4),
+        slice_num: Some(8),
+        ..EncodeCase::ext()
+    },
+    // Static/moving scene in camera mode at 4 threads: exercises parallel BGD
+    // (`VaaBackgroundMbDataUpdate`) + parallel deblocking (`iLoopFilterDisableIdc = 2`).
+    static_320x192_bgd_mt4 => EncodeCase {
+        use_screen_gen: true,
+        loop_filter_idc: 2,
+        slice_mode: SM_FIXEDSLCNUM_SLICE,
+        threads: Some(4),
+        slice_num: Some(4),
+        ..EncodeCase::ext()
+    },
 }
 
 fn sha1_file_path() -> PathBuf {
@@ -350,13 +429,23 @@ fn build_ext_param_for_case(mut param: SEncParamExt, c: &EncodeCase) -> SEncPara
                 if c.slice_mode == SM_SIZELIMITED_SLICE {
                     param.sSpatialLayers[i].sSliceArgument.uiSliceSizeConstraint = 600;
                     param.uiMaxNalSize = 1500;
-                    param.iMultipleThreadIdc = 4;
+                    param.iMultipleThreadIdc = c.threads.unwrap_or(4);
                     param.bUseLoadBalancing = false;
                 }
                 if c.slice_mode == SM_FIXEDSLCNUM_SLICE {
-                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum = 4;
-                    param.iMultipleThreadIdc = 4;
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum = c.slice_num.unwrap_or(4);
+                    param.iMultipleThreadIdc = c.threads.unwrap_or(4);
                     param.bUseLoadBalancing = false;
+                }
+                if !c.raster_mb_counts.is_empty() {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum =
+                        c.raster_mb_counts.len() as u32;
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceMbNum
+                        [..c.raster_mb_counts.len()]
+                        .copy_from_slice(c.raster_mb_counts);
+                }
+                if let Some(t) = c.threads {
+                    param.iMultipleThreadIdc = t;
                 }
                 if param.iEntropyCodingModeFlag != 0 {
                     param.sSpatialLayers[i].uiProfileIdc = PRO_MAIN;
@@ -389,10 +478,27 @@ fn build_ext_param_for_case(mut param: SEncParamExt, c: &EncodeCase) -> SEncPara
                 param.sSpatialLayers[i].iSpatialBitrate = c.bitrate;
                 param.sSpatialLayers[i].iDLayerQp = 24;
                 param.sSpatialLayers[i].sSliceArgument.uiSliceMode = c.slice_mode;
-                if c.slice_mode == SM_FIXEDSLCNUM_SLICE {
-                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum = 4;
-                    param.iMultipleThreadIdc = 4;
+                if c.slice_mode == SM_SIZELIMITED_SLICE {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceSizeConstraint = 600;
+                    param.uiMaxNalSize = 1500;
+                    param.iMultipleThreadIdc = c.threads.unwrap_or(4);
                     param.bUseLoadBalancing = false;
+                }
+                if c.slice_mode == SM_FIXEDSLCNUM_SLICE {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum = c.slice_num.unwrap_or(4);
+                    param.iMultipleThreadIdc = c.threads.unwrap_or(4);
+                    param.bUseLoadBalancing = false;
+                }
+                if !c.raster_mb_counts.is_empty() {
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceNum =
+                        c.raster_mb_counts.len() as u32;
+                    param.sSpatialLayers[i].sSliceArgument.uiSliceMbNum
+                        [..c.raster_mb_counts.len()]
+                        .copy_from_slice(c.raster_mb_counts);
+                    param.bUseLoadBalancing = false;
+                }
+                if let Some(t) = c.threads {
+                    param.iMultipleThreadIdc = t;
                 }
                 if param.iEntropyCodingModeFlag != 0 {
                     param.sSpatialLayers[i].uiProfileIdc = PRO_MAIN;
@@ -406,6 +512,9 @@ fn build_ext_param_for_case(mut param: SEncParamExt, c: &EncodeCase) -> SEncPara
 fn is_base_init_case(c: &EncodeCase) -> bool {
     c.init_style == InitStyle::Upstream
         && c.slice_mode == SM_SINGLE_SLICE
+        && c.threads.is_none()
+        && c.slice_num.is_none()
+        && c.raster_mb_counts.is_empty()
         && !c.denoise
         && c.spatial_layers == 1
         && !c.lossless
@@ -430,7 +539,53 @@ fn init_rust_encoder_for_case(enc: &mut Encoder, c: &EncodeCase) -> i32 {
     }
 }
 
+fn effective_threads(c: &EncodeCase) -> i32 {
+    if let Some(t) = c.threads {
+        return t as i32;
+    }
+    match c.init_style {
+        InitStyle::Upstream => {
+            if c.slice_mode == SM_SIZELIMITED_SLICE || c.slice_mode == SM_FIXEDSLCNUM_SLICE {
+                4
+            } else if c.slice_mode != SM_SINGLE_SLICE {
+                2
+            } else {
+                0
+            }
+        }
+        InitStyle::Ext => {
+            if c.slice_mode == SM_FIXEDSLCNUM_SLICE || c.slice_mode == SM_SIZELIMITED_SLICE {
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Returns `true` for cases whose slice/partition boundaries intentionally align to whole
+/// MB rows rather than C++ OpenH264's mid-row MB splits (`crbug.com/588541102`):
+/// - multithreaded `SM_SIZELIMITED_SLICE` when `mb_height % threads != 0` (e.g., 720p at 4T),
+/// - `RC_OFF_MODE` `SM_FIXEDSLCNUM_SLICE` when `mb_height >= slice_num && mb_height % slice_num != 0`.
+///
+/// For these cases the exact bitstream SHA-1 intentionally differs from C++ OpenH264 while
+/// remaining deterministic, 1T==NT identical (for fixed slices), and H.264-compliant.
+fn is_mb_row_partition_divergent(c: &EncodeCase) -> bool {
+    let t = effective_threads(c);
+    let mb_h = (c.h + 15) / 16;
+    let szlim = c.slice_mode == SM_SIZELIMITED_SLICE && t > 1 && mb_h % t != 0;
+    let fixed_rc_off = c.slice_mode == SM_FIXEDSLCNUM_SLICE && c.rc_mode == RC_OFF_MODE && {
+        let n = c.slice_num.unwrap_or(4) as i32;
+        n > 1 && mb_h >= n && mb_h % n != 0
+    };
+    szlim || fixed_rc_off
+}
+
 fn compute_rust_case_sha1(c: &EncodeCase) -> String {
+    compute_rust_case_sha1_with_decode(c, false)
+}
+
+fn compute_rust_case_sha1_with_decode(c: &EncodeCase, verify_decode: bool) -> String {
     let mut enc = Encoder::new();
     enc.set_trace_level(1); // WELS_LOG_ERROR
 
@@ -440,6 +595,23 @@ fn compute_rust_case_sha1(c: &EncodeCase) -> String {
         "Initialize failed for {}",
         c.name
     );
+
+    let mut dec = if verify_decode {
+        let mut d = Decoder::new();
+        let dp = SDecodingParam {
+            uiTargetDqLayer: u8::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            d.initialize(&dp),
+            CM_RESULT_SUCCESS as std::ffi::c_long,
+            "Decoder init failed for {}",
+            c.name
+        );
+        Some(d)
+    } else {
+        None
+    };
 
     let (w, h) = (c.w as usize, c.h as usize);
     let luma = w * h;
@@ -461,12 +633,33 @@ fn compute_rust_case_sha1(c: &EncodeCase) -> String {
         let rv = enc.encode_frame(&pic, &mut info);
         assert_eq!(rv, CM_RESULT_SUCCESS, "EncodeFrame failed for {}", c.name);
         if info.eFrameType != videoFrameTypeSkip {
+            let mut au = Vec::new();
             for layer in info.layers() {
-                hasher.update(layer.bs_buf(&enc));
+                let bytes = layer.bs_buf(&enc);
+                hasher.update(bytes);
+                if verify_decode {
+                    au.extend_from_slice(bytes);
+                }
+            }
+            if let Some(d) = dec.as_mut() {
+                let mut dec_info = SBufferInfo::default();
+                let st = d.decode_no_delay(Some(&au), &mut dec_info);
+                assert_eq!(
+                    st,
+                    DECODING_STATE::dsErrorFree,
+                    "Decode failed on frame {f} for {}",
+                    c.name
+                );
+                assert_eq!(dec_info.iBufferStatus, 1, "No output frame {f} for {}", c.name);
+                assert_eq!(dec_info.UsrData.sSystemBuffer.iWidth, c.w);
+                assert_eq!(dec_info.UsrData.sSystemBuffer.iHeight, c.h);
             }
         }
     }
 
+    if let Some(mut d) = dec {
+        assert_eq!(d.uninitialize(), CM_RESULT_SUCCESS as std::ffi::c_long);
+    }
     enc.uninitialize();
     hasher.digest()
 }
@@ -480,7 +673,8 @@ fn run_single_case(c: &EncodeCase) {
             path.display()
         )
     });
-    let actual_sha1 = compute_rust_case_sha1(c);
+    let verify_decode = is_mb_row_partition_divergent(c);
+    let actual_sha1 = compute_rust_case_sha1_with_decode(c, verify_decode);
     assert_eq!(
         &actual_sha1,
         expected_sha1,
@@ -488,6 +682,14 @@ fn run_single_case(c: &EncodeCase) {
         c.name,
         path.display()
     );
+    if verify_decode {
+        let second_sha1 = compute_rust_case_sha1(c);
+        assert_eq!(
+            second_sha1, actual_sha1,
+            "non-deterministic multithreaded output for `{}`",
+            c.name
+        );
+    }
 }
 
 #[cfg(feature = "c-api")]
@@ -694,9 +896,18 @@ fn regenerate_sha1_from_cpp_openh264() {
     let mut new_hashes = HashMap::new();
 
     for c in &cases {
-        let cpp_sha1 = compute_case_sha1(&cpp_factory, c);
-        println!("{:<32} C++ SHA-1 = {}", c.name, cpp_sha1);
-        new_hashes.insert(c.name.to_string(), cpp_sha1);
+        if is_mb_row_partition_divergent(c) {
+            let rust_sha1 = compute_rust_case_sha1_with_decode(c, true);
+            println!(
+                "{:<32} Rust SHA-1 = {} (MB-row-aligned MT partition)",
+                c.name, rust_sha1
+            );
+            new_hashes.insert(c.name.to_string(), rust_sha1);
+        } else {
+            let cpp_sha1 = compute_case_sha1(&cpp_factory, c);
+            println!("{:<32} C++ SHA-1 = {}", c.name, cpp_sha1);
+            new_hashes.insert(c.name.to_string(), cpp_sha1);
+        }
     }
 
     unsafe {

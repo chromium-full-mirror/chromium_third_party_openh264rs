@@ -7,12 +7,9 @@
 
 use crate::decoder::decode_mb_aux::idct_res_add_pred_c;
 use crate::encoder::decode_mb_aux::{
-    idct_four_t4_rec_c, idct_four_t4_rec_in_place_c, idct_four_t4_rec_in_place_view_c,
-    idct_four_t4_rec_to_view_c, idct_rec_i16x16_dc_c, idct_rec_i16x16_dc_to_view_c, idct_t4_rec_c,
-    idct_t4_rec_in_place_c, idct_t4_rec_in_place_view_c, idct_t4_rec_on_mb_in_place_view_c,
-    idct_t4_rec_to_view_c,
+    idct_four_t4_rec_c, idct_four_t4_rec_in_place_c, idct_rec_i16x16_dc_c, idct_t4_rec_c,
+    idct_t4_rec_in_place_c, idct_t4_rec_on_mb_in_place_c,
 };
-use crate::encoder::rec_view::RecCursor;
 use crate::safe::plane::{PlaneCursor, PlaneCursorMut, SampleCursor};
 
 #[inline(always)]
@@ -51,46 +48,11 @@ pub fn idct_four_t4_rec_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 64]) 
 }
 
 #[inline(always)]
-pub fn idct_t4_rec_to_view(rec: &RecCursor<'_>, pred: &[u8], pred_stride: usize, dct: &[i16; 16]) {
-    idct_t4_rec_to_view_c(rec, pred, pred_stride, dct)
-}
-
-#[inline(always)]
-pub fn idct_four_t4_rec_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 64],
-) {
-    idct_four_t4_rec_to_view_c(rec, pred, pred_stride, dct)
-}
-
-#[inline(always)]
-pub fn idct_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    idct_t4_rec_in_place_view_c(rec, dct)
-}
-
-#[inline(always)]
-pub fn idct_four_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    idct_four_t4_rec_in_place_view_c(rec, dct)
-}
-
-#[inline(always)]
-pub fn idct_t4_rec_on_mb_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 256]) {
-    idct_t4_rec_on_mb_in_place_view_c(rec, dct)
+pub fn idct_t4_rec_on_mb_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 256]) {
+    idct_t4_rec_on_mb_in_place_c(rec, dct)
 }
 
 #[inline(always)]
 pub fn idct_rec_i16x16_dc(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dc: &[i16; 16]) {
     idct_rec_i16x16_dc_c(rec, pred, dc)
-}
-
-#[inline(always)]
-pub fn idct_rec_i16x16_dc_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dc: &[i16; 16],
-) {
-    idct_rec_i16x16_dc_to_view_c(rec, pred, pred_stride, dc)
 }

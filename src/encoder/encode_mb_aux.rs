@@ -74,22 +74,10 @@ pub const KI_TRUN_TABLE: [i32; 16] = [3, 2, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 
 // ============================================================================
 
 /// The fixed-shape block-copy slot.
-///
-/// Both operands are `RecCursor` because the slot's two callers disagree
-/// about storage: the background path copies picture-to-picture, while the
-/// mode-decision path copies an owned prediction scratch into a picture plane. A
-/// function-pointer table cannot be generic, so the scratch reaches the same type
-/// through `RecCursor::over_owned`.
-pub type PCopyFunc = fn(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-);
+pub type PCopyFunc = fn(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>);
 /// The forward-DCT slot.
-pub type PDctFunc = fn(
-    pDct: &mut [i16],
-    pSample1: &crate::encoder::rec_view::RecCursor<'_>,
-    pSample2: &crate::encoder::rec_view::RecCursor<'_>,
-);
+pub type PDctFunc =
+    fn(pDct: &mut [i16], pSample1: &PlaneCursor<'_>, pSample2: &PlaneCursor<'_>);
 
 // The odd lengths below are the reach, not the block: `hadamard_quant_2x2` and
 // its `Skip` twin read `rs[0]`, `rs[16]`, `rs[32]`, `rs[48]` — so their span is
@@ -188,7 +176,7 @@ pub fn hadamard_dc_span(a: &[i16], off: usize) -> &[i16; 241] {
 // `-stride` row. The DCT and Hadamard intermediates are `i32` and stay far inside it
 // on every in-contract input, so none of these kernels can panic in a debug build.
 
-use crate::safe::plane::SampleCursor;
+use crate::safe::plane::{PlaneCursor, PlaneCursorMut, SampleCursor};
 
 /// The kernel set the dispatch sites below call: `simd::x86_64` or `simd::aarch64` by
 /// default, `simd::scalar` under `--features scalar` or on a target with neither. These
@@ -525,8 +513,8 @@ pub fn get_none_zero_count(level: &[i16; 16]) -> i32 {
 #[inline]
 pub fn WelsDctT4_c(
     pDct: &mut [i16],
-    pPixel1: &crate::encoder::rec_view::RecCursor<'_>,
-    pPixel2: &crate::encoder::rec_view::RecCursor<'_>,
+    pPixel1: &PlaneCursor<'_>,
+    pPixel2: &PlaneCursor<'_>,
 ) {
     let Some(dct) = pDct.first_chunk_mut::<16>() else {
         return;
@@ -544,8 +532,8 @@ pub fn WelsDctT4_c(
 #[inline]
 pub fn WelsDctFourT4_c(
     pDct: &mut [i16],
-    pPixel1: &crate::encoder::rec_view::RecCursor<'_>,
-    pPixel2: &crate::encoder::rec_view::RecCursor<'_>,
+    pPixel1: &PlaneCursor<'_>,
+    pPixel2: &PlaneCursor<'_>,
 ) {
     let Some(dct) = pDct.first_chunk_mut::<64>() else {
         return;
@@ -556,8 +544,8 @@ pub fn WelsDctFourT4_c(
 #[inline(always)]
 pub fn WelsDctT4_sse2(
     pDct: &mut [i16],
-    pPixel1: &crate::encoder::rec_view::RecCursor<'_>,
-    pPixel2: &crate::encoder::rec_view::RecCursor<'_>,
+    pPixel1: &PlaneCursor<'_>,
+    pPixel2: &PlaneCursor<'_>,
 ) {
     let Some(dct) = pDct.first_chunk_mut::<16>() else {
         return;
@@ -568,8 +556,8 @@ pub fn WelsDctT4_sse2(
 #[inline(always)]
 pub fn WelsDctFourT4_sse2(
     pDct: &mut [i16],
-    pPixel1: &crate::encoder::rec_view::RecCursor<'_>,
-    pPixel2: &crate::encoder::rec_view::RecCursor<'_>,
+    pPixel1: &PlaneCursor<'_>,
+    pPixel2: &PlaneCursor<'_>,
 ) {
     let Some(dct) = pDct.first_chunk_mut::<64>() else {
         return;
@@ -594,79 +582,71 @@ pub fn WelsScan4x4Dc(pLevel: &mut [i16; 16], pDct: &[i16; 16]) {
 // Pixel Block Copy Fallbacks (matching copy_mb.h)
 // ============================================================================
 
-/// Copies a 4x4 block of samples from `pSrc` to `pDst`, row by row through
-/// `copy_rows_shared`.
-#[inline]
-pub fn WelsCopy4x4_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
+/// Copies a packed `W * H` slice (stride `W`) into `dst`.
+#[inline(always)]
+pub fn copy_block_to_cursor<const W: usize, const H: usize>(
+    src: &[u8],
+    dst: &mut PlaneCursorMut<'_>,
 ) {
-    crate::encoder::rec_view::copy_rows_shared::<4>(pDst, pSrc, 4);
+    match (W, H) {
+        (16, 16) => kernels::copy::copy_16x16_slice(dst, src),
+        (8, 8) => kernels::copy::copy_8x8_slice(dst, src),
+        _ => {
+            let mut d = dst.span_mut::<W, H>(0, 0);
+            for y in 0..H {
+                if let Some(row) = src.get(y * W..).and_then(|s| s.first_chunk::<W>()) {
+                    *d.row_mut::<W>(y, 0) = *row;
+                }
+            }
+        }
+    }
 }
 
-/// Copies an 8-wide, 4-tall block of samples from `pSrc` to `pDst`, row by row
-/// through `copy_rows_shared`.
+/// Copies a 4x4 block of samples from `pSrc` to `pDst`.
 #[inline]
-pub fn WelsCopy8x4_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<8>(pDst, pSrc, 4);
+pub fn WelsCopy4x4_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<4, _>(pSrc, pDst, 4);
 }
 
-/// Copies a 4-wide, 8-tall block of samples from `pSrc` to `pDst`, row by row
-/// through `copy_rows_shared`.
+/// Copies an 8-wide, 4-tall block of samples from `pSrc` to `pDst`.
 #[inline]
-pub fn WelsCopy4x8_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<4>(pDst, pSrc, 8);
+pub fn WelsCopy8x4_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<8, _>(pSrc, pDst, 4);
 }
 
-/// Copies an 8x8 block of samples from `pSrc` to `pDst`, row by row through
-/// `copy_rows_shared`.
+/// Copies a 4-wide, 8-tall block of samples from `pSrc` to `pDst`.
+#[inline]
+pub fn WelsCopy4x8_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<4, _>(pSrc, pDst, 8);
+}
+
+/// Copies an 8x8 block of samples from `pSrc` to `pDst`.
 ///
 /// (The decoder's error-concealment module has its own same-named kernel —
 /// different function, never unify.)
 #[inline]
-pub fn WelsCopy8x8_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<8>(pDst, pSrc, 8);
+pub fn WelsCopy8x8_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<8, _>(pSrc, pDst, 8);
 }
 
-/// Copies a 16-wide, 8-tall block of samples from `pSrc` to `pDst`, row by row
-/// through `copy_rows_shared`.
+/// Copies a 16-wide, 8-tall block of samples from `pSrc` to `pDst`.
 #[inline]
-pub fn WelsCopy16x8_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<16>(pDst, pSrc, 8);
+pub fn WelsCopy16x8_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<16, _>(pSrc, pDst, 8);
 }
 
-/// Copies an 8-wide, 16-tall block of samples from `pSrc` to `pDst`, row by row
-/// through `copy_rows_shared`.
+/// Copies an 8-wide, 16-tall block of samples from `pSrc` to `pDst`.
 #[inline]
-pub fn WelsCopy8x16_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<8>(pDst, pSrc, 16);
+pub fn WelsCopy8x16_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<8, _>(pSrc, pDst, 16);
 }
 
-/// Copies a 16x16 block of samples from `pSrc` to `pDst`, row by row through
-/// `copy_rows_shared`.
+/// Copies a 16x16 block of samples from `pSrc` to `pDst`.
 ///
 /// (Same name-collision note as [`WelsCopy8x8_c`].)
 #[inline]
-pub fn WelsCopy16x16_c(
-    pDst: &crate::encoder::rec_view::RecCursor<'_>,
-    pSrc: &crate::encoder::rec_view::RecCursor<'_>,
-) {
-    crate::encoder::rec_view::copy_rows_shared::<16>(pDst, pSrc, 16);
+pub fn WelsCopy16x16_c(pDst: &mut PlaneCursorMut<'_>, pSrc: &PlaneCursor<'_>) {
+    crate::common::mc::copy_rows::<16, _>(pSrc, pDst, 16);
 }
 
 // ============================================================================
@@ -775,14 +755,9 @@ mod tests {
         }
     }
 
-    /// The DCT kernels are generic over [`SampleCursor`], and read a `RecCursor` over a
-    /// shared interior-mutable plane exactly as a `PlaneCursor` over a slice.
-    ///
-    /// The second assertion biases the shared cursor by one sample and requires the
-    /// outputs to *differ*, so the equality above cannot pass for the wrong reason.
+    /// The DCT kernels read a `PlaneBand` cursor identically to a whole-plane cursor.
     #[test]
-    fn dct_reads_a_shared_source_plane_exactly_as_a_slice_cursor_does() {
-        use crate::encoder::rec_view::shared_plane_for_test;
+    fn dct_reads_a_band_cursor_identically_to_a_plane_cursor() {
         use crate::safe::plane::PaddedPlane;
 
         let (w, h, pad, stride) = (32usize, 16usize, 16usize, 64usize);
@@ -793,22 +768,19 @@ mod tests {
         let pred = [7u8; 256];
         let predc = PlaneCursor::new(&pred, 0, 16);
 
-        let mut via_slice = [0i16; 64];
-        dct_four_4x4(&mut via_slice, &plane.cursor(0, 0), &predc);
+        let mut via_plane = [0i16; 64];
+        dct_four_4x4(&mut via_plane, &plane.cursor(0, 0), &predc);
 
-        let shared = shared_plane_for_test(&mut plane);
-        let mut via_shared = [0i16; 64];
-        dct_four_4x4(&mut via_shared, &shared.cursor(0, 0), &predc);
-        assert_eq!(
-            via_slice, via_shared,
-            "a RecCursor source and a PlaneCursor source over the same bytes disagree"
-        );
+        let band = plane.band(0, 16);
+        let mut via_band = [0i16; 64];
+        dct_four_4x4(&mut via_band, &band.cursor(0, 0), &predc);
+        assert_eq!(via_plane, via_band);
 
         // control
         let mut biased = [0i16; 64];
-        dct_four_4x4(&mut biased, &shared.cursor(1, 0), &predc);
+        dct_four_4x4(&mut biased, &band.cursor(1, 0), &predc);
         assert_ne!(
-            via_shared, biased,
+            via_band, biased,
             "control: a one-sample bias changed nothing, so this test cannot fail"
         );
     }

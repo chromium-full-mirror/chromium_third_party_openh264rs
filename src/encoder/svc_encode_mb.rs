@@ -38,11 +38,11 @@
 #![forbid(unsafe_code)]
 
 use crate::encoder::decode_mb_aux::{
-    idct_four_t4_rec_to_view, idct_rec_i16x16_dc_to_view, idct_t4_rec_to_view,
+    idct_four_t4_rec, idct_rec_i16x16_dc, idct_t4_rec,
 };
 use crate::encoder::encode_mb_aux::{
-    blk_four4x4, blk_four4x4_mut, blk4x4, blk4x4_mut, hadamard_dc_span, hadamard2x2_span,
-    hadamard2x2_span_mut,
+    blk_four4x4, blk_four4x4_mut, blk4x4, blk4x4_mut, copy_block_to_cursor, hadamard_dc_span,
+    hadamard2x2_span, hadamard2x2_span_mut,
 };
 pub use crate::encoder::encoder_context::SDCTCoeff;
 pub use crate::encoder::encoder_context::SMVUnitXY;
@@ -53,13 +53,12 @@ pub use crate::encoder::md::SMB;
 pub use crate::encoder::md::SMbCache;
 use crate::encoder::md::{best_pred_i4x4_blk4_off, mem_pred_luma_off};
 pub use crate::encoder::param_svc::SWelsPPS;
-use crate::encoder::rec_view::{RecCursor, copy_block_to_view};
+use crate::encoder::picture::SlicePicBands;
 pub use crate::encoder::svc_encode_slice::SDqLayer;
 pub use crate::encoder::svc_encode_slice::SLayerInfo;
-use crate::encoder::svc_encode_slice::{
-    current_layer_expect, layer_enc_view_expect, layer_pps_ref, layer_rec_view_expect,
-};
+use crate::encoder::svc_encode_slice::{current_layer_expect, layer_pps_ref};
 pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
+use crate::safe::plane::PlaneCursor;
 
 // ============================================================================
 // Constants, Tables, and Bitmasks
@@ -151,8 +150,8 @@ pub fn WelsDequantIHadamard2x2Dc(pDct: &mut [i16; 4], kuiMF: u16) {
 #[inline]
 pub fn WelsDctMb(
     pRes: &mut [i16],
-    pEncMb: &RecCursor<'_>,
-    pBestPred: &RecCursor<'_>,
+    pEncMb: &PlaneCursor<'_>,
+    pBestPred: &PlaneCursor<'_>,
     pfDctFourT4: PDctFunc,
 ) {
     for (k, (dx, dy)) in [(0isize, 0isize), (8, 0), (0, 8), (8, 8)]
@@ -169,13 +168,17 @@ pub fn WelsDctMb(
 
 /// Full DCT, DC Hadamard, quantization, scanning, inverse quantization and local
 /// reconstruction for an Intra 16x16 luma macroblock.
-pub fn WelsEncRecI16x16Y(pEncCtx: &sWelsEncCtx, pCurMb: &mut SMB, pMbCache: &mut SMbCache) {
+pub fn WelsEncRecI16x16Y(
+    pEncCtx: &sWelsEncCtx,
+    pCurMb: &mut SMB,
+    pMbCache: &mut SMbCache,
+    bands: &mut SlicePicBands<'_>,
+) {
     let mut aDctT4Dc = [0i16; 16];
     let pFuncList = pEncCtx.func_list();
-    let pCurDqLayer = current_layer_expect(pEncCtx);
     // The prediction scratch is owned by the cache and has stride 16.
-    let pBestPred = RecCursor::over_owned(
-        &mut pMbCache.sMemPredMb,
+    let pBestPred = PlaneCursor::new(
+        &pMbCache.sMemPredMb,
         mem_pred_luma_off(pMbCache.uiMemPredLumaHalf),
         16,
     );
@@ -186,8 +189,7 @@ pub fn WelsEncRecI16x16Y(pEncCtx: &sWelsEncCtx, pCurMb: &mut SMB, pMbCache: &mut
     let pMF = &g_kiQuantMF[uiQp as usize];
     let pFF = get_quant_intra_ff(uiQp as usize);
 
-    let encView = layer_enc_view_expect(pCurDqLayer);
-    let pEncCur = pMbCache.SPicData.mb_cursor_ro(encView, 0);
+    let pEncCur = pMbCache.SPicData.mb_cursor_enc(&bands.enc, 0);
     WelsDctMb(
         &mut pMbCache.sCoeffLevel,
         &pEncCur,
@@ -255,37 +257,38 @@ pub fn WelsEncRecI16x16Y(pEncCtx: &sWelsEncCtx, pCurMb: &mut SMB, pMbCache: &mut
         // The 8x8 quadrant grid, applied to both the prediction scratch at stride 16
         // and the reconstruction plane at its own stride.
         const QUADS: [(isize, isize); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
-        let view = layer_rec_view_expect(pCurDqLayer);
         let (lx, ly) = pMbCache.SPicData.luma_origin();
-        let dst = view.plane(0).cursor(lx, ly);
+        let mut dst = bands.rec.plane_mut(0).cursor_mut(lx, ly);
         let kiPredOff = mem_pred_luma_off(pMbCache.uiMemPredLumaHalf);
         for (k, &(dx, dy)) in QUADS.iter().enumerate() {
-            idct_four_t4_rec_to_view(
-                &dst.advance(dx, dy),
-                &pMbCache.sMemPredMb[kiPredOff + dy as usize * 16 + dx as usize..],
+            let pred = PlaneCursor::new(
+                &pMbCache.sMemPredMb,
+                kiPredOff + dy as usize * 16 + dx as usize,
                 16,
+            );
+            idct_four_t4_rec(
+                &mut dst.reborrow(dx, dy),
+                &pred,
                 blk_four4x4(&pMbCache.sCoeffLevel, k << 6),
             );
         }
     } else if uiCountI16x16Dc > 0 {
-        let view = layer_rec_view_expect(pCurDqLayer);
         let (lx, ly) = pMbCache.SPicData.luma_origin();
         let kiPredOff = mem_pred_luma_off(pMbCache.uiMemPredLumaHalf);
-        idct_rec_i16x16_dc_to_view(
-            &view.plane(0).cursor(lx, ly),
-            &pMbCache.sMemPredMb[kiPredOff..],
-            16,
+        let pred = PlaneCursor::new(&pMbCache.sMemPredMb, kiPredOff, 16);
+        idct_rec_i16x16_dc(
+            &mut bands.rec.plane_mut(0).cursor_mut(lx, ly),
+            &pred,
             &aDctT4Dc,
         );
     } else {
         // Residual-free: the prediction is the reconstruction, copied straight across
         // from `sMemPredMb`'s luma half.
-        let view = layer_rec_view_expect(pCurDqLayer);
         let (lx, ly) = pMbCache.SPicData.luma_origin();
         let kiPredOff = mem_pred_luma_off(pMbCache.uiMemPredLumaHalf);
-        copy_block_to_view::<16, 16>(
+        copy_block_to_cursor::<16, 16>(
             &pMbCache.sMemPredMb[kiPredOff..kiPredOff + 256],
-            &view.plane(0).cursor(lx, ly),
+            &mut bands.rec.plane_mut(0).cursor_mut(lx, ly),
         );
     }
 }
@@ -297,18 +300,17 @@ pub fn WelsEncRecI4x4Y(
     pCurMb: &mut SMB,
     pMbCache: &mut SMbCache,
     uiI4x4Idx: u8,
+    bands: &mut SlicePicBands<'_>,
 ) {
     let pFuncList = pEncCtx.func_list();
-    let pCurDqLayer = current_layer_expect(pEncCtx);
     let uiQp = pCurMb.uiLumaQp;
 
     let uiOffset = g_kuiMbCountScan4Idx[uiI4x4Idx as usize] as usize;
-    // The source plane comes through the frame's read-only view; the prediction scratch
+    // The source plane comes from this worker's exclusive band; the prediction scratch
     // is owned by the cache and has stride 4.
-    let encView = layer_enc_view_expect(pCurDqLayer);
-    let pEncMb = pMbCache.SPicData.mb_cursor_ro(encView, 0);
-    let pBestPred = RecCursor::over_owned(
-        &mut pMbCache.sMemPredBlk4,
+    let pEncMb = pMbCache.SPicData.mb_cursor_enc(&bands.enc, 0);
+    let pBestPred = PlaneCursor::new(
+        &pMbCache.sMemPredBlk4,
         best_pred_i4x4_blk4_off(pMbCache.uiBestPredI4x4Blk4Half),
         4,
     );
@@ -336,7 +338,6 @@ pub fn WelsEncRecI4x4Y(
     let iNoneZeroCount = (pFuncList.pfGetNoneZeroCount)(&pMbCache.sDct.iLumaBlock[kiBlk]);
     pCurMb.iNonZeroCount[uiOffset] = iNoneZeroCount as i8;
 
-    let view = layer_rec_view_expect(pCurDqLayer);
     let (lx, ly) = pMbCache.SPicData.luma_origin();
     let kiPredOff = best_pred_i4x4_blk4_off(pMbCache.uiBestPredI4x4Blk4Half);
 
@@ -345,16 +346,16 @@ pub fn WelsEncRecI4x4Y(
         if let Some(blk) = blk4x4_mut(&mut pMbCache.sCoeffLevel, 0) {
             (pFuncList.pfDequantization4x4)(blk, &g_kuiDequantCoeff[uiQp as usize]);
         }
-        idct_t4_rec_to_view(
-            &view.plane(0).cursor(lx + dx, ly + dy),
-            &pMbCache.sMemPredBlk4[kiPredOff..],
-            4,
+        let pred = PlaneCursor::new(&pMbCache.sMemPredBlk4, kiPredOff, 4);
+        idct_t4_rec(
+            &mut bands.rec.plane_mut(0).cursor_mut(lx + dx, ly + dy),
+            &pred,
             blk4x4(&pMbCache.sCoeffLevel, 0),
         );
     } else {
-        copy_block_to_view::<4, 4>(
+        copy_block_to_cursor::<4, 4>(
             &pMbCache.sMemPredBlk4[kiPredOff..kiPredOff + 16],
-            &view.plane(0).cursor(lx + dx, ly + dy),
+            &mut bands.rec.plane_mut(0).cursor_mut(lx + dx, ly + dy),
         );
     }
 }

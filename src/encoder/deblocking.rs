@@ -36,7 +36,6 @@
 //! chroma 4-sample directional edge filtering, and frame/slice macroblock traversal.
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
-#![deny(unsafe_code)]
 
 // Constants and Dimension Definitions
 
@@ -78,10 +77,11 @@ pub use crate::common::deblocking_common::{
 use crate::common::deblocking_common::{
     deblock_chroma_eq4, deblock_chroma_lt4, deblock_luma_eq4, deblock_luma_lt4,
 };
-use crate::encoder::rec_view::{RecCursor, RecPicView};
+use crate::encoder::picture::RecPicBand;
 /// 4-byte motion vector unit $(MV_x, MV_y)$ in quarter-pel precision.
 pub use crate::encoder::svc_encode_slice::SMVUnitXY;
 use crate::safe::mb_grid::{MbSplit, MbWindow};
+use crate::safe::plane::PlaneCursorMut;
 /// The kernel set this module dispatches through; see [`crate::simd::kernels`].
 use crate::simd::kernels;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -125,8 +125,8 @@ pub use crate::encoder::svc_encode_slice::SMB;
 /// genuinely two-valued at runtime (`DeblockingFilterSliceAvcbase` when the
 /// parallel-deblocking conditions hold, `..Null` otherwise, re-stamped every
 /// frame by `PreprocessSliceCoding`).
-pub type PDeblockingFilterSlice = extern "C" fn(
-    view: &RecPicView,
+pub type PDeblockingFilterSlice = fn(
+    rec: &mut RecPicBand<'_>,
     pSliceCtx: &SSliceCtx,
     kiCsStride: &[i32; 3],
     pSlice: &mut SSlice,
@@ -455,23 +455,6 @@ pub fn WelsNonZeroCount_c(pNonZeroCount: &mut [i8; MB_LUMA_CHROMA_BLOCK4x4_NUM])
 
 // Directional Filtering Dispatchers
 
-/// This macroblock's three reconstruction cursors.
-///
-/// Luma is 16 samples per macroblock and chroma 8, hence the `<< 4` and `<< 3`.
-fn mb_cursors<'a>(
-    view: &'a RecPicView,
-    iMbX: i32,
-    iMbY: i32,
-) -> (RecCursor<'a>, RecCursor<'a>, RecCursor<'a>) {
-    let (lx, ly) = ((iMbX as isize) << 4, (iMbY as isize) << 4);
-    let (cx, cy) = ((iMbX as isize) << 3, (iMbY as isize) << 3);
-    (
-        view.plane(0).cursor(lx, ly),
-        view.plane(1).cursor(cx, cy),
-        view.plane(2).cursor(cx, cy),
-    )
-}
-
 /// The eight directional edge dispatchers.
 ///
 /// `iStride` stays a parameter even though the cursor carries it: here it is not
@@ -481,7 +464,7 @@ fn mb_cursors<'a>(
 /// steps its taps by the stride, which filters a *horizontal* edge.
 fn FilteringEdgeLumaH(
     pFilter: &SDeblockingFilter,
-    pix: &mut RecCursor<'_>,
+    pix: &mut PlaneCursorMut<'_>,
     iStride: i32,
     pBS: &[u8; 4],
 ) {
@@ -504,7 +487,7 @@ fn FilteringEdgeLumaH(
 /// [`FilteringEdgeLumaH`]'s vertical-edge twin: the taps step by one byte.
 fn FilteringEdgeLumaV(
     pFilter: &SDeblockingFilter,
-    pix: &mut RecCursor<'_>,
+    pix: &mut PlaneCursorMut<'_>,
     iStride: i32,
     pBS: &[u8; 4],
 ) {
@@ -526,7 +509,11 @@ fn FilteringEdgeLumaV(
 
 /// The bS == 4 (intra boundary) strong filter — no `pBS`, because the boundary
 /// strength is what selected this function.
-fn FilteringEdgeLumaIntraH(pFilter: &SDeblockingFilter, pix: &mut RecCursor<'_>, iStride: i32) {
+fn FilteringEdgeLumaIntraH(
+    pFilter: &SDeblockingFilter,
+    pix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+) {
     let (mut iIdexA, mut iAlpha, mut iBeta) = (0i32, 0i32, 0i32);
     GET_ALPHA_BETA_FROM_QP(
         pFilter.uiLumaQP as i32,
@@ -542,7 +529,11 @@ fn FilteringEdgeLumaIntraH(pFilter: &SDeblockingFilter, pix: &mut RecCursor<'_>,
 }
 
 /// [`FilteringEdgeLumaIntraH`]'s vertical-edge twin.
-fn FilteringEdgeLumaIntraV(pFilter: &SDeblockingFilter, pix: &mut RecCursor<'_>, iStride: i32) {
+fn FilteringEdgeLumaIntraV(
+    pFilter: &SDeblockingFilter,
+    pix: &mut PlaneCursorMut<'_>,
+    iStride: i32,
+) {
     let (mut iIdexA, mut iAlpha, mut iBeta) = (0i32, 0i32, 0i32);
     GET_ALPHA_BETA_FROM_QP(
         pFilter.uiLumaQP as i32,
@@ -561,8 +552,8 @@ fn FilteringEdgeLumaIntraV(pFilter: &SDeblockingFilter, pix: &mut RecCursor<'_>,
 /// by line in one call.
 fn FilteringEdgeChromaH(
     pFilter: &SDeblockingFilter,
-    cb: &mut RecCursor<'_>,
-    cr: &mut RecCursor<'_>,
+    cb: &mut PlaneCursorMut<'_>,
+    cr: &mut PlaneCursorMut<'_>,
     iStride: i32,
     pBS: &[u8; 4],
 ) {
@@ -585,8 +576,8 @@ fn FilteringEdgeChromaH(
 /// [`FilteringEdgeChromaH`]'s vertical-edge twin.
 fn FilteringEdgeChromaV(
     pFilter: &SDeblockingFilter,
-    cb: &mut RecCursor<'_>,
-    cr: &mut RecCursor<'_>,
+    cb: &mut PlaneCursorMut<'_>,
+    cr: &mut PlaneCursorMut<'_>,
     iStride: i32,
     pBS: &[u8; 4],
 ) {
@@ -609,8 +600,8 @@ fn FilteringEdgeChromaV(
 /// The bS == 4 chroma strong filter.
 fn FilteringEdgeChromaIntraH(
     pFilter: &SDeblockingFilter,
-    cb: &mut RecCursor<'_>,
-    cr: &mut RecCursor<'_>,
+    cb: &mut PlaneCursorMut<'_>,
+    cr: &mut PlaneCursorMut<'_>,
     iStride: i32,
 ) {
     let (mut iIdexA, mut iAlpha, mut iBeta) = (0i32, 0i32, 0i32);
@@ -630,8 +621,8 @@ fn FilteringEdgeChromaIntraH(
 /// [`FilteringEdgeChromaIntraH`]'s vertical-edge twin.
 fn FilteringEdgeChromaIntraV(
     pFilter: &SDeblockingFilter,
-    cb: &mut RecCursor<'_>,
-    cr: &mut RecCursor<'_>,
+    cb: &mut PlaneCursorMut<'_>,
+    cr: &mut PlaneCursorMut<'_>,
     iStride: i32,
 ) {
     let (mut iIdexA, mut iAlpha, mut iBeta) = (0i32, 0i32, 0i32);
@@ -658,7 +649,7 @@ pub fn DeblockingInterMb(
     mbs: &MbSplit<'_, SMB>,
     pFilter: &mut SDeblockingFilter,
     uiBS: &[[[u8; 4]; 4]; 2],
-    cursors: (RecCursor<'_>, RecCursor<'_>, RecCursor<'_>),
+    cursors: (PlaneCursorMut<'_>, PlaneCursorMut<'_>, PlaneCursorMut<'_>),
     iLeftFlag: bool,
     iTopFlag: bool,
 ) {
@@ -697,16 +688,16 @@ pub fn DeblockingInterMb(
 
     let bs01_u32 = u32::from_ne_bytes(uiBS[0][1]);
     if bs01_u32 != 0 {
-        FilteringEdgeLumaV(&*pFilter, &mut pDestY.advance(4, 0), iLineSize, &uiBS[0][1]);
+        FilteringEdgeLumaV(&*pFilter, &mut pDestY.reborrow(4, 0), iLineSize, &uiBS[0][1]);
     }
 
     let bs02_u32 = u32::from_ne_bytes(uiBS[0][2]);
     if bs02_u32 != 0 {
-        FilteringEdgeLumaV(&*pFilter, &mut pDestY.advance(8, 0), iLineSize, &uiBS[0][2]);
+        FilteringEdgeLumaV(&*pFilter, &mut pDestY.reborrow(8, 0), iLineSize, &uiBS[0][2]);
         FilteringEdgeChromaV(
             &*pFilter,
-            &mut pDestCb.advance(4, 0),
-            &mut pDestCr.advance(4, 0),
+            &mut pDestCb.reborrow(4, 0),
+            &mut pDestCr.reborrow(4, 0),
             iLineSizeUV,
             &uiBS[0][2],
         );
@@ -716,7 +707,7 @@ pub fn DeblockingInterMb(
     if bs03_u32 != 0 {
         FilteringEdgeLumaV(
             &*pFilter,
-            &mut pDestY.advance(12, 0),
+            &mut pDestY.reborrow(12, 0),
             iLineSize,
             &uiBS[0][3],
         );
@@ -750,16 +741,16 @@ pub fn DeblockingInterMb(
 
     let bs11_u32 = u32::from_ne_bytes(uiBS[1][1]);
     if bs11_u32 != 0 {
-        FilteringEdgeLumaH(&*pFilter, &mut pDestY.advance(0, 4), iLineSize, &uiBS[1][1]);
+        FilteringEdgeLumaH(&*pFilter, &mut pDestY.reborrow(0, 4), iLineSize, &uiBS[1][1]);
     }
 
     let bs12_u32 = u32::from_ne_bytes(uiBS[1][2]);
     if bs12_u32 != 0 {
-        FilteringEdgeLumaH(&*pFilter, &mut pDestY.advance(0, 8), iLineSize, &uiBS[1][2]);
+        FilteringEdgeLumaH(&*pFilter, &mut pDestY.reborrow(0, 8), iLineSize, &uiBS[1][2]);
         FilteringEdgeChromaH(
             &*pFilter,
-            &mut pDestCb.advance(0, 4),
-            &mut pDestCr.advance(0, 4),
+            &mut pDestCb.reborrow(0, 4),
+            &mut pDestCr.reborrow(0, 4),
             iLineSizeUV,
             &uiBS[1][2],
         );
@@ -769,7 +760,7 @@ pub fn DeblockingInterMb(
     if bs13_u32 != 0 {
         FilteringEdgeLumaH(
             &*pFilter,
-            &mut pDestY.advance(0, 12),
+            &mut pDestY.reborrow(0, 12),
             iLineSize,
             &uiBS[1][3],
         );
@@ -781,7 +772,7 @@ pub fn DeblockingInterMb(
 pub fn FilteringEdgeLumaHV(
     mbs: &MbSplit<'_, SMB>,
     pFilter: &mut SDeblockingFilter,
-    mut pDestY: RecCursor<'_>,
+    mut pDestY: PlaneCursorMut<'_>,
     iLeftFlag: bool,
     iTopFlag: bool,
 ) {
@@ -814,7 +805,7 @@ pub fn FilteringEdgeLumaHV(
     if (iAlpha | iBeta) != 0 {
         TC0_TBL_LOOKUP(&mut iTc, iIdexA, &uiBSx4, 0);
         deblock_luma_lt4(
-            &mut pDestY.advance(4, 0),
+            &mut pDestY.reborrow(4, 0),
             1,
             iLineSize as isize,
             iAlpha,
@@ -822,7 +813,7 @@ pub fn FilteringEdgeLumaHV(
             &iTc,
         );
         deblock_luma_lt4(
-            &mut pDestY.advance(8, 0),
+            &mut pDestY.reborrow(8, 0),
             1,
             iLineSize as isize,
             iAlpha,
@@ -830,7 +821,7 @@ pub fn FilteringEdgeLumaHV(
             &iTc,
         );
         deblock_luma_lt4(
-            &mut pDestY.advance(12, 0),
+            &mut pDestY.reborrow(12, 0),
             1,
             iLineSize as isize,
             iAlpha,
@@ -848,7 +839,7 @@ pub fn FilteringEdgeLumaHV(
     pFilter.uiLumaQP = iCurQp as u8;
     if (iAlpha | iBeta) != 0 {
         deblock_luma_lt4(
-            &mut pDestY.advance(0, 4),
+            &mut pDestY.reborrow(0, 4),
             iLineSize as isize,
             1,
             iAlpha,
@@ -856,7 +847,7 @@ pub fn FilteringEdgeLumaHV(
             &iTc,
         );
         deblock_luma_lt4(
-            &mut pDestY.advance(0, 8),
+            &mut pDestY.reborrow(0, 8),
             iLineSize as isize,
             1,
             iAlpha,
@@ -864,7 +855,7 @@ pub fn FilteringEdgeLumaHV(
             &iTc,
         );
         deblock_luma_lt4(
-            &mut pDestY.advance(0, 12),
+            &mut pDestY.reborrow(0, 12),
             iLineSize as isize,
             1,
             iAlpha,
@@ -878,8 +869,8 @@ pub fn FilteringEdgeLumaHV(
 pub fn FilteringEdgeChromaHV(
     mbs: &MbSplit<'_, SMB>,
     pFilter: &mut SDeblockingFilter,
-    mut pDestCb: RecCursor<'_>,
-    mut pDestCr: RecCursor<'_>,
+    mut pDestCb: PlaneCursorMut<'_>,
+    mut pDestCr: PlaneCursorMut<'_>,
     iLeftFlag: bool,
     iTopFlag: bool,
 ) {
@@ -912,8 +903,8 @@ pub fn FilteringEdgeChromaHV(
     if (iAlpha | iBeta) != 0 {
         TC0_TBL_LOOKUP(&mut iTc, iIdexA, &uiBSx4, 1);
         deblock_chroma_lt4(
-            &mut pDestCb.advance(4, 0),
-            &mut pDestCr.advance(4, 0),
+            &mut pDestCb.reborrow(4, 0),
+            &mut pDestCr.reborrow(4, 0),
             1,
             iLineSize as isize,
             iAlpha,
@@ -931,8 +922,8 @@ pub fn FilteringEdgeChromaHV(
     pFilter.uiChromaQP = iCurQp as u8;
     if (iAlpha | iBeta) != 0 {
         deblock_chroma_lt4(
-            &mut pDestCb.advance(0, 4),
-            &mut pDestCr.advance(0, 4),
+            &mut pDestCb.reborrow(0, 4),
+            &mut pDestCr.reborrow(0, 4),
             iLineSize as isize,
             1,
             iAlpha,
@@ -946,7 +937,7 @@ pub fn FilteringEdgeChromaHV(
 pub fn DeblockingIntraMb(
     mbs: &MbSplit<'_, SMB>,
     pFilter: &mut SDeblockingFilter,
-    cursors: (RecCursor<'_>, RecCursor<'_>, RecCursor<'_>),
+    cursors: (PlaneCursorMut<'_>, PlaneCursorMut<'_>, PlaneCursorMut<'_>),
     iLeftFlag: bool,
     iTopFlag: bool,
 ) {
@@ -961,7 +952,7 @@ pub fn DeblockingIntraMb(
 /// The slice map is read only for the flag `uiFilterIdc` actually selects. The read is
 /// relaxed and side-effect-free, so skipping the other costs nothing.
 pub fn DeblockingMbAvcbase(
-    view: &RecPicView,
+    rec: &mut RecPicBand<'_>,
     map: &[AtomicU16],
     mbs: &mut MbSplit<'_, SMB>,
     pFilter: &mut SDeblockingFilter,
@@ -984,7 +975,7 @@ pub fn DeblockingMbAvcbase(
         && (!bWithinSlice
             || uiSliceIdc == map[(kiMbXY - iMbStride as i32) as usize].load(Ordering::Relaxed));
 
-    let cursors = mb_cursors(view, iMbX, iMbY);
+    let cursors = rec.mb_cursors_mut(iMbX, iMbY);
 
     match uiCurMbType {
         MB_TYPE_INTRA4x4 | MB_TYPE_INTRA16x16 | MB_TYPE_INTRA_PCM => {
@@ -999,7 +990,7 @@ pub fn DeblockingMbAvcbase(
 
 // Frame and Slice Level Traversal
 
-pub fn DeblockingFilterFrameAvcbase(pCurDq: &mut SDqLayer) {
+pub fn DeblockingFilterFrameAvcbase(pCurDq: &mut SDqLayer, rec: &mut RecPicBand<'_>) {
     if pCurDq.pDecPic.is_none() {
         return;
     }
@@ -1028,9 +1019,6 @@ pub fn DeblockingFilterFrameAvcbase(pCurDq: &mut SDqLayer) {
         0
     };
 
-    let Some(view) = pCurDq.pRecView.as_ref() else {
-        return;
-    };
     pFilter.iCsStride[0] = pCurDq.iCsStride[0];
     pFilter.iCsStride[1] = pCurDq.iCsStride[1];
     pFilter.iCsStride[2] = pCurDq.iCsStride[2];
@@ -1047,7 +1035,7 @@ pub fn DeblockingFilterFrameAvcbase(pCurDq: &mut SDqLayer) {
     for iMbY in 0..kiMbHeight as usize {
         for iMbX in 0..kiMbWidth as usize {
             mbs.set_cur(iMbY * kiMbWidth as usize + iMbX);
-            DeblockingMbAvcbase(view, map, &mut mbs.split_cur(), &mut pFilter);
+            DeblockingMbAvcbase(rec, map, &mut mbs.split_cur(), &mut pFilter);
         }
     }
 }
@@ -1059,8 +1047,8 @@ pub use crate::encoder::svc_encode_slice::GetCurrentSliceNum;
 pub use crate::encoder::svc_encode_slice::WelsGetNextMbOfSlice;
 
 /// The per-slice walker.
-pub extern "C" fn DeblockingFilterSliceAvcbase(
-    view: &RecPicView,
+pub fn DeblockingFilterSliceAvcbase(
+    rec: &mut RecPicBand<'_>,
     pSliceCtx: &SSliceCtx,
     kiCsStride: &[i32; 3],
     pSlice: &mut SSlice,
@@ -1099,7 +1087,7 @@ pub extern "C" fn DeblockingFilterSliceAvcbase(
         let iCurMbIdx = iNextMbIdx;
         // A walk step outside the caller's window panics with the coordinates.
         pMbs.set_cur(iCurMbIdx as usize);
-        DeblockingMbAvcbase(view, map, &mut pMbs.split_cur(), &mut pFilter);
+        DeblockingMbAvcbase(rec, map, &mut pMbs.split_cur(), &mut pFilter);
 
         iNumMbFiltered += 1;
         iNextMbIdx = WelsGetNextMbOfSlice(pSliceCtx, iCurMbIdx);
@@ -1109,8 +1097,8 @@ pub extern "C" fn DeblockingFilterSliceAvcbase(
     }
 }
 
-pub extern "C" fn DeblockingFilterSliceAvcbaseNull(
-    _view: &RecPicView,
+pub fn DeblockingFilterSliceAvcbaseNull(
+    _rec: &mut RecPicBand<'_>,
     _pSliceCtx: &SSliceCtx,
     _kiCsStride: &[i32; 3],
     _pSlice: &mut SSlice,
@@ -1118,11 +1106,32 @@ pub extern "C" fn DeblockingFilterSliceAvcbaseNull(
 ) {
 }
 
-pub extern "C" fn PerformDeblockingFilter(pEnc: &mut sWelsEncCtx) {
-    let pCurDq = current_layer_expect_mut(pEnc);
+pub fn PerformDeblockingFilter(pEnc: &mut sWelsEncCtx) {
+    let Some(layer_idx) = pEnc.iCurDqLayer else {
+        return;
+    };
+    let Some(pCurDq) = pEnc
+        .ppDqLayerList
+        .get_mut(layer_idx.get())
+        .and_then(|l| l.as_deref_mut())
+    else {
+        return;
+    };
+    let Some(id_dec) = pCurDq.pDecPic else {
+        return;
+    };
+    let did = pCurDq.sLayerInfo.sNalHeaderExt.uiDependencyId as usize;
+    let Some(pRefList) = pEnc
+        .ppRefPicListExt
+        .get_mut(did)
+        .and_then(|r| r.as_deref_mut())
+    else {
+        return;
+    };
+    let mut rec = RecPicBand::whole(pRefList.pic_mut(id_dec));
 
     if pCurDq.iLoopFilterDisableIdc == 0 {
-        DeblockingFilterFrameAvcbase(pCurDq);
+        DeblockingFilterFrameAvcbase(pCurDq, &mut rec);
     } else if pCurDq.iLoopFilterDisableIdc == 2 {
         let iSliceCount = GetCurrentSliceNum(&*pCurDq);
         // The layer's disjoint fields, split once: the grid becomes one whole window and
@@ -1132,13 +1141,9 @@ pub extern "C" fn PerformDeblockingFilter(pEnc: &mut sWelsEncCtx) {
             sSliceEncCtx,
             sSliceBufferInfo,
             ppSliceInLayer,
-            pRecView,
             iCsStride,
             ..
         } = pCurDq;
-        let Some(view) = pRecView.as_ref() else {
-            return;
-        };
         let mut sMbWindow = MbWindow::whole(sMbDataP, 0);
         for iSliceIdx in 0..iSliceCount {
             let Some(&loc) = ppSliceInLayer.get(iSliceIdx as usize) else {
@@ -1153,7 +1158,13 @@ pub extern "C" fn PerformDeblockingFilter(pEnc: &mut sWelsEncCtx) {
             else {
                 continue;
             };
-            DeblockingFilterSliceAvcbase(view, sSliceEncCtx, iCsStride, pSlice, &mut sMbWindow);
+            DeblockingFilterSliceAvcbase(
+                &mut rec,
+                sSliceEncCtx,
+                iCsStride,
+                pSlice,
+                &mut sMbWindow,
+            );
         }
     }
 }
@@ -1170,7 +1181,7 @@ pub use crate::common::cpu_core::{
 };
 use crate::common::deblocking_common::nonzero_count;
 use crate::encoder::slice_multi_threading::SSliceCtx;
-use crate::encoder::svc_encode_slice::{current_layer_expect_mut, slice_in_layer_mut};
+use crate::encoder::svc_encode_slice::slice_in_layer_mut;
 
 // Unit Tests
 

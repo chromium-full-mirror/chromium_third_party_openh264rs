@@ -17,10 +17,9 @@
 
 use super::lanes::{ld4, ld8, ld16};
 use super::sse2_token;
-use crate::encoder::rec_view::RecCursor;
-use crate::safe::plane::{BlockRows, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursor, RefSamples};
 use crate::simd::{
-    Avx2RecSadKernel, simd_entry,
+    Avx2PlaneSadKernel, simd_entry,
     tokens::{Avx2Token, Sse2Token},
 };
 use core::arch::x86_64::*;
@@ -585,10 +584,10 @@ pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 }
 
 struct Sad16xKernel<const H: usize>;
-impl<const H: usize> Avx2RecSadKernel for Sad16xKernel<H> {
+impl<const H: usize> Avx2PlaneSadKernel for Sad16xKernel<H> {
     #[inline(always)]
-    fn run(a: &RecCursor<'_>, b: &RecCursor<'_>, token: Avx2Token) -> i32 {
-        sad_16x_avx2::<RecCursor<'_>, H>(a, b, token)
+    fn run(a: &PlaneCursor<'_>, b: &PlaneCursor<'_>, token: Avx2Token) -> i32 {
+        sad_16x_avx2::<PlaneCursor<'_>, H>(a, b, token)
     }
 }
 
@@ -597,8 +596,8 @@ impl<const H: usize> Avx2RecSadKernel for Sad16xKernel<H> {
 // Dead in a kernel set no dispatch site aliases.
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn sample_sad_16x16_avx2() -> Option<fn(&RecCursor<'_>, &RecCursor<'_>) -> i32> {
-    Avx2Token::try_new().map(Avx2Token::into_rec_sad_fn::<Sad16xKernel<16>>)
+pub(crate) fn sample_sad_16x16_avx2() -> Option<fn(&PlaneCursor<'_>, &PlaneCursor<'_>) -> i32> {
+    Avx2Token::try_new().map(Avx2Token::into_plane_sad_fn::<Sad16xKernel<16>>)
 }
 
 #[inline(always)]
@@ -611,8 +610,8 @@ pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 // Dead in a kernel set no dispatch site aliases.
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn sample_sad_16x8_avx2() -> Option<fn(&RecCursor<'_>, &RecCursor<'_>) -> i32> {
-    Avx2Token::try_new().map(Avx2Token::into_rec_sad_fn::<Sad16xKernel<8>>)
+pub(crate) fn sample_sad_16x8_avx2() -> Option<fn(&PlaneCursor<'_>, &PlaneCursor<'_>) -> i32> {
+    Avx2Token::try_new().map(Avx2Token::into_plane_sad_fn::<Sad16xKernel<8>>)
 }
 
 #[inline(always)]

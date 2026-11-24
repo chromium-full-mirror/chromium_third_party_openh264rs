@@ -108,7 +108,6 @@ fn strides(min: usize) -> Vec<usize> {
 // ===========================================================================
 
 use openh264rs::common::sad_common as sad;
-use openh264rs::encoder::rec_view::RecCursor;
 use openh264rs::safe::plane::PlaneCursor;
 
 /// Dispatches the const-generic safe kernel for a runtime shape, so the tables below
@@ -791,7 +790,7 @@ pub(crate) fn encode_mb_aux_shims_stay_inside_the_spans_they_declare() {
     // --- The seven copies: exact spans both sides ((H-1)*stride + W), every
     // block byte equal to its source row (write-every-byte), bytes outside
     // the block untouched, source untouched.
-    type BlockCopy = fn(&RecCursor<'_>, &RecCursor<'_>);
+    type BlockCopy = fn(&mut PlaneCursorMut<'_>, &PlaneCursor<'_>);
     let kernels: &[(&str, usize, usize, BlockCopy)] = &[
         ("Copy4x4", 4, 4, ema::WelsCopy4x4_c),
         ("Copy8x4", 8, 4, ema::WelsCopy8x4_c),
@@ -804,14 +803,14 @@ pub(crate) fn encode_mb_aux_shims_stay_inside_the_spans_they_declare() {
     for &(name, w, h, raw) in kernels {
         for &ss in &[w, 21.max(w), 240] {
             for &ds in &[w, 29.max(w), 240] {
-                let mut src = rng.bytes((h - 1) * ss + w);
+                let src = rng.bytes((h - 1) * ss + w);
                 let mut dst = rng.bytes((h - 1) * ds + w);
                 let src_before = src.clone();
                 let dst_before = dst.clone();
                 {
-                    let d = RecCursor::over_owned(&mut dst, 0, ds);
-                    let sc = RecCursor::over_owned(&mut src, 0, ss);
-                    raw(&d, &sc);
+                    let mut d = PlaneCursorMut::new(&mut dst, 0, ds);
+                    let sc = PlaneCursor::new(&src, 0, ss);
+                    raw(&mut d, &sc);
                 }
                 for y in 0..h {
                     assert_eq!(

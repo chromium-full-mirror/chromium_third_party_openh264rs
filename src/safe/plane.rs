@@ -76,6 +76,7 @@ impl PaddedPlane {
             stride >= width + 2 * pad,
             "stride {stride} cannot hold a padded row of {width} + 2*{pad}"
         );
+        assert!(stride <= u32::MAX as usize, "stride {stride} exceeds u32");
         let rows = height + 2 * pad;
         Self {
             buf: vec![0u8; rows * stride],
@@ -105,6 +106,7 @@ impl PaddedPlane {
         height: usize,
     ) -> Self {
         assert!(stride > 0, "stride must be non-zero");
+        assert!(stride <= u32::MAX as usize, "stride {stride} exceeds u32");
         let pad = origin % stride;
         assert!(
             origin / stride == pad,
@@ -144,6 +146,7 @@ impl PaddedPlane {
     /// metadata, not geometry, and [`from_parts`](Self::from_parts) would have to divide
     /// by it to recover the padding. `SPicture::default()` uses `empty(0)`.
     pub fn empty(stride: usize) -> Self {
+        assert!(stride <= u32::MAX as usize, "stride {stride} exceeds u32");
         Self {
             buf: Vec::new(),
             stride,
@@ -267,17 +270,310 @@ impl PaddedPlane {
     }
 
     /// A read cursor anchored at logical `(x, y)`.
-    #[inline]
+    ///
+    /// Stride invariants were checked when this plane was constructed, and every
+    /// sample/span read bounds-checks against `self.buf`.
+    #[inline(always)]
     pub fn cursor(&self, x: isize, y: isize) -> PlaneCursor<'_> {
-        PlaneCursor::new(&self.buf, idx(self.origin, x, y, self.stride), self.stride)
+        debug_assert!(self.stride <= u32::MAX as usize);
+        PlaneCursor {
+            buf: &self.buf,
+            center: idx(self.origin, x, y, self.stride),
+            stride: self.stride,
+        }
     }
 
     /// A write cursor anchored at logical `(x, y)` — the safe form of the roving
     /// `pDstY` pointer in C++ `decode_slice.cpp:1944`.
-    #[inline]
+    #[inline(always)]
     pub fn cursor_mut(&mut self, x: isize, y: isize) -> PlaneCursorMut<'_> {
+        debug_assert!(self.stride <= u32::MAX as usize);
         let center = idx(self.origin, x, y, self.stride);
-        PlaneCursorMut::new(&mut self.buf, center, self.stride)
+        PlaneCursorMut {
+            buf: &mut self.buf,
+            center,
+            stride: self.stride,
+        }
+    }
+
+    /// A read-only horizontal band covering logical rows `[y_start, y_end)` (including
+    /// left and right padding on every row in the band).
+    ///
+    /// # Panics
+    /// If `y_start > y_end` or `y_end > self.height` (for a non-empty band).
+    #[inline]
+    pub fn band(&self, y_start: usize, y_end: usize) -> PlaneBand<'_> {
+        if self.is_empty() || y_start == y_end {
+            return PlaneBand::empty();
+        }
+        assert!(
+            y_start <= y_end && y_end <= self.height,
+            "band rows [{y_start}..{y_end}) out of bounds for plane height {}",
+            self.height
+        );
+        let start = (self.pad + y_start) * self.stride;
+        let end = (self.pad + y_end) * self.stride;
+        PlaneBand {
+            buf: &self.buf[start..end],
+            stride: self.stride,
+            biased_origin: self.pad as isize - (y_start * self.stride) as isize,
+        }
+    }
+
+    /// A read-only band covering all logical rows `[0, self.height)`.
+    #[inline]
+    pub fn whole_band(&self) -> PlaneBand<'_> {
+        self.band(0, self.height)
+    }
+
+    /// A mutable horizontal band covering logical rows `[y_start, y_end)` (including
+    /// left and right padding on every row in the band).
+    ///
+    /// # Panics
+    /// If `y_start > y_end` or `y_end > self.height` (for a non-empty band).
+    #[inline]
+    pub fn band_mut(&mut self, y_start: usize, y_end: usize) -> PlaneBandMut<'_> {
+        if self.is_empty() || y_start == y_end {
+            return PlaneBandMut::empty();
+        }
+        assert!(
+            y_start <= y_end && y_end <= self.height,
+            "band rows [{y_start}..{y_end}) out of bounds for plane height {}",
+            self.height
+        );
+        let start = (self.pad + y_start) * self.stride;
+        let end = (self.pad + y_end) * self.stride;
+        PlaneBandMut {
+            buf: &mut self.buf[start..end],
+            stride: self.stride,
+            biased_origin: self.pad as isize - (y_start * self.stride) as isize,
+        }
+    }
+
+    /// A mutable band covering all logical rows `[0, self.height)`.
+    #[inline]
+    pub fn whole_band_mut(&mut self) -> PlaneBandMut<'_> {
+        let h = self.height;
+        self.band_mut(0, h)
+    }
+
+    /// Splits this plane into disjoint mutable horizontal bands for the given scaled
+    /// logical row ranges `[(r_start, r_end), ...]` (pixel rows `[r_start * scale .. r_end * scale)`),
+    /// writing the bands into `out[..ranges.len()]` with no heap allocations.
+    ///
+    /// Non-empty ranges must be sorted and non-overlapping with `r_end * scale <= self.height`.
+    /// Empty ranges (`r_start == r_end`) produce [`PlaneBandMut::empty`] at any position.
+    ///
+    /// # Panics
+    /// If `out.len() < ranges.len()`, or if any non-empty range is unsorted, overlaps a
+    /// previous range, or exceeds `self.height`.
+    pub fn split_scaled_bands_mut_into<'a>(
+        &'a mut self,
+        ranges: &[(usize, usize)],
+        scale: usize,
+        out: &mut [PlaneBandMut<'a>],
+    ) {
+        assert!(
+            out.len() >= ranges.len(),
+            "output slice length {} smaller than range count {}",
+            out.len(),
+            ranges.len()
+        );
+        if self.is_empty() {
+            for slot in &mut out[..ranges.len()] {
+                *slot = PlaneBandMut::empty();
+            }
+            return;
+        }
+        let stride = self.stride;
+        let pad = self.pad;
+        let height = self.height;
+        let (_, mut rest) = self.buf.split_at_mut(pad * stride);
+        let mut cur_y = 0usize;
+        for (&(r_start, r_end), slot) in ranges.iter().zip(out.iter_mut()) {
+            let y_start = r_start * scale;
+            let y_end = r_end * scale;
+            if y_start == y_end {
+                *slot = PlaneBandMut::empty();
+                continue;
+            }
+            assert!(
+                y_start >= cur_y && y_start < y_end && y_end <= height,
+                "band rows [{y_start}..{y_end}) invalid against cursor {cur_y} and height {height}"
+            );
+            let skip = (y_start - cur_y) * stride;
+            let (_gap, tail) = rest.split_at_mut(skip);
+            let len = (y_end - y_start) * stride;
+            let (band_buf, tail) = tail.split_at_mut(len);
+            *slot = PlaneBandMut {
+                buf: band_buf,
+                stride,
+                biased_origin: pad as isize - (y_start * stride) as isize,
+            };
+            rest = tail;
+            cur_y = y_end;
+        }
+    }
+
+    /// Splits this plane into disjoint mutable horizontal bands for the given logical
+    /// row ranges `[(y_start, y_end), ...]` via safe `split_at_mut`.
+    ///
+    /// Non-empty ranges must be sorted and non-overlapping with `y_end <= self.height`.
+    /// Empty ranges (`y_start == y_end`) produce [`PlaneBandMut::empty`] at any position.
+    /// Each returned band includes left and right padding for every row in its range,
+    /// while excluding rows above `y_start` and at/below `y_end` so any cross-band read
+    /// or write panics immediately.
+    ///
+    /// # Panics
+    /// If any non-empty range is unsorted, overlaps a previous range, or exceeds
+    /// `self.height`.
+    pub fn split_bands_mut(&mut self, row_ranges: &[(usize, usize)]) -> Vec<PlaneBandMut<'_>> {
+        let mut out = Vec::with_capacity(row_ranges.len());
+        out.resize_with(row_ranges.len(), PlaneBandMut::empty);
+        self.split_scaled_bands_mut_into(row_ranges, 1, &mut out);
+        out
+    }
+}
+
+/// A read-only horizontal band of a [`PaddedPlane`] covering logical rows
+/// `[y_start, y_end)`, including left and right padding on every row in the band.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaneBand<'a> {
+    buf: &'a [u8],
+    stride: usize,
+    /// Pre-biased byte offset from `buf[0]` to logical `(0, 0)`:
+    /// `pad as isize - (y_start * stride) as isize`.
+    biased_origin: isize,
+}
+
+impl<'a> PlaneBand<'a> {
+    /// An empty band covering no rows.
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            buf: &[],
+            stride: 0,
+            biased_origin: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    #[inline(always)]
+    fn local_center(&self, x: isize, y: isize) -> usize {
+        (self.biased_origin + y * self.stride as isize + x) as usize
+    }
+
+    /// Sample at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn at(&self, x: isize, y: isize) -> u8 {
+        self.buf[self.local_center(x, y)]
+    }
+
+    /// A read cursor anchored at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn cursor(&self, x: isize, y: isize) -> PlaneCursor<'a> {
+        debug_assert!(self.stride <= u32::MAX as usize);
+        PlaneCursor {
+            buf: self.buf,
+            center: self.local_center(x, y),
+            stride: self.stride,
+        }
+    }
+}
+
+/// An exclusive, mutable horizontal band of a [`PaddedPlane`] covering logical rows
+/// `[y_start, y_end)`, including left and right padding on every row in the band.
+///
+/// Built by [`PaddedPlane::split_bands_mut`] so concurrent workers hold compiler-checked
+/// disjoint `&mut` slices of a frame's planes with zero `unsafe`.
+#[derive(Debug)]
+pub struct PlaneBandMut<'a> {
+    buf: &'a mut [u8],
+    stride: usize,
+    /// Pre-biased byte offset from `buf[0]` to logical `(0, 0)`:
+    /// `pad as isize - (y_start * stride) as isize`.
+    biased_origin: isize,
+}
+
+impl<'a> PlaneBandMut<'a> {
+    /// An empty mutable band covering no rows.
+    #[inline(always)]
+    pub fn empty() -> Self {
+        Self {
+            buf: &mut [],
+            stride: 0,
+            biased_origin: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    #[inline(always)]
+    fn local_center(&self, x: isize, y: isize) -> usize {
+        (self.biased_origin + y * self.stride as isize + x) as usize
+    }
+
+    /// Reborrows this band as a read-only [`PlaneBand`].
+    #[inline(always)]
+    pub fn as_band(&self) -> PlaneBand<'_> {
+        PlaneBand {
+            buf: self.buf,
+            stride: self.stride,
+            biased_origin: self.biased_origin,
+        }
+    }
+
+    /// Sample at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn at(&self, x: isize, y: isize) -> u8 {
+        self.buf[self.local_center(x, y)]
+    }
+
+    /// Writes the sample at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn set(&mut self, x: isize, y: isize, v: u8) {
+        let i = self.local_center(x, y);
+        self.buf[i] = v;
+    }
+
+    /// A read cursor anchored at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn cursor(&self, x: isize, y: isize) -> PlaneCursor<'_> {
+        debug_assert!(self.stride <= u32::MAX as usize);
+        PlaneCursor {
+            buf: self.buf,
+            center: self.local_center(x, y),
+            stride: self.stride,
+        }
+    }
+
+    /// A write cursor anchored at logical `(x, y)` within this band.
+    #[inline(always)]
+    pub fn cursor_mut(&mut self, x: isize, y: isize) -> PlaneCursorMut<'_> {
+        debug_assert!(self.stride <= u32::MAX as usize);
+        let center = self.local_center(x, y);
+        PlaneCursorMut {
+            buf: self.buf,
+            center,
+            stride: self.stride,
+        }
     }
 }
 
@@ -285,26 +581,18 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// A read cursor over pixel samples, in whichever storage the plane lives in.
+/// A `Copy` read cursor over pixel samples.
 ///
-/// `RefSamples` cannot carry `advance` because `PlaneCursorMut` implements it and holds
-/// a `&mut`, so it is not `Copy`. This trait is the `Copy` half, for kernels that walk
-/// sub-blocks and must rebase over both a plain slice plane (`PlaneCursor`) and a shared
-/// interior-mutable one (`RecCursor`).
-///
-/// A kernel has to accept both because the encoder's source picture is not read-only:
-/// `VaaBackgroundMbDataUpdate` copies previous-source into current-source in-fork, per
-/// macroblock, so a source plane is reached through the shared seam exactly as the
-/// reconstruction planes are, while a prediction scratch on `SMbCache` is an owned array
-/// and stays a plain slice.
+/// `RefSamples` cannot require `Copy` because [`PlaneCursorMut`] implements it and holds
+/// a `&mut`. This trait is the `Copy` half, for kernels that walk sub-blocks and rebase
+/// their read cursor by value.
 pub trait SampleCursor: RefSamples + Copy {}
 
 impl SampleCursor for PlaneCursor<'_> {}
 
-/// Zero-copy view of one `W`-sample row inside a [`BlockRows`] span (`&[u8; W]` on a
-/// plain byte plane, `&[Cell<u8>; W]` on a shared plane), allowing kernels with odd or
-/// padded row widths (`SW = 9, 13, 14, 17, 21, 22`) to load register-sized sub-windows
-/// directly from memory without staging `[u8; SW]` on the stack.
+/// Zero-copy view of one `W`-sample row inside a [`BlockRows`] span (`&[u8; W]`),
+/// allowing kernels with odd or padded row widths (`SW = 9, 13, 14, 17, 21, 22`) to load
+/// register-sized sub-windows directly from memory without staging `[u8; SW]` on the stack.
 #[allow(private_bounds)]
 pub trait RowSampleView<const W: usize>: Copy + sealed::Sealed {
     /// Sample at column `x` (`x < W`).
@@ -329,29 +617,12 @@ impl<const W: usize> RowSampleView<W> for &[u8; W] {
     }
 }
 
-impl<const W: usize> sealed::Sealed for &[core::cell::Cell<u8>; W] {}
-impl<const W: usize> RowSampleView<W> for &[core::cell::Cell<u8>; W] {
-    #[inline(always)]
-    fn sample(self, x: usize) -> u8 {
-        self[x].get()
-    }
-
-    #[inline(always)]
-    fn sub<const N: usize>(self, x: usize) -> [u8; N] {
-        let s = self[x..x + N]
-            .first_chunk::<N>()
-            .expect("sub-slice within row");
-        core::array::from_fn(|i| s[i].get())
-    }
-}
-
 /// The rows of a block whose bounds have already been checked once, as a whole.
 ///
 /// Handed out by [`RefSamples::span`], which is where the checking happens and where the
 /// argument for why the rows inside are free is written down.
 ///
-/// Sealed to the crate's span types ([`PlaneSpan`] and
-/// [`CellSpan`](crate::encoder::rec_view::CellSpan)).
+/// Sealed to [`PlaneSpan`].
 #[allow(private_bounds)]
 pub trait BlockRows: sealed::Sealed {
     /// Borrowed view of a `W`-sample row inside this span.
@@ -530,15 +801,9 @@ pub trait RefSamples: sealed::Sealed {
     /// `h` consecutive rows of `N` samples each from `(dx0, dy0)` — the folded block
     /// walk, which lets the SAD family be generic without paying for it.
     ///
-    /// Not named `row_windows`: [`PlaneCursor::row_windows`] and `RecCursor`'s are
-    /// inherent methods yielding `&[u8; N]` and `&[Cell<u8>; N]`, and an inherent method
-    /// wins over a same-named trait method wherever the receiver's type is known, so the
-    /// spelling would mean different things in generic and concrete code.
-    ///
-    /// Yields [`Row`](Self::Row) — a borrow for the plane cursors, an owned `RowBuf` only
-    /// for the cell view; `N` sizes the slice, not the returned type. This walk slices
-    /// once per block per side, where a per-row `row_n` walk makes a 16x8 SAD emit 32
-    /// bounds branches before reading a sample.
+    /// Not named `row_windows`: [`PlaneCursor::row_windows`] is an inherent method
+    /// yielding `&[u8; N]`. This walk slices once per block per side, where a per-row
+    /// `row_n` walk makes a 16x8 SAD emit 32 bounds branches before reading a sample.
     ///
     /// # Panics
     /// If the block leaves the buffer, at the first slicing.
@@ -549,9 +814,7 @@ pub trait RefSamples: sealed::Sealed {
         h: usize,
     ) -> impl Iterator<Item = Self::Row<'_>>;
 
-    /// Rows of a block that has been bounds-checked once, one type per implementor:
-    /// `&[u8]` plus a stride for the plane cursors, `&[Cell<u8>]` plus a stride for the
-    /// shared view. Both hand out rows by value through [`BlockRows::row`].
+    /// Rows of a block that has been bounds-checked once (`&[u8]` plus a narrowed stride).
     type Span<'a>: BlockRows
     where
         Self: 'a;
@@ -610,18 +873,12 @@ pub trait RefSamples: sealed::Sealed {
     where
         Self: Sized;
 
-    /// A run-time-length row, borrowed where the cursor can lend one and owned only where
-    /// it cannot.
+    /// A run-time-length row borrowed from the cursor.
     ///
     /// [`row_blocks`](Self::row_blocks) covers the fixed-size block walks and
     /// [`span`](Self::span) the shaped ones; this is for a caller whose row length is a
     /// run-time value and has neither — the 4-sample prediction rows the SSE2 IDCT kernel
-    /// reads. An associated type because a copy here is measurable:
-    /// `Row<'a> = &'a [u8]` for the plane cursors, and only
-    /// [`RecCursor`](crate::encoder::rec_view::RecCursor) pays for a copy.
-    ///
-    /// The bound is `Deref<Target = [u8]>`, so a consumer writes `row[j]` and
-    /// `row.iter()` without knowing which it got.
+    /// reads.
     type Row<'a>: std::ops::Deref<Target = [u8]>
     where
         Self: 'a;
@@ -632,53 +889,6 @@ pub trait RefSamples: sealed::Sealed {
     /// If the row leaves the buffer, at the slicing — same contract as
     /// [`row_n`](Self::row_n).
     fn row_view(&self, dy: isize, dx0: isize, len: usize) -> Self::Row<'_>;
-}
-
-/// Longest run-time row [`RefSamples::row_view`] will carry by value.
-///
-/// The remaining callers read four samples; 32 is headroom.
-pub const ROW_BUF_MAX: usize = 32;
-
-/// An owned row — [`RefSamples::Row`] for the cursors that cannot lend one.
-///
-/// For one implementor only: a shared cell view has no `&[u8]` to hand out, so its row is
-/// copied into this. Every other implementor's `Row` is a borrow.
-#[derive(Clone, Copy, Debug)]
-pub struct RowBuf {
-    buf: [u8; ROW_BUF_MAX],
-    len: usize,
-}
-
-impl RowBuf {
-    /// An empty row of `len` samples, to be filled by the caller.
-    ///
-    /// # Panics
-    /// If `len` exceeds [`ROW_BUF_MAX`].
-    #[inline]
-    pub fn new(len: usize) -> Self {
-        assert!(
-            len <= ROW_BUF_MAX,
-            "row of {len} samples exceeds ROW_BUF_MAX"
-        );
-        Self {
-            buf: [0; ROW_BUF_MAX],
-            len,
-        }
-    }
-
-    /// The writable prefix.
-    #[inline]
-    pub fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.len]
-    }
-}
-
-impl std::ops::Deref for RowBuf {
-    type Target = [u8];
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
 }
 
 /// A read view of a plane anchored at some sample — the safe form of a `const uint8_t*`
@@ -752,12 +962,7 @@ impl RefSamples for PlaneCursor<'_> {
 /// A plane cursor that can be read *and* written — [`RefSamples`] plus `set`.
 ///
 /// The deblocking filters are the one kernel family that reads and writes the same
-/// samples, over two storages: the decoder's ordinary picture as [`PlaneCursorMut`], and
-/// the encoder's reconstruction picture through the seam's `RecCursor`.
-///
-/// `set` takes `&mut self` even though `RecCursor` can write through `&self` — the
-/// stricter signature is the one that fits both. No method here hands out `&mut [u8]`
-/// into the plane.
+/// samples through [`PlaneCursorMut`].
 pub trait PlaneSamples: RefSamples {
     /// Writes the sample at `(dx, dy)` from the anchor.
     fn set(&mut self, dx: isize, dy: isize, v: u8);
@@ -1012,10 +1217,8 @@ impl BlockRows for PlaneSpan<'_> {
 /// `y * stride + x + W <= len` holds for every row the block contains and LLVM drops the
 /// branch.
 ///
-/// Not `BlockRows`: that trait hands rows out by value because a shared cell view has no
-/// `&[u8]` to lend, and a destination has to be written through. The reconstruction seam's
-/// own write path is
-/// [`RecCursor::write_row`](crate::encoder::rec_view::RecCursor::write_row).
+/// Not `BlockRows`: that trait hands rows out read-only, while a destination has to be
+/// written through.
 #[derive(Debug)]
 pub struct PlaneSpanMut<'a> {
     buf: &'a mut [u8],
@@ -1104,6 +1307,16 @@ impl<'a> PlaneSpanMut<'a> {
 }
 
 impl<'a> PlaneCursor<'a> {
+    /// An empty cursor over a zero-length slice.
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            buf: &[],
+            center: 0,
+            stride: 0,
+        }
+    }
+
     /// Anchors a cursor at byte `center` of `buf`.
     ///
     /// `stride` must fit in a `u32`. Every picture line size in the codec is an `int32_t`,
@@ -1174,23 +1387,13 @@ impl<'a> PlaneCursor<'a> {
 
     /// The same view rebased by `(dx, dy)` — `pSrc.add(dy * stride + dx)`.
     ///
-    /// Only the anchor is re-checked: this cursor's stride already satisfied
-    /// [`new`](Self::new)'s two stride assertions when it was made, and rebasing does not
-    /// change it.
-    ///
-    /// # Panics
-    /// If the new anchor is outside the buffer, per [`new`](Self::new).
-    #[inline]
+    /// Bounds enforcement happens when samples or spans are sliced from `self.buf`, so
+    /// stepping a cursor across candidate positions pays no panicking branch per step.
+    #[inline(always)]
     pub fn advance(self, dx: isize, dy: isize) -> Self {
-        let center = idx(self.center, dx, dy, self.stride);
-        assert!(
-            center < self.buf.len(),
-            "cursor anchor {center} outside a buffer of {} bytes",
-            self.buf.len()
-        );
         Self {
             buf: self.buf,
-            center,
+            center: idx(self.center, dx, dy, self.stride),
             stride: self.stride,
         }
     }
@@ -1303,13 +1506,14 @@ impl<'a> PlaneCursorMut<'a> {
 
     /// The same view rebased by `(dx, dy)`, consuming it — the `pDstY.add(16)` of
     /// the MB walk.
-    ///
-    /// # Panics
-    /// If the new anchor is outside the buffer, per [`new`](Self::new).
-    #[inline]
+    #[inline(always)]
     pub fn advance(self, dx: isize, dy: isize) -> Self {
         let center = idx(self.center, dx, dy, self.stride);
-        Self::new(self.buf, center, self.stride)
+        Self {
+            buf: self.buf,
+            center,
+            stride: self.stride,
+        }
     }
 
     /// A *borrowed* write cursor rebased by `(dx, dy)` — the safe form of passing
@@ -1320,13 +1524,14 @@ impl<'a> PlaneCursorMut<'a> {
     /// kernel hands each of its sub-blocks to an inner one and then carries on —
     /// `IdctFourResAddPred_c` calling `IdctResAddPred_c` four times. The returned cursor
     /// borrows `self`, so the two can never be live at once.
-    ///
-    /// # Panics
-    /// If the new anchor is outside the buffer, per [`new`](Self::new).
-    #[inline]
+    #[inline(always)]
     pub fn reborrow(&mut self, dx: isize, dy: isize) -> PlaneCursorMut<'_> {
         let center = idx(self.center, dx, dy, self.stride);
-        PlaneCursorMut::new(self.buf, center, self.stride)
+        PlaneCursorMut {
+            buf: self.buf,
+            center,
+            stride: self.stride,
+        }
     }
 
     /// A read-only cursor at the same anchor, borrowing this one.
@@ -1736,5 +1941,61 @@ mod tests {
         c.set_block::<0, 4>(0, 0, &[[]; 4]);
         c.set_block::<0, 0>(0, 0, &[]);
         assert_eq!(buf, [0x5Au8; 64]);
+    }
+
+    #[test]
+    fn split_bands_mut_carves_disjoint_rows_with_horizontal_padding() {
+        let mut p = PaddedPlane::new(32, 32, 8, 48);
+        let mut bands = p.split_bands_mut(&[(0, 16), (16, 32), (0, 0)]);
+        assert_eq!(bands.len(), 3);
+        assert!(bands[2].is_empty());
+
+        let (b0, rest) = bands.split_at_mut(1);
+        let b1 = &mut rest[0];
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Left/right padding on rows 0..16 is writable in band 0.
+                b0[0].set(-1, 0, 0xAA);
+                b0[0].set(32, 15, 0xBB);
+                for y in 0..16isize {
+                    b0[0].cursor_mut(0, y).row_mut(0, 0, 32).fill(y as u8 + 1);
+                }
+            });
+            s.spawn(|| {
+                b1.set(-1, 16, 0xCC);
+                b1.set(32, 31, 0xDD);
+                for y in 16..32isize {
+                    b1.cursor_mut(0, y).row_mut(0, 0, 32).fill(y as u8 + 1);
+                }
+            });
+        });
+
+        assert_eq!(p.at(-1, 0), 0xAA);
+        assert_eq!(p.at(32, 15), 0xBB);
+        assert_eq!(p.at(-1, 16), 0xCC);
+        assert_eq!(p.at(32, 31), 0xDD);
+        for y in 0..32isize {
+            for x in 0..32isize {
+                assert_eq!(p.at(x, y), y as u8 + 1, "at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn band_panics_on_read_above_top_row() {
+        let mut p = PaddedPlane::new(32, 32, 8, 48);
+        let bands = p.split_bands_mut(&[(0, 16), (16, 32)]);
+        // Reading row 15 from a band starting at row 16 must panic.
+        let _ = bands[1].cursor(0, 16).at(0, -1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn band_panics_on_read_below_bottom_row() {
+        let mut p = PaddedPlane::new(32, 32, 8, 48);
+        let bands = p.split_bands_mut(&[(0, 16), (16, 32)]);
+        // Reading row 16 from a band ending at row 16 must panic.
+        let _ = bands[0].cursor(0, 15).at(0, 1);
     }
 }

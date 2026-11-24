@@ -75,8 +75,7 @@
 //!    unconditional — `f` runs under `catch_unwind`, so a panic in the scope body
 //!    also waits, then resumes unwinding. The wait's `Acquire` load against the
 //!    worker's `Release` decrement is the happens-before edge that publishes
-//!    everything the job wrote to whatever reads it after the scope; the
-//!    reconstruction seam (`rec_view.rs`) relies on that edge.
+//!    everything the job wrote to whatever reads it after the scope.
 //! 2. **The decrement is the last thing a job does with anything borrowed.** The
 //!    user's closure is consumed by its call, so its captures are dropped when it
 //!    returns; the result `T` (which may itself borrow `'scope`) is stored in the
@@ -105,9 +104,9 @@
 //!
 //! # Invariants the encoder relies on
 //!
-//! * The pool is built by `RequestMtResource`, with `uiThreadBsBufferNum`
-//!   workers, only when `iMultipleThreadIdc > 1`; single-threaded encoding never
-//!   constructs one.
+//! * The pool is built by `RequestMtResource`, with `uiThreadBsBufferNum - 1`
+//!   background workers (the calling thread executes one slice job directly), only
+//!   when `iMultipleThreadIdc > 1`; single-threaded encoding never constructs one.
 //! * It lives in `SSliceThreading`, which the context drops at
 //!   `WelsUninitEncoderExt`, so the threads end with the encoder and none outlives
 //!   it.
@@ -118,7 +117,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, Thread};
 
@@ -131,6 +130,10 @@ pub type Payload = Box<dyn Any + Send + 'static>;
 
 /// A parked worker's mailbox: its thread handle, registered by the worker itself
 /// before it first parks, and the flag a producer claims to wake it.
+///
+/// Cache-line padded (`128` bytes covers both 64-byte x86 and 128-byte ARM64
+/// cache lines) to avoid false sharing between adjacent workers' `parked` atomics.
+#[repr(align(128))]
 struct WorkerSlot {
     thread: OnceLock<Thread>,
     /// `true` while the worker is parked or about to park. A producer that wants
@@ -150,6 +153,9 @@ struct Shared {
     /// Worker threads that have not yet exited their loop. The `Drop` test reads
     /// it after the join.
     live: AtomicUsize,
+    /// Single-slot freelist for reusing `Arc<ScopeData>` across consecutive frames
+    /// once all previous workers have dropped their references (`Arc::get_mut`).
+    cached_scope: Mutex<Option<Arc<ScopeData>>>,
 }
 
 impl Shared {
@@ -202,7 +208,10 @@ impl Shared {
     fn wait_for_work(&self, slot: &WorkerSlot) {
         let has_work =
             || self.pending.load(Ordering::SeqCst) > 0 || self.stop.load(Ordering::SeqCst);
-        slot.parked.store(true, Ordering::SeqCst);
+        // Use an RMW (`swap`) rather than a plain `store` so the store-load barrier
+        // against `pending`/`stop` is enforced even under TCG emulators where
+        // AArch64 `STLR`+`LDAR` lacks a host store-load fence.
+        slot.parked.swap(true, Ordering::SeqCst);
         loop {
             if has_work() {
                 slot.parked.store(false, Ordering::SeqCst);
@@ -218,11 +227,32 @@ impl Shared {
         }
     }
 
-    /// The calling thread's wait for `done`: park until every completing job
-    /// unparks the scope's owner, which is this thread.
-    fn wait_caller(&self, done: impl Fn() -> bool) {
-        while !done() {
-            thread::park();
+    fn acquire_scope_data(&self) -> Arc<ScopeData> {
+        let cached = self
+            .cached_scope
+            .try_lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(mut arc) = cached
+            && let Some(data) = Arc::get_mut(&mut arc)
+        {
+            data.state.store(0, Ordering::Relaxed);
+            data.unhandled_panics.store(0, Ordering::Relaxed);
+            data.owner = thread::current();
+            return arc;
+        }
+        Arc::new(ScopeData {
+            state: AtomicUsize::new(0),
+            unhandled_panics: AtomicUsize::new(0),
+            owner: thread::current(),
+        })
+    }
+
+    fn release_scope_data(&self, data: Arc<ScopeData>) {
+        if let Ok(mut slot) = self.cached_scope.try_lock()
+            && slot.is_none()
+        {
+            *slot = Some(data);
         }
     }
 
@@ -264,6 +294,7 @@ impl WorkerPool {
                 stop: AtomicBool::new(false),
                 workers: Vec::new(),
                 live: AtomicUsize::new(0),
+                cached_scope: Mutex::new(None),
             }),
             threads: Vec::new(),
         }
@@ -290,6 +321,7 @@ impl WorkerPool {
                 })
                 .collect(),
             live: AtomicUsize::new(workers),
+            cached_scope: Mutex::new(None),
         });
         let mut pool = Self {
             shared,
@@ -338,34 +370,82 @@ impl WorkerPool {
     where
         F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R,
     {
-        let scope = Scope {
-            shared: &self.shared,
-            data: Arc::new(ScopeData {
-                running: AtomicUsize::new(0),
-                unhandled_panics: AtomicUsize::new(0),
-                owner: thread::current(),
-            }),
-            scope: PhantomData,
-            env: PhantomData,
-            not_sync: PhantomData,
+        let data = self.shared.acquire_scope_data();
+        let result = {
+            let scope = Scope {
+                shared: &self.shared,
+                data: Arc::clone(&data),
+                scope: PhantomData,
+                env: PhantomData,
+                not_sync: PhantomData,
+            };
+
+            // `f` under `catch_unwind` so that the wait below runs on the panic path
+            // too: the frame's locals die when this function unwinds, and a job may
+            // still be borrowing them.
+            let res = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+
+            // The wait, on both paths: what makes the erased `'static` in `spawn` sound
+            // (module header, point 1).
+            scope.wait_all();
+            res
         };
 
-        // `f` under `catch_unwind` so that the wait below runs on the panic path
-        // too: the frame's locals die when this function unwinds, and a job may
-        // still be borrowing them.
-        let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
-
-        // The wait, on both paths: what makes the erased `'static` in `spawn` sound
-        // (module header, point 1).
-        scope.wait_all();
+        let unhandled = data.unhandled_panics.load(Ordering::Relaxed);
+        self.shared.release_scope_data(data);
 
         match result {
             Err(e) => resume_unwind(e),
-            Ok(_) if scope.data.unhandled_panics.load(Ordering::Relaxed) != 0 => {
+            Ok(_) if unhandled != 0 => {
                 resume_unwind(Box::new("a job spawned on the worker pool panicked"))
             }
             Ok(r) => r,
         }
+    }
+
+    /// Runs `f` on every element of `items` in parallel, executing `items[0]`
+    /// directly on the calling thread while background workers execute `items[1..]`.
+    ///
+    /// Avoids per-job `Arc<Packet>`/`Mutex` allocations and `JobHandle` vectors.
+    /// Panics inside any job are caught and reported via the return value (`true`
+    /// if all jobs succeeded, `false` if any panicked). When `items.len() <= 1`,
+    /// no pool synchronization or heap allocation occurs.
+    #[must_use]
+    pub fn for_each_mut<T, F>(&self, items: &mut [T], f: F) -> bool
+    where
+        T: Send,
+        F: Fn(&mut T) + Sync,
+    {
+        let Some((first, rest)) = items.split_first_mut() else {
+            return true;
+        };
+        if rest.is_empty() {
+            return match catch_unwind(AssertUnwindSafe(|| f(first))) {
+                Ok(()) => true,
+                Err(payload) => {
+                    let _ = drop_catching_panic(payload);
+                    false
+                }
+            };
+        }
+        let panicked = AtomicBool::new(false);
+        let f_ref = &f;
+        let panicked_ref = &panicked;
+        self.scope(|s| {
+            for item in rest.iter_mut() {
+                s.spawn_detached(move || {
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f_ref(item))) {
+                        panicked_ref.store(true, Ordering::Release);
+                        let _ = drop_catching_panic(payload);
+                    }
+                });
+            }
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f_ref(first))) {
+                panicked_ref.store(true, Ordering::Release);
+                let _ = drop_catching_panic(payload);
+            }
+        });
+        !panicked.load(Ordering::Acquire)
     }
 
     /// The shared block, for the tests that watch the threads exit.
@@ -413,14 +493,22 @@ impl fmt::Debug for WorkerPool {
     }
 }
 
+/// High bit of [`ScopeData::state`]: set while the owning thread is parked in
+/// [`Scope::wait_all`]. Packing count and waiter flag into one atomic word gives
+/// a single total modification order (`fetch_sub` vs `fetch_or`) with zero
+/// missed wakeups and only one `unpark()` from the final completing worker.
+const WAITING_ALL_BIT: usize = 1usize << (usize::BITS - 1);
+const RUNNING_MASK: usize = !WAITING_ALL_BIT;
+
 /// One scope's bookkeeping, `Arc`-owned so a job can finish its decrement after
 /// `scope` has returned.
 struct ScopeData {
-    /// Jobs spawned and not yet completed.
-    running: AtomicUsize,
+    /// Low bits: jobs spawned and not yet completed (`RUNNING_MASK`).
+    /// High bit (`WAITING_ALL_BIT`): set while the owner is parked in `wait_all`.
+    state: AtomicUsize,
     /// Jobs that panicked and whose `Err` no `join` has taken yet.
     unhandled_panics: AtomicUsize,
-    /// The thread that called `scope`, which every completion unparks.
+    /// The thread that called `scope`, unparked only when waiting.
     owner: Thread,
 }
 
@@ -437,7 +525,90 @@ pub struct Scope<'scope, 'env: 'scope> {
     not_sync: PhantomData<*mut ()>,
 }
 
+/// Aborts the process if dropped during an unwind instead of being disarmed with
+/// [`std::mem::forget`]. Guards sections whose invariants (`Scope::wait_all`
+/// reaching `RUNNING_MASK == 0`, or a job wrapper decrementing `ScopeData::state`)
+/// must hold unconditionally for `'scope` lifetime erasure to remain sound.
+struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        std::process::abort();
+    }
+}
+
+/// Rolls back a pre-enqueue `ScopeData::state` increment if boxing or pushing a
+/// job unwinds before the job enters the queue.
+struct RollbackRunning<'a>(&'a ScopeData);
+
+impl Drop for RollbackRunning<'_> {
+    fn drop(&mut self) {
+        let prev = self.0.state.fetch_sub(1, Ordering::AcqRel);
+        if prev == (1 | WAITING_ALL_BIT) {
+            self.0.owner.unpark();
+        }
+    }
+}
+
+/// Drops `value` inside `catch_unwind`, returning `true` if `Drop` panicked.
+/// If dropping the resulting panic payload also panics, it unwinds into the
+/// caller's [`AbortOnUnwind`] guard rather than escaping the job wrapper.
+fn drop_catching_panic<T>(value: T) -> bool {
+    match catch_unwind(AssertUnwindSafe(move || drop(value))) {
+        Ok(()) => false,
+        Err(payload) => {
+            let _ = catch_unwind(AssertUnwindSafe(move || drop(payload)));
+            true
+        }
+    }
+}
+
 impl<'scope, 'env> Scope<'scope, 'env> {
+    /// Erases `'scope` to `'static` and enqueues `wrapper`. The sole `unsafe` site
+    /// in this module — see the module header for the soundness argument.
+    fn push_scoped<F>(&'scope self, wrapper: F)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        let boxed: ScopedJob<'scope> = Box::new(wrapper);
+        // SAFETY: lifetime erasure only — the same trait object with `'scope` read
+        // as `'static`, an identical fat-pointer layout. Sound because the closure
+        // is called, and every capture and result dropped, before `'scope` can end:
+        // `scope` waits for `ScopeData::running` to reach zero on both its return
+        // and its unwind path (guarded by `AbortOnUnwind`), and every caller of
+        // `push_scoped` decrements `running` only after the user's closure has been
+        // consumed and its result handed over (catching panicking drops and aborting
+        // on any escape). See the module header.
+        #[allow(unsafe_code)]
+        let job: Job = unsafe { std::mem::transmute::<ScopedJob<'scope>, Job>(boxed) };
+        self.shared.push(job);
+    }
+
+    /// Spawns a job without allocating a `Packet`/`JobHandle`, synchronized solely
+    /// by `Scope::wait_all()`. Used by [`WorkerPool::for_each_mut`].
+    fn spawn_detached<F>(&'scope self, f: F)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        let data = Arc::clone(&self.data);
+        self.data.state.fetch_add(1, Ordering::Relaxed);
+        let rollback = RollbackRunning(&self.data);
+
+        self.push_scoped(move || {
+            let no_unwind = AbortOnUnwind;
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
+                data.unhandled_panics.fetch_add(1, Ordering::Relaxed);
+                let _ = drop_catching_panic(payload);
+            }
+            let prev = data.state.fetch_sub(1, Ordering::AcqRel);
+            if prev == (1 | WAITING_ALL_BIT) {
+                data.owner.unpark();
+            }
+            std::mem::forget(no_unwind);
+        });
+        std::mem::forget(rollback);
+    }
+
     /// Hands the job to the pool and returns a handle for its result. The job
     /// runs on the first idle worker, or on the calling thread while it waits
     /// in [`JobHandle::join`] or at the end of the scope, whichever comes first.
@@ -449,45 +620,45 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     {
         let packet = Arc::new(Packet {
             result: Mutex::new(None),
-            done: AtomicBool::new(false),
+            state: AtomicU8::new(PACKET_RUNNING),
         });
         let their_packet = Arc::clone(&packet);
         let data = Arc::clone(&self.data);
-        self.data.running.fetch_add(1, Ordering::SeqCst);
+        self.data.state.fetch_add(1, Ordering::Relaxed);
+        let rollback = RollbackRunning(&self.data);
 
-        let wrapper = move || {
+        self.push_scoped(move || {
+            let no_unwind = AbortOnUnwind;
             // `f` is consumed by the call: its captures are dropped by the time
             // this returns, panic or not.
             let result = catch_unwind(AssertUnwindSafe(f));
             if result.is_err() {
-                // Before `done`, so a `join` that observes the `Err` always finds
-                // this count already raised.
+                // Before `PACKET_DONE`, so a `join` that observes the `Err` always
+                // finds this count already raised.
                 data.unhandled_panics.fetch_add(1, Ordering::Relaxed);
             }
             *their_packet
                 .result
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(result);
-            their_packet.done.store(true, Ordering::Release);
+            let wake_joiner =
+                their_packet.state.swap(PACKET_DONE, Ordering::AcqRel) == PACKET_WAITING;
             // The result may borrow `'scope`; if the handle is already gone this
             // drops it, and it happens before the decrement (module header,
-            // point 2).
-            drop(their_packet);
-            data.running.fetch_sub(1, Ordering::Release);
-            data.owner.unpark();
+            // point 2). Catch any panic in `T::drop` or a panic payload's `Drop`
+            // so `data.state` is always decremented and a panicking `T::drop` is
+            // still reported by `scope()`.
+            if drop_catching_panic(their_packet) {
+                data.unhandled_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            let prev = data.state.fetch_sub(1, Ordering::AcqRel);
+            if wake_joiner || prev == (1 | WAITING_ALL_BIT) {
+                data.owner.unpark();
+            }
             // `data` is an `Arc` — heap, not the frame — and is dropped here.
-        };
-
-        let boxed: ScopedJob<'scope> = Box::new(wrapper);
-        // SAFETY: lifetime erasure only — the same trait object with `'scope` read
-        // as `'static`, an identical fat-pointer layout. Sound because the closure
-        // is called, and every capture and result dropped, before `'scope` can end:
-        // `scope` waits for `ScopeData::running` to reach zero on both its return
-        // and its unwind path, and the wrapper above decrements only after `f` has
-        // been consumed and its result handed over. See the module header.
-        #[allow(unsafe_code)]
-        let job: Job = unsafe { std::mem::transmute::<ScopedJob<'scope>, Job>(boxed) };
-        self.shared.push(job);
+            std::mem::forget(no_unwind);
+        });
+        std::mem::forget(rollback);
 
         JobHandle {
             packet,
@@ -500,24 +671,39 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// Waits until every job of this scope has completed, running queued ones on
     /// this thread meanwhile.
     fn wait_all(&self) {
-        let done = || self.data.running.load(Ordering::Acquire) == 0;
+        // Unwinding out of `wait_all()` before `RUNNING_MASK` reaches zero would
+        // let `'scope` end while background workers still hold erased borrows
+        // into the caller's stack. Abort on any unwind here, as `std::thread::scope`
+        // does.
+        let no_unwind = AbortOnUnwind;
         loop {
-            if done() {
-                return;
+            if (self.data.state.load(Ordering::Acquire) & RUNNING_MASK) == 0 {
+                break;
             }
             if let Some(job) = self.shared.try_pop() {
                 job();
                 continue;
             }
-            self.shared.wait_caller(done);
+            let prev = self.data.state.fetch_or(WAITING_ALL_BIT, Ordering::AcqRel);
+            if (prev & RUNNING_MASK) != 0 {
+                while (self.data.state.load(Ordering::Acquire) & RUNNING_MASK) != 0 {
+                    thread::park();
+                }
+            }
+            self.data.state.fetch_and(RUNNING_MASK, Ordering::Relaxed);
+            break;
         }
+        std::mem::forget(no_unwind);
     }
 }
 
 impl fmt::Debug for Scope<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Scope")
-            .field("running", &self.data.running.load(Ordering::Relaxed))
+            .field(
+                "running",
+                &(self.data.state.load(Ordering::Relaxed) & RUNNING_MASK),
+            )
             .field(
                 "unhandled_panics",
                 &self.data.unhandled_panics.load(Ordering::Relaxed),
@@ -526,11 +712,17 @@ impl fmt::Debug for Scope<'_, '_> {
     }
 }
 
+/// [`Packet::state`] values: `RUNNING -> WAITING -> DONE` (caller parked) or
+/// `RUNNING -> DONE` (worker finished before caller parked).
+const PACKET_RUNNING: u8 = 0;
+const PACKET_WAITING: u8 = 1;
+const PACKET_DONE: u8 = 2;
+
 /// A job's result slot.
 struct Packet<T> {
     result: Mutex<Option<Result<T, Payload>>>,
-    /// Set, with `Release`, after the result is stored.
-    done: AtomicBool,
+    /// Single-atomic completion + waiter state machine (`AcqRel`).
+    state: AtomicU8,
 }
 
 /// An owned permission to wait for one job; see [`Scope::spawn`].
@@ -547,16 +739,30 @@ impl<T> JobHandle<'_, T> {
     /// `ScopedJoinHandle::join`. While the job is still queued, or another job
     /// is, this thread runs them itself rather than waiting.
     pub fn join(self) -> Result<T, Payload> {
-        let done = || self.packet.done.load(Ordering::Acquire);
         loop {
-            if done() {
+            if self.packet.state.load(Ordering::Acquire) == PACKET_DONE {
                 break;
             }
             if let Some(job) = self.shared.try_pop() {
                 job();
                 continue;
             }
-            self.shared.wait_caller(done);
+            if self
+                .packet
+                .state
+                .compare_exchange(
+                    PACKET_RUNNING,
+                    PACKET_WAITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                while self.packet.state.load(Ordering::Acquire) != PACKET_DONE {
+                    thread::park();
+                }
+                break;
+            }
         }
         let result = self
             .packet
@@ -573,7 +779,7 @@ impl<T> JobHandle<'_, T> {
 
     /// Whether the job has completed (not blocking).
     pub fn is_finished(&self) -> bool {
-        self.packet.done.load(Ordering::Acquire)
+        self.packet.state.load(Ordering::Acquire) == PACKET_DONE
     }
 }
 
@@ -891,5 +1097,235 @@ mod tests {
     fn the_pool_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WorkerPool>();
+    }
+
+    /// `WorkerSlot` is cache-line aligned to prevent false sharing between adjacent
+    /// workers' `parked` atomics.
+    #[test]
+    fn worker_slot_is_cache_line_padded() {
+        assert!(align_of::<WorkerSlot>() >= 64);
+        assert!(size_of::<WorkerSlot>() >= 128);
+    }
+
+    /// `for_each_mut` runs `items[0]` inline on the calling thread while the `N - 1`
+    /// background workers run `items[1..]` concurrently.
+    #[test]
+    fn for_each_mut_runs_first_inline_and_rest_on_workers() {
+        let pool = WorkerPool::new(3);
+        let caller = thread::current().id();
+        let gate = Barrier::new(4);
+        let mut slots: [(usize, Option<thread::ThreadId>); 4] =
+            [(0, None), (1, None), (2, None), (3, None)];
+        let ok = pool.for_each_mut(&mut slots, |(idx, tid)| {
+            // All 4 items must reach the barrier concurrently (1 caller + 3 workers).
+            gate.wait();
+            *tid = Some(thread::current().id());
+            *idx = (*idx + 1) * 10;
+        });
+        assert!(ok);
+        assert_eq!(slots[0].0, 10);
+        assert_eq!(slots[0].1, Some(caller), "items[0] must run on the caller");
+        for (k, (val, tid)) in slots[1..].iter().enumerate() {
+            assert_eq!(*val, (k + 2) * 10);
+            assert_ne!(
+                *tid,
+                Some(caller),
+                "background item {} must run on a worker thread",
+                k + 1
+            );
+        }
+    }
+
+    /// Empty and single-element batches run inline with no pool wakeup.
+    #[test]
+    fn for_each_mut_handles_empty_and_single_inline() {
+        let pool = WorkerPool::new(2);
+        let mut empty: [u32; 0] = [];
+        assert!(pool.for_each_mut(&mut empty, |x| *x += 1));
+
+        let caller = thread::current().id();
+        let mut one = [(0u32, None)];
+        assert!(pool.for_each_mut(&mut one, |(v, tid)| {
+            *v = 77;
+            *tid = Some(thread::current().id());
+        }));
+        assert_eq!(one[0], (77, Some(caller)));
+    }
+
+    /// Panics inside `for_each_mut` (on either caller or worker) are caught and
+    /// reported as `false`, leaving the pool healthy.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn for_each_mut_catches_panics_and_leaves_pool_usable() {
+        let pool = WorkerPool::new(2);
+        let mut items = [0u32, 1, 2];
+        let ok = pool.for_each_mut(&mut items, |x| {
+            if *x == 1 {
+                panic!("worker failure");
+            }
+            *x += 10;
+        });
+        assert!(!ok);
+        assert_eq!(items[0], 10);
+        assert_eq!(items[2], 12);
+
+        let mut items2 = [0u32, 1, 2];
+        let ok2 = pool.for_each_mut(&mut items2, |x| {
+            if *x == 0 {
+                panic!("caller failure");
+            }
+            *x += 20;
+        });
+        assert!(!ok2);
+        assert_eq!(items2[1], 21);
+        assert_eq!(items2[2], 22);
+
+        // Pool remains fully operational afterwards.
+        let mut items3 = [1u32, 2, 3];
+        assert!(pool.for_each_mut(&mut items3, |x| *x *= 3));
+        assert_eq!(items3, [3, 6, 9]);
+    }
+
+    /// Consecutive scopes reuse the cached `Arc<ScopeData>` allocation once the
+    /// previous scope's workers have dropped their references.
+    #[test]
+    fn consecutive_scopes_reuse_cached_scope_data() {
+        let pool = WorkerPool::new(1);
+        let mut ptrs = Vec::new();
+        for _ in 0..8 {
+            let p = pool.scope(|s| {
+                let ptr = Arc::as_ptr(&s.data) as usize;
+                let h = s.spawn(|| 1u32);
+                assert_eq!(h.join().unwrap(), 1);
+                ptr
+            });
+            ptrs.push(p);
+            // Yield briefly so the worker drops its `Arc<ScopeData>` clone before
+            // the next scope acquires from the cache.
+            thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 2 }));
+        }
+        assert!(
+            ptrs.windows(2).any(|w| w[0] == w[1]),
+            "expected Arc<ScopeData> reuse across consecutive scopes, saw {ptrs:?}"
+        );
+    }
+
+    /// Dropping an unjoined `JobHandle` whose result `T` panics in `Drop` must still
+    /// drop `T` before the scope exits, decrement `ScopeData::state` (no deadlock),
+    /// surface the panic via `scope()`, and leave the worker thread alive.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn panicking_drop_of_unjoined_result_does_not_deadlock_or_escape() {
+        struct PanicOnDrop<'a>(&'a AtomicBool);
+        impl Drop for PanicOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("result drop boom");
+            }
+        }
+
+        for workers in [0usize, 2] {
+            let pool = WorkerPool::new(workers);
+            let shared = pool.shared_for_tests();
+            let dropped = AtomicBool::new(false);
+            let sibling_done = AtomicBool::new(false);
+            let release = AtomicBool::new(false);
+
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                pool.scope(|s| {
+                    // Drop the handle before the job completes so `their_packet`
+                    // runs `PanicOnDrop::drop` inside the job wrapper.
+                    let _ = s.spawn(|| {
+                        while !release.load(Ordering::Acquire) && workers > 0 {
+                            thread::yield_now();
+                        }
+                        PanicOnDrop(&dropped)
+                    });
+                    // Sibling job borrowing `sibling_done` must finish before
+                    // `scope()` returns or unwinds.
+                    let _ = s.spawn(|| {
+                        if workers > 0 {
+                            thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 5 }));
+                        }
+                        sibling_done.store(true, Ordering::Release);
+                    });
+                    release.store(true, Ordering::Release);
+                });
+            }));
+
+            assert!(
+                res.is_err(),
+                "panicking result Drop must surface from scope"
+            );
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(
+                sibling_done.load(Ordering::Acquire),
+                "sibling job must complete before scope unwinds"
+            );
+            assert_eq!(shared.live.load(Ordering::Acquire), workers);
+            // Pool remains usable after the panicking Drop.
+            assert_eq!(pool.scope(|s| s.spawn(|| 42u32).join().unwrap()), 42);
+        }
+    }
+
+    /// A panic whose payload itself panics in `Drop` must not kill workers,
+    /// deadlock `wait_all()`, or unwind past running siblings in `scope()` or
+    /// `for_each_mut()`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn panicking_drop_of_panic_payload_is_contained() {
+        struct BombPayload;
+        impl Drop for BombPayload {
+            fn drop(&mut self) {
+                panic!("payload drop boom");
+            }
+        }
+
+        for workers in [0usize, 2] {
+            let pool = WorkerPool::new(workers);
+            let shared = pool.shared_for_tests();
+            let sibling_done = AtomicBool::new(false);
+
+            // 1. `for_each_mut` (exercises both `spawn_detached` and inline caller).
+            let mut items = [0u32, 1, 2];
+            let ok = pool.for_each_mut(&mut items, |x| {
+                if *x == 1 {
+                    std::panic::panic_any(BombPayload);
+                }
+                if *x == 2 && workers > 0 {
+                    thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 5 }));
+                }
+                *x += 10;
+            });
+            assert!(!ok);
+            assert_eq!(items[0], 10);
+            assert_eq!(items[2], 12);
+            assert_eq!(shared.live.load(Ordering::Acquire), workers);
+
+            // Single-item inline `for_each_mut`.
+            let mut one = [1u32];
+            assert!(!pool.for_each_mut(&mut one, |_| std::panic::panic_any(BombPayload)));
+
+            // 2. Unjoined `scope::spawn` with a `BombPayload`.
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                pool.scope(|s| {
+                    let _ = s.spawn(|| std::panic::panic_any(BombPayload));
+                    let _ = s.spawn(|| {
+                        if workers > 0 {
+                            thread::sleep(Duration::from_millis(if cfg!(miri) { 1 } else { 5 }));
+                        }
+                        sibling_done.store(true, Ordering::Release);
+                    });
+                });
+            }));
+            assert!(res.is_err());
+            assert!(sibling_done.load(Ordering::Acquire));
+            assert_eq!(shared.live.load(Ordering::Acquire), workers);
+
+            // Pool remains healthy.
+            let mut check = [1u32, 2, 3];
+            assert!(pool.for_each_mut(&mut check, |x| *x *= 2));
+            assert_eq!(check, [2, 4, 6]);
+        }
     }
 }

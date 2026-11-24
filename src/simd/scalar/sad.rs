@@ -14,9 +14,8 @@ pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 }
 
 #[inline(always)]
-pub(crate) fn sample_sad_16x16_avx2() -> Option<
-    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
-> {
+pub(crate) fn sample_sad_16x16_avx2()
+-> Option<fn(&crate::safe::plane::PlaneCursor<'_>, &crate::safe::plane::PlaneCursor<'_>) -> i32> {
     None
 }
 
@@ -26,9 +25,8 @@ pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 }
 
 #[inline(always)]
-pub(crate) fn sample_sad_16x8_avx2() -> Option<
-    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
-> {
+pub(crate) fn sample_sad_16x8_avx2()
+-> Option<fn(&crate::safe::plane::PlaneCursor<'_>, &crate::safe::plane::PlaneCursor<'_>) -> i32> {
     None
 }
 

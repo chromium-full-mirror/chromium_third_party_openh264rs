@@ -26,7 +26,6 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#![deny(unsafe_code)]
 #![forbid(unsafe_code)]
 
 //! # Multithreaded Slice Processing & Dynamic Workload Balancing
@@ -46,8 +45,9 @@ use crate::common::wels_common_defs::{EWelsNalRefIdc, EWelsNalUnitType};
 use crate::encoder::nal_encap::{
     WelsEncodeNal, WelsLoadNalForSlice, WelsUnloadNalForSlice, WelsWriteSVCPrefixNal,
 };
+use crate::encoder::picture::SlicePicBands;
 use crate::encoder::svc_encode_slice::{
-    InitOneSliceInThread, SetSliceBoundaryInfo, WelsCodeOneSlice, current_layer_ref,
+    InitOneSliceInThread, SetSliceBoundaryInfo, TakenFramePics, WelsCodeOneSlice, current_layer_ref,
 };
 use crate::encoder::vlc_encoder::BsWriter;
 use crate::encoder::wels_encoder_ext::WelsTime;
@@ -62,7 +62,7 @@ pub use crate::encoder::svc_encode_slice::SSlice;
 use crate::encoder::svc_encode_slice::{LayerIdx, set_current_layer};
 use crate::encoder::svc_encode_slice::{
     ReallocateSliceInThread, SSliceBufferInfo, UpdateMbNeighbor, current_layer_expect,
-    current_layer_expect_mut, layer_rec_view, slice_in_layer_mut,
+    current_layer_expect_mut, slice_in_layer_mut,
 };
 use crate::{MAX_SPATIAL_LAYER_NUM, RCMode, SLayerBSInfo, SliceMode};
 
@@ -76,7 +76,7 @@ pub const THRESHOLD_RMSE_CORE2: f32 = 0.0200;
 pub const EPSN: f32 = 0.000001;
 pub const INT_MULTIPLY: i32 = 100;
 pub const SEM_NAME_MAX: usize = 32;
-pub const MAX_THREADS_NUM: usize = 4;
+pub use crate::encoder::encoder_context::MAX_THREADS_NUM;
 use crate::encoder::encoder_context::{dq_layer_mut, dq_layer_ref};
 use crate::encoder::nal_encap::SWelsEncoderOutput;
 use crate::encoder::param_svc::SWelsSvcCodingParam;
@@ -128,12 +128,12 @@ pub struct SSliceThreading {
     /// `min(iMultipleThreadIdc, MAX_THREADS_NUM)`. This is where the fork reads it
     /// (`ForkWidth`).
     pub uiThreadBsBufferNum: usize,
-    /// The persistent worker threads the three forks run on — `CWelsThreadPool`'s
-    /// counterpart. Built with the buffers, one worker per slot
-    /// (`uiThreadBsBufferNum`), and dropped with them: the threads end when the
-    /// context does, at `WelsUninitEncoderExt`, and none outlives the encoder.
-    /// `Default` is a pool of no threads, on which every job runs on the calling
-    /// thread.
+    /// The persistent background worker threads the three forks run on —
+    /// `CWelsThreadPool`'s counterpart. Built with `uiThreadBsBufferNum - 1`
+    /// background workers (the calling thread executes slot 0 directly via
+    /// [`WorkerPool::for_each_mut`]) and dropped with the context at
+    /// `WelsUninitEncoderExt`, so none outlives the encoder. `Default` is a pool
+    /// of no threads, on which every job runs on the calling thread.
     pub pool: WorkerPool,
 }
 
@@ -373,7 +373,11 @@ pub fn DynamicAdjustSlicing(
     let mut iSliceIdx: i32;
 
     let rc_mode = pSvcParam.iRCMode;
+    let kiMbWidth = pSliceCtx.iMbWidth as i32;
     let mut iNumMbInEachGom = 0i32;
+    let bAlignToMbRow = rc_mode == RCMode::RC_OFF_MODE
+        && kiMbWidth > 0
+        && kiMbWidth * kiCountSliceNum < kiCountNumMb;
     if rc_mode != RCMode::RC_OFF_MODE {
         if kpRc.is_empty() {
             return;
@@ -390,7 +394,11 @@ pub fn DynamicAdjustSlicing(
     } else {
         if kiCountSliceNum >= kiCountNumMb {
             return;
-        } else if iMinimalMbNum * kiCountSliceNum >= kiCountNumMb {
+        } else if iMinimalMbNum * kiCountSliceNum == kiCountNumMb {
+            // Exactly one MB row per slice: shifting mid-row would break MB-row
+            // alignment between concurrent workers without adding parallelism.
+            return;
+        } else if iMinimalMbNum * kiCountSliceNum > kiCountNumMb {
             iMinimalMbNum = 1;
         }
     }
@@ -410,6 +418,8 @@ pub fn DynamicAdjustSlicing(
 
         if rc_mode != RCMode::RC_OFF_MODE {
             iNumMbAssigning = iNumMbAssigning / iNumMbInEachGom * iNumMbInEachGom;
+        } else if bAlignToMbRow {
+            iNumMbAssigning = iNumMbAssigning / kiMbWidth * kiMbWidth;
         }
 
         if iNumMbAssigning < iMinimalMbNum {
@@ -510,10 +520,11 @@ pub fn RequestMtResource(
     for i in 0..iThreadBufferNum {
         pSmt.pThreadBsBuffer[i] = vec![0u8; iCountBsLen as usize];
     }
-    // The workers, one per slot: created here, on the application's thread, and
-    // joined when the context drops. A thread the OS refuses is the same failure
-    // as a buffer it refuses.
-    pSmt.pool = match WorkerPool::try_new(iThreadBufferNum) {
+    // Spawn `N - 1` background workers: the calling thread runs slot 0 directly
+    // via `WorkerPool::for_each_mut`, avoiding oversubscription (`N + 1` runnable
+    // threads for `N` jobs) and eliminating the spurious worker wake/re-park cycle
+    // every frame. A thread the OS refuses is the same failure as a buffer it refuses.
+    pSmt.pool = match WorkerPool::try_new(iThreadBufferNum.saturating_sub(1)) {
         Ok(pool) => pool,
         Err(_) => return 1,
     };
@@ -691,9 +702,7 @@ pub fn WriteSliceBs(
 
 /// Queries the operating system for the number of active logical CPU processing cores.
 pub fn DynamicDetectCpuCores() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(1)
+    crate::decoder::decoder_core::GetCPUCount()
 }
 
 /// Evaluates load balance and dynamically adjusts slicing for the base spatial dependency layer.
@@ -823,86 +832,169 @@ pub fn AdjustEnhanceLayer(pCtx: &mut sWelsEncCtx, iCurDid: i32) -> i32 {
 // Slice Threading Execution Engine
 // ============================================================================
 
-/// One worker's share of a frame's slices, and the one value in this crate that
-/// crosses a spawn.
+/// One worker's share of a frame's slices in fixed/raster slice modes.
 ///
-/// The worker owns bs scratch slot `iBsSlot` for the whole scope and encodes the
-/// slices `iFirstSlice`, `iFirstSlice + iSliceStep`, ... below `iSliceCount`.
-pub struct SliceJobHandle<'a> {
-    /// The encoder context.
+/// The worker owns bs scratch slot `iBsSlot`, contiguous slices
+/// `iFirstSlice..iSliceEnd`, their paired MB windows, and disjoint MB-row
+/// picture bands `bands` for the whole scope.
+struct FixedSliceJob<'a, 'mb> {
     pCtx: &'a sWelsEncCtx,
-    /// This worker's bs scratch bytes — `pThreadBsBuffer[iBsSlot]`'s buffer,
-    /// taken out of the context before the fork and handed here. Restored to its
-    /// slot after the join.
     pBsBuf: &'a mut [u8],
-    /// This worker's slices. Worker `k` codes slices `k, k+step, k+2*step, …`, so
-    /// the bank is distributed by that rule on the calling thread while the
-    /// layer is `&mut`, and each worker holds `&mut SSlice`s no sibling can name.
-    pSlices: Vec<&'a mut SSlice>,
-    /// This worker's macroblock windows. One per slice this worker codes (fixed
-    /// modes, paired 1:1 with `pSlices`), or the single partition run
-    /// (size-limited). Each window is a disjoint `&mut [SMB]` peeled off the
-    /// taken grid, and the coding chain and the deblocking walker both write
-    /// through it.
-    pMbs: Vec<crate::safe::mb_grid::MbWindow<'a, SMB>>,
-    /// This worker's CABAC restore scratch: `pDynamicBsBuffer[k]`, taken from the
-    /// context before the fork like everything else here; `None` for the fixed
-    /// modes, which never stash-restore across a boundary.
-    pDynBsBuf: Option<&'a mut [u8]>,
-    /// This worker's slice bank, owned for the frame. Taken from the layer before
-    /// the spawn; the size-limited job grows it and resolves every slice by
-    /// index. `None` for the fixed modes, whose slices arrive already carved
-    /// (`pSlices`).
-    pBank: Option<&'a mut SSliceBufferInfo>,
-    /// This worker's bs scratch slot index — still carried because the slice's
-    /// `uiBufferIdx` must agree with the buffer above (asserted in the job).
+    pSlices: &'a mut [SSlice],
+    /// Paired 1:1 with `pSlices`; each entry is populated before the fork.
+    pMbs: &'a mut [Option<crate::safe::mb_grid::MbWindow<'mb, SMB>>],
+    bands: SlicePicBands<'a>,
+    /// When executing a 2-wave schedule, `Some((tags, wave_id))` restricts this worker
+    /// to slices within `iFirstSlice..iSliceEnd` whose wave tag matches `wave_id`.
+    slice_wave_filter: Option<(&'a [u8], u8)>,
     iBsSlot: i32,
     iFirstSlice: i32,
-    iSliceStep: i32,
-    iSliceCount: i32,
-    /// `CWelsLoadBalancingSlicingEncodingTask`'s two extra stamps — the start time
-    /// in `InitTask`, the elapsed time in `FinishTask`. False is
-    /// `CWelsSliceEncodingTask`, which is what `bUseLoadBalancing = false` builds.
+    iSliceEnd: i32,
     bRecordsTime: bool,
+    iResult: i32,
 }
 
-impl<'a> SliceJobHandle<'a> {
-    /// `pCtx`'s `pSliceThreading` must have been built by `RequestMtResource`,
-    /// `iBsSlot` must be a slot that call allocated, and `pBsBuf` must be that
-    /// slot's taken buffer (the fork entries' partition is the only maker).
-    fn new(
-        pCtx: &'a sWelsEncCtx,
-        pBsBuf: &'a mut [u8],
-        pSlices: Vec<&'a mut SSlice>,
-        pMbs: Vec<crate::safe::mb_grid::MbWindow<'a, SMB>>,
-        pDynBsBuf: Option<&'a mut [u8]>,
-        pBank: Option<&'a mut SSliceBufferInfo>,
-        iBsSlot: i32,
-        iFirstSlice: i32,
-        iSliceStep: i32,
-        iSliceCount: i32,
-        bRecordsTime: bool,
-    ) -> Self {
-        // Both entry points refuse a null `pSliceThreading` before they get
-        // here; what is checked here is the slot bound.
-        debug_assert!(
-            pCtx.pSliceThreading
-                .as_deref()
-                .is_some_and(|pSmt| iBsSlot >= 0 && (iBsSlot as usize) < pSmt.uiThreadBsBufferNum),
-            "job slot {iBsSlot} is outside the allocated bs buffers"
-        );
+/// One worker's share of a frame in `SM_SIZELIMITED_SLICE` mode.
+///
+/// Worker `p` owns partition `p`, bank `p`, bs slot `p`, optional CABAC restore
+/// scratch, optional MB window (`None` for empty partitions), and disjoint
+/// MB-row picture bands `bands`.
+struct SizeLimitedJob<'a> {
+    pCtx: &'a sWelsEncCtx,
+    pBsBuf: &'a mut [u8],
+    pMb: Option<crate::safe::mb_grid::MbWindow<'a, SMB>>,
+    bands: SlicePicBands<'a>,
+    pDynBsBuf: Option<&'a mut [u8]>,
+    pBank: &'a mut SSliceBufferInfo,
+    iBsSlot: i32,
+    iPartitionIdx: i32,
+    iResult: i32,
+}
+
+/// RAII restore guard for [`EncodeFixedSlicesForked`]: moves the worker bs
+/// scratch buffers, slice bank 0, MB grid, and mutable picture planes out of
+/// `sWelsEncCtx` before the fork and restores them unconditionally on return or
+/// panic unwind.
+struct FixedForkGuard<'ctx> {
+    pCtx: &'ctx mut sWelsEncCtx,
+    bs_bufs: [Vec<u8>; MAX_THREADS_NUM],
+    bs_count: usize,
+    bank: Vec<SSlice>,
+    mb_data: MbArray<SMB>,
+    pics: TakenFramePics,
+}
+
+impl<'ctx> FixedForkGuard<'ctx> {
+    fn take(pCtx: &'ctx mut sWelsEncCtx, width: usize) -> Self {
+        let mut bs_bufs: [Vec<u8>; MAX_THREADS_NUM] = std::array::from_fn(|_| Vec::new());
+        let mut bs_count = 0usize;
+        if let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() {
+            bs_count = width.min(MAX_THREADS_NUM);
+            for (k, slot) in bs_bufs[..bs_count].iter_mut().enumerate() {
+                let buf = std::mem::take(&mut pSmt.pThreadBsBuffer[k]);
+                debug_assert!(!buf.is_empty(), "job slot {k} has no buffer behind it");
+                *slot = buf;
+            }
+        }
+        let (bank, mb_data) = {
+            let pCurDq = current_layer_expect_mut(pCtx);
+            (
+                std::mem::take(&mut pCurDq.sSliceBufferInfo[0].pSliceBuffer),
+                std::mem::replace(&mut pCurDq.sMbDataP, MbArray::empty()),
+            )
+        };
+        let pics = TakenFramePics::take(pCtx);
         Self {
             pCtx,
-            pBsBuf,
-            pSlices,
-            pMbs,
-            pDynBsBuf,
-            pBank,
-            iBsSlot,
-            iFirstSlice,
-            iSliceStep,
-            iSliceCount,
-            bRecordsTime,
+            bs_bufs,
+            bs_count,
+            bank,
+            mb_data,
+            pics,
+        }
+    }
+}
+
+impl Drop for FixedForkGuard<'_> {
+    fn drop(&mut self) {
+        self.pics.restore_mut(self.pCtx);
+        if let Some(pSmt) = self.pCtx.pSliceThreading.as_deref_mut() {
+            for (k, slot) in self.bs_bufs[..self.bs_count].iter_mut().enumerate() {
+                pSmt.pThreadBsBuffer[k] = std::mem::take(slot);
+            }
+        }
+        let pCurDq = current_layer_expect_mut(self.pCtx);
+        pCurDq.sSliceBufferInfo[0].pSliceBuffer = std::mem::take(&mut self.bank);
+        pCurDq.sMbDataP = std::mem::replace(&mut self.mb_data, MbArray::empty());
+    }
+}
+
+/// RAII restore guard for [`EncodeSizeLimitedSlicesForked`]: moves the worker
+/// bs scratch buffers, CABAC restore buffers, per-partition slice banks, MB
+/// grid, and mutable picture planes out of `sWelsEncCtx` and restores them
+/// unconditionally on return or panic unwind.
+struct SizeLimitedForkGuard<'ctx> {
+    pCtx: &'ctx mut sWelsEncCtx,
+    width: usize,
+    bs_bufs: [Vec<u8>; MAX_THREADS_NUM],
+    dyn_bufs: [Vec<u8>; MAX_THREADS_NUM],
+    banks: [SSliceBufferInfo; MAX_THREADS_NUM],
+    mb_data: MbArray<SMB>,
+    pics: TakenFramePics,
+}
+
+impl<'ctx> SizeLimitedForkGuard<'ctx> {
+    fn take(pCtx: &'ctx mut sWelsEncCtx, width: usize) -> Self {
+        let width = width.min(MAX_THREADS_NUM);
+        let mut bs_bufs: [Vec<u8>; MAX_THREADS_NUM] = std::array::from_fn(|_| Vec::new());
+        if let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() {
+            for (k, slot) in bs_bufs[..width].iter_mut().enumerate() {
+                let buf = std::mem::take(&mut pSmt.pThreadBsBuffer[k]);
+                debug_assert!(!buf.is_empty(), "job slot {k} has no buffer behind it");
+                *slot = buf;
+            }
+        }
+        let mut dyn_bufs: [Vec<u8>; MAX_THREADS_NUM] = std::array::from_fn(|_| Vec::new());
+        for (k, slot) in dyn_bufs[..width].iter_mut().enumerate() {
+            *slot = std::mem::take(&mut pCtx.pDynamicBsBuffer[k]);
+        }
+        let mut banks: [SSliceBufferInfo; MAX_THREADS_NUM] =
+            std::array::from_fn(|_| SSliceBufferInfo::default());
+        let mb_data = {
+            let pCurDq = current_layer_expect_mut(pCtx);
+            for (k, slot) in banks[..width].iter_mut().enumerate() {
+                *slot = std::mem::take(&mut pCurDq.sSliceBufferInfo[k]);
+            }
+            std::mem::replace(&mut pCurDq.sMbDataP, MbArray::empty())
+        };
+        let pics = TakenFramePics::take(pCtx);
+        Self {
+            pCtx,
+            width,
+            bs_bufs,
+            dyn_bufs,
+            banks,
+            mb_data,
+            pics,
+        }
+    }
+}
+
+impl Drop for SizeLimitedForkGuard<'_> {
+    fn drop(&mut self) {
+        self.pics.restore_mut(self.pCtx);
+        if let Some(pSmt) = self.pCtx.pSliceThreading.as_deref_mut() {
+            for (k, slot) in self.bs_bufs[..self.width].iter_mut().enumerate() {
+                pSmt.pThreadBsBuffer[k] = std::mem::take(slot);
+            }
+        }
+        for (k, slot) in self.dyn_bufs[..self.width].iter_mut().enumerate() {
+            self.pCtx.pDynamicBsBuffer[k] = std::mem::take(slot);
+        }
+        let pCurDq = current_layer_expect_mut(self.pCtx);
+        pCurDq.sMbDataP = std::mem::replace(&mut self.mb_data, MbArray::empty());
+        for (k, slot) in self.banks[..self.width].iter_mut().enumerate() {
+            pCurDq.sSliceBufferInfo[k] = std::mem::take(slot);
         }
     }
 }
@@ -941,55 +1033,45 @@ fn WritePrefixNalForSlice(
     }
 }
 
-/// What one slice's encode reports back through the join.
-///
-/// `CWelsSliceEncodingTask::Execute` returns early when `InitTask` fails, before
-/// `FinishTask` — the only place a task's result is ORed into
-/// `pCtx->iEncoderError` — so a failed init is swallowed and the frame comes back
-/// short rather than as an error. `bInitFailed` carries that distinction so the
-/// calling thread ORs exactly what `FinishTask` would have.
-struct SliceJobResult {
-    iResult: i32,
-    bInitFailed: bool,
-}
-
 /// One slice, start to finish, on a worker thread: the `InitTask` / `ExecuteTask`
 /// / `FinishTask` triple of `CWelsSliceEncodingTask`.
+///
+/// Returns `ENC_RETURN_SUCCESS` or the first error encountered during
+/// initialization, coding, or bitstream encapsulation.
+#[allow(clippy::too_many_arguments)]
 fn EncodeOneSliceInJob(
     pCtx: &sWelsEncCtx,
     iSliceIdx: i32,
     iBsSlot: i32,
     bRecordsTime: bool,
     pSlotBuf: &mut [u8],
-    pSlices: &mut [&mut SSlice],
+    pSlices: &mut [SSlice],
     // This worker's macroblock windows, one per slice it codes, indexed exactly
     // as `pSlices` is.
-    pMbs: &mut [crate::safe::mb_grid::MbWindow<'_, SMB>],
+    pMbs: &mut [Option<crate::safe::mb_grid::MbWindow<'_, SMB>>],
+    bands: &mut SlicePicBands<'_>,
     iFirstSlice: i32,
-    iSliceStep: i32,
-) -> SliceJobResult {
+) -> i32 {
     // ---- CWelsSliceEncodingTask::InitTask
     let eNalType = pCtx.eNalType;
     let eNalRefIdc = pCtx.eNalPriority;
     let bNeedPrefix = pCtx.bNeedPrefixNalFlag;
 
-    // The slice comes from this worker's own list: `iSliceIdx` advances by
-    // `iSliceStep` from `iFirstSlice`, so this worker's `n`th slice is at
-    // position `(iSliceIdx - iFirstSlice) / iSliceStep` in its list.
-    let kiLocal = ((iSliceIdx - iFirstSlice) / iSliceStep) as usize;
+    // The slice comes from this worker's contiguous range `iFirstSlice..iSliceEnd`.
+    let kiLocal = (iSliceIdx - iFirstSlice) as usize;
     let Some(pSlice) = pSlices.get_mut(kiLocal) else {
-        return SliceJobResult {
-            iResult: ENC_RETURN_UNEXPECTED,
-            bInitFailed: true,
-        };
+        return ENC_RETURN_UNEXPECTED;
+    };
+    // Move the window onto this worker's stack rather than borrowing it in place
+    // inside `sMbWindowStack`, avoiding cross-core false sharing when `set_cur`
+    // mutates `cur` on every macroblock.
+    let Some(mut mb_run) = pMbs.get_mut(kiLocal).and_then(Option::take) else {
+        return ENC_RETURN_UNEXPECTED;
     };
     InitOneSliceInThread(pCtx, pSlice, iBsSlot, iSliceIdx);
     let iReturn = SetSliceBoundaryInfo(current_layer_ref(pCtx), pSlice, iSliceIdx);
     if iReturn != ENC_RETURN_SUCCESS {
-        return SliceJobResult {
-            iResult: iReturn,
-            bInitFailed: true,
-        };
+        return iReturn;
     }
     pSlice.sSliceBs.sBsWrite = BsWriter::new();
     let iSliceStart = if bRecordsTime { WelsTime() } else { 0 };
@@ -1013,7 +1095,6 @@ fn EncodeOneSliceInJob(
         }
         WelsLoadNalForSlice(&mut pSlice.sSliceBs, eNalType as i32, eNalRefIdc as i32);
         debug_assert_eq!(iSliceIdx, pSlice.iSliceIdx);
-        let pMbRun = &mut pMbs[kiLocal];
         // `None` restore scratch: the fixed loops never use it. `None`
         // next-slice too — the fixed modes never hit the dynamic boundary, so
         // `AddSliceBoundary` never fires here.
@@ -1023,7 +1104,8 @@ fn EncodeOneSliceInJob(
             eNalType as i32,
             &mut *pSliceBsBuf,
             &mut pCtxOutBs,
-            pMbRun,
+            &mut mb_run,
+            bands,
             None,
             None,
         );
@@ -1042,31 +1124,26 @@ fn EncodeOneSliceInJob(
         {
             // The walker's window is the worker's own carved run, the same one
             // the coding chain just wrote through. `uiFilterIdc == 1` (MT
-            // validation rewrites idc 0 → 2) confines
-            // walk and neighbour reads to it.
+            // validation rewrites idc 0 -> 2) confines walk and neighbour reads
+            // to this slice, hence inside this worker's MB-row band.
             let pCurDq = current_layer_expect(pCtx);
-            if let Some(view) = layer_rec_view(pCurDq) {
-                pfDeblockingFilterSlice(
-                    view,
-                    &pCurDq.sSliceEncCtx,
-                    &pCurDq.iCsStride,
-                    pSlice,
-                    &mut pMbs[kiLocal],
-                );
-            }
+            pfDeblockingFilterSlice(
+                &mut bands.rec,
+                &pCurDq.sSliceEncCtx,
+                &pCurDq.iCsStride,
+                pSlice,
+                &mut mb_run,
+            );
         }
         ENC_RETURN_SUCCESS
     })();
 
     // ---- CWelsSliceEncodingTask::FinishTask (the load-balancing override's half)
     if bRecordsTime {
-        pSlice.uiSliceConsumeTime = (WelsTime() - iSliceStart) as u32;
+        pSlice.uiSliceConsumeTime = (WelsTime() - iSliceStart).max(0) as u32;
     }
 
-    SliceJobResult {
-        iResult,
-        bInitFailed: false,
-    }
+    iResult
 }
 
 /// How many workers a fork gets: never more than there are slices to encode, and
@@ -1077,6 +1154,275 @@ fn ForkWidth(pCtx: &mut sWelsEncCtx, iItemCount: i32) -> i32 {
         .as_deref()
         .map_or(1, |pSmt| pSmt.uiThreadBsBufferNum as i32);
     iItemCount.min(iBuffers.max(1)).max(1)
+}
+
+/// One worker's contiguous slice span and disjoint MB-row band within a wave:
+/// `(slice_start, slice_end, row_start, row_end)`.
+type WorkerPlan = (usize, usize, usize, usize);
+
+#[derive(Clone, Copy)]
+struct SliceGroup {
+    slice_start: usize,
+    slice_end: usize,
+    row_start: usize,
+    row_end: usize,
+    mb_count: i32,
+}
+
+/// Fixed-slice execution schedule produced by [`plan_fixed_slice_schedule`]:
+///
+/// - **1 wave** (the fast path for all MB-row-aligned slices and any layout where
+///   single-wave merging already matches or beats 2-wave critical-path work).
+/// - **2 waves** (when mid-row boundaries — e.g. custom `SM_RASTER_SLICE` or tiny-height
+///   `SM_FIXEDSLCNUM_SLICE` — would otherwise chain into fewer workers, alternating
+///   non-adjacent slices into two disjoint waves cuts critical-path work while preserving
+///   exact bitstream output).
+struct FixedSliceSchedule {
+    waves: [[WorkerPlan; MAX_THREADS_NUM]; 2],
+    wave_widths: [usize; 2],
+    num_waves: usize,
+    slice_wave_stack: [u8; MAX_SLICES_NUM],
+    slice_wave_heap: Vec<u8>,
+}
+
+impl FixedSliceSchedule {
+    fn max_width(&self) -> usize {
+        self.wave_widths[..self.num_waves]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+    }
+
+    fn slice_waves(&self, slice_count: usize) -> &[u8] {
+        if !self.slice_wave_heap.is_empty() {
+            &self.slice_wave_heap[..slice_count]
+        } else {
+            &self.slice_wave_stack[..slice_count]
+        }
+    }
+}
+
+fn distribute_slice_groups(
+    groups: &[SliceGroup],
+    cap: usize,
+) -> ([WorkerPlan; MAX_THREADS_NUM], usize, i32) {
+    let g_len = groups.len();
+    let num_workers = g_len.min(cap).max(1);
+    let base = g_len / num_workers;
+    let rem = g_len % num_workers;
+    let mut plans = [(0usize, 0usize, 0usize, 0usize); MAX_THREADS_NUM];
+    let mut g_idx = 0usize;
+    let mut max_mbs = 0i32;
+    for (w, slot) in plans[..num_workers].iter_mut().enumerate() {
+        let g_cnt = base + usize::from(w < rem);
+        let g_first = groups[g_idx];
+        let g_last = groups[g_idx + g_cnt - 1];
+        let mut w_mbs = 0i32;
+        for g in &groups[g_idx..g_idx + g_cnt] {
+            w_mbs += g.mb_count;
+        }
+        max_mbs = max_mbs.max(w_mbs);
+        *slot = (
+            g_first.slice_start,
+            g_last.slice_end,
+            g_first.row_start,
+            g_last.row_end,
+        );
+        g_idx += g_cnt;
+    }
+    (plans, num_workers, max_mbs)
+}
+
+/// Plans 1 or 2 waves of disjoint MB-row-aligned worker bands for raster-ordered slices
+/// across at most `max_workers` workers (`<= MAX_THREADS_NUM`).
+///
+/// Returns `None` if the slice ranges are empty, malformed, or not in disjoint raster
+/// order. Avoids heap allocation whenever `first_mbs.len() <= MAX_SLICES_NUM`.
+fn plan_fixed_slice_schedule(
+    first_mbs: &[i32],
+    counts: &[i32],
+    mb_width: usize,
+    max_workers: usize,
+) -> Option<FixedSliceSchedule> {
+    let n = first_mbs.len();
+    if n == 0 || counts.len() < n || mb_width == 0 {
+        return None;
+    }
+    let zero_group = SliceGroup {
+        slice_start: 0,
+        slice_end: 0,
+        row_start: 0,
+        row_end: 0,
+        mb_count: 0,
+    };
+    let mut stack_groups = [zero_group; MAX_SLICES_NUM];
+    let mut heap_groups: Vec<SliceGroup> = Vec::new();
+    let groups_buf: &mut [SliceGroup] = if n <= MAX_SLICES_NUM {
+        &mut stack_groups[..n]
+    } else {
+        heap_groups.resize(n, zero_group);
+        &mut heap_groups[..]
+    };
+
+    // Pass 1: validate raster order and build single-wave merged groups.
+    let mut group_len = 0usize;
+    let mut cursor = 0i32;
+    for i in 0..n {
+        let first = first_mbs[i];
+        let count = counts[i];
+        if first < cursor || count <= 0 {
+            return None;
+        }
+        let row_start = (first as usize) / mb_width;
+        let row_end = ((first + count - 1) as usize) / mb_width + 1;
+        if group_len > 0 && groups_buf[group_len - 1].row_end > row_start {
+            let last = &mut groups_buf[group_len - 1];
+            last.slice_end = i + 1;
+            last.row_end = last.row_end.max(row_end);
+            last.mb_count += count;
+        } else {
+            groups_buf[group_len] = SliceGroup {
+                slice_start: i,
+                slice_end: i + 1,
+                row_start,
+                row_end,
+                mb_count: count,
+            };
+            group_len += 1;
+        }
+        cursor = first + count;
+    }
+
+    let cap = max_workers.clamp(1, MAX_THREADS_NUM);
+    let (single_plans, single_workers, single_crit) =
+        distribute_slice_groups(&groups_buf[..group_len], cap);
+
+    let mut sched = FixedSliceSchedule {
+        waves: [single_plans, [(0, 0, 0, 0); MAX_THREADS_NUM]],
+        wave_widths: [single_workers, 0],
+        num_waves: 1,
+        slice_wave_stack: [0u8; MAX_SLICES_NUM],
+        slice_wave_heap: Vec::new(),
+    };
+
+    // Fast path: no row overlaps, single wave already saturates `cap`, or 1 worker cap.
+    if cap <= 1 || group_len == n || single_workers >= cap {
+        return Some(sched);
+    }
+
+    // Pass 2: try a 2-wave alternating schedule so slices sharing a boundary row can run
+    // in separate waves while non-adjacent slices run concurrently within each wave.
+    let mut stack_w0 = [zero_group; MAX_SLICES_NUM];
+    let mut stack_w1 = [zero_group; MAX_SLICES_NUM];
+    let mut heap_w0: Vec<SliceGroup> = Vec::new();
+    let mut heap_w1: Vec<SliceGroup> = Vec::new();
+    let (w0_buf, w1_buf): (&mut [SliceGroup], &mut [SliceGroup]) = if n <= MAX_SLICES_NUM {
+        (&mut stack_w0[..n], &mut stack_w1[..n])
+    } else {
+        heap_w0.resize(n, zero_group);
+        heap_w1.resize(n, zero_group);
+        (&mut heap_w0[..], &mut heap_w1[..])
+    };
+    let mut wave_tag_stack = [0u8; MAX_SLICES_NUM];
+    let mut wave_tag_heap: Vec<u8> = Vec::new();
+    let wave_tags: &mut [u8] = if n <= MAX_SLICES_NUM {
+        &mut wave_tag_stack[..n]
+    } else {
+        wave_tag_heap.resize(n, 0);
+        &mut wave_tag_heap[..]
+    };
+
+    let mut w_len = [0usize; 2];
+    let mut last_wave = 0usize;
+    for i in 0..n {
+        let first = first_mbs[i];
+        let count = counts[i];
+        let row_start = (first as usize) / mb_width;
+        let row_end = ((first + count - 1) as usize) / mb_width + 1;
+
+        let fits0 = w_len[0] == 0 || w0_buf[w_len[0] - 1].row_end <= row_start;
+        let fits1 = w_len[1] == 0 || w1_buf[w_len[1] - 1].row_end <= row_start;
+
+        let chosen = if fits0 && fits1 {
+            let w = usize::from(w_len[1] < w_len[0]);
+            let buf = if w == 0 { &mut *w0_buf } else { &mut *w1_buf };
+            buf[w_len[w]] = SliceGroup {
+                slice_start: i,
+                slice_end: i + 1,
+                row_start,
+                row_end,
+                mb_count: count,
+            };
+            w_len[w] += 1;
+            w
+        } else if fits0 {
+            w0_buf[w_len[0]] = SliceGroup {
+                slice_start: i,
+                slice_end: i + 1,
+                row_start,
+                row_end,
+                mb_count: count,
+            };
+            w_len[0] += 1;
+            0
+        } else if fits1 {
+            w1_buf[w_len[1]] = SliceGroup {
+                slice_start: i,
+                slice_end: i + 1,
+                row_start,
+                row_end,
+                mb_count: count,
+            };
+            w_len[1] += 1;
+            1
+        } else {
+            // Overlaps both waves (e.g. >=3 slices in the same MB row): merge into
+            // `last_wave`'s last group, whose `slice_end == i`, keeping spans contiguous.
+            let buf = if last_wave == 0 {
+                &mut *w0_buf
+            } else {
+                &mut *w1_buf
+            };
+            let last = &mut buf[w_len[last_wave] - 1];
+            last.slice_end = i + 1;
+            last.row_end = last.row_end.max(row_end);
+            last.mb_count += count;
+            last_wave
+        };
+        wave_tags[i] = chosen as u8;
+        last_wave = chosen;
+    }
+
+    if w_len[0] > 0 && w_len[1] > 0 {
+        let (p0, nw0, crit0) = distribute_slice_groups(&w0_buf[..w_len[0]], cap);
+        let (p1, nw1, crit1) = distribute_slice_groups(&w1_buf[..w_len[1]], cap);
+        if crit0 + crit1 < single_crit {
+            sched.waves = [p0, p1];
+            sched.wave_widths = [nw0, nw1];
+            sched.num_waves = 2;
+            sched.slice_wave_stack = wave_tag_stack;
+            sched.slice_wave_heap = wave_tag_heap;
+        }
+    }
+
+    Some(sched)
+}
+
+#[cfg(test)]
+fn plan_fixed_slice_workers(
+    slice_ranges: &[(i32, i32)],
+    mb_width: usize,
+    max_workers: usize,
+) -> Option<Vec<Vec<WorkerPlan>>> {
+    let firsts: Vec<i32> = slice_ranges.iter().map(|&(f, _)| f).collect();
+    let counts: Vec<i32> = slice_ranges.iter().map(|&(_, c)| c).collect();
+    let sched = plan_fixed_slice_schedule(&firsts, &counts, mb_width, max_workers)?;
+    Some(
+        (0..sched.num_waves)
+            .map(|w| sched.waves[w][..sched.wave_widths[w]].to_vec())
+            .collect(),
+    )
 }
 
 /// The fork/join for every fixed slice mode —
@@ -1090,8 +1436,8 @@ pub fn EncodeFixedSlicesForked(pCtx: &mut sWelsEncCtx, kiSliceCount: i32) -> i32
         return ENC_RETURN_SUCCESS;
     }
     let bRecordsTime = pCtx.param_opt().is_some() && pCtx.param().bUseLoadBalancing;
-    let iWidth = ForkWidth(pCtx, kiSliceCount);
-    if iWidth > 1 {
+    let iMaxWorkers = ForkWidth(pCtx, kiSliceCount);
+    if iMaxWorkers > 1 {
         if let Some(pCurDq) = current_layer_ref(pCtx) {
             debug_assert!(
                 !pCurDq.bDeblockingParallelFlag || pCurDq.iLoopFilterDisableIdc != 0,
@@ -1103,84 +1449,69 @@ pub fn EncodeFixedSlicesForked(pCtx: &mut sWelsEncCtx, kiSliceCount: i32) -> i32
         }
     }
 
+    // Read the finalized slice ranges and plan 1 or 2 waves of disjoint MB-row-aligned
+    // worker bands before taking any buffers out of `pCtx`.
+    let kiSliceCountU = kiSliceCount as usize;
+    let (schedule, kiGridWidth, kiMbWidth) = {
+        let pCurDq = current_layer_expect(pCtx);
+        if pCurDq.pFirstMbIdxOfSlice.len() < kiSliceCountU
+            || pCurDq.pCountMbNumInSlice.len() < kiSliceCountU
+        {
+            return ENC_RETURN_UNEXPECTED;
+        }
+        let kiMbWidth = pCurDq.iMbWidth as usize;
+        let Some(sched) = plan_fixed_slice_schedule(
+            &pCurDq.pFirstMbIdxOfSlice[..kiSliceCountU],
+            &pCurDq.pCountMbNumInSlice[..kiSliceCountU],
+            kiMbWidth,
+            iMaxWorkers as usize,
+        ) else {
+            return ENC_RETURN_UNEXPECTED;
+        };
+        (sched, pCurDq.sMbDataP.dims().mb_width(), kiMbWidth)
+    };
+
     // Hoisted out of the fork: `sLayerInfo.sNalHeaderExt.bIdrFlag` is the same
     // constant on every worker and no worker reads it before its own write, so it is
     // stamped once here, on the calling thread, before anything spawns.
     crate::encoder::svc_encode_slice::StampLayerIdrFlagForSliceType(pCtx);
 
-    // The pre-fork partition of the bitstream pool: the worker buffers leave the
-    // context while it is still `&mut`, so each worker's `&mut [u8]` borrows this
-    // local and never the shared context. Moved, not copied. Restored below, after
-    // the join, behind the same `&mut`.
-    let mut vTakenBsBufs: Vec<Vec<u8>> = {
-        let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() else {
-            return ENC_RETURN_SUCCESS;
-        };
-        (0..iWidth as usize)
-            .map(|k| {
-                let buf = std::mem::take(&mut pSmt.pThreadBsBuffer[k]);
-                debug_assert!(!buf.is_empty(), "job slot {k} has no buffer behind it");
-                buf
-            })
-            .collect()
-    };
-
-    // The slice bank is carved the same way. In every fixed slice mode all workers
-    // resolve bank 0, so the bank leaves the layer here while it is still `&mut`,
-    // and its slices are distributed by the rule the fork already uses: worker `k`
-    // codes slices `k, k+iWidth, k+2*iWidth, …`, i.e. `i % iWidth == k`. Every
-    // slice reaches exactly one worker.
-    let mut vTakenBank: Vec<SSlice> = {
-        let pCurDq = current_layer_expect_mut(pCtx);
-        std::mem::take(&mut pCurDq.sSliceBufferInfo[0].pSliceBuffer)
-    };
-
-    // The macroblock grid is carved beside the bank — a `split_at_mut` chain over
-    // `[pFirstMbIdxOfSlice[i] .. +pCountMbNumInSlice[i])`, the ranges the slice map
-    // itself was built from, final before the fork (`SetSliceBoundaryInfo`, inside
-    // the worker, only reads them). Every slice index in `0..kiSliceCount` gets a
-    // window at its own position, unfiltered and unreordered, because the job pairs
-    // windows with slices by `kiLocal` arithmetic.
-    let (vSliceRanges, kiGridWidth) = {
-        let pCurDq = current_layer_expect(pCtx);
-        let r: Vec<(i32, i32)> = (0..kiSliceCount as usize)
-            .map(|i| (pCurDq.pFirstMbIdxOfSlice[i], pCurDq.pCountMbNumInSlice[i]))
-            .collect();
-        (r, pCurDq.sMbDataP.dims().mb_width())
-    };
-    let mut sTakenMbData = {
-        let pCurDq = current_layer_expect_mut(pCtx);
-        std::mem::replace(&mut pCurDq.sMbDataP, MbArray::empty())
-    };
+    // Move out the worker bs scratch buffers, slice bank, MB grid, and mutable
+    // picture planes under an RAII guard that restores all of them on return or
+    // panic unwind.
+    let mut guard = FixedForkGuard::take(pCtx, schedule.max_width());
 
     let mut iErr = ENC_RETURN_SUCCESS;
     {
-        // One handle per worker, each carrying its own slot, that slot's taken
-        // buffer, and its own slices — constructed here, on the calling thread,
-        // so the slot bound is checked before anything spawns.
+        let FixedForkGuard {
+            pCtx,
+            bs_bufs,
+            bank,
+            mb_data,
+            pics,
+            ..
+        } = &mut guard;
         let pCtx: &sWelsEncCtx = pCtx;
-        let mut vPerWorker: Vec<Vec<&mut SSlice>> =
-            (0..iWidth as usize).map(|_| Vec::new()).collect();
-        for (i, slc) in vTakenBank.iter_mut().enumerate() {
-            if (i as i32) < kiSliceCount {
-                vPerWorker[i % iWidth as usize].push(slc);
-            }
-        }
-        // The peel: slice `i`'s records leave the taken grid as one chunk, in
-        // index order — the ranges are raster-consecutive in every fixed mode,
-        // and the assert names the coordinates if they ever overlap.
-        let mut vMbPerWorker: Vec<Vec<crate::safe::mb_grid::MbWindow<'_, SMB>>> =
-            (0..iWidth as usize).map(|_| Vec::new()).collect();
+        let pCurDq = current_layer_expect(pCtx);
+
+        // Peel one `MbWindow` per slice in raster order into a flat stack array
+        // (no heap allocation for `kiSliceCount <= MAX_SLICES_NUM`).
+        let mut sMbWindowStack: [Option<crate::safe::mb_grid::MbWindow<'_, SMB>>; MAX_SLICES_NUM] =
+            std::array::from_fn(|_| None);
+        let mut vMbWindowHeap: Vec<Option<crate::safe::mb_grid::MbWindow<'_, SMB>>> = Vec::new();
+        let pAllMbWindows: &mut [Option<crate::safe::mb_grid::MbWindow<'_, SMB>>] =
+            if kiSliceCountU <= MAX_SLICES_NUM {
+                &mut sMbWindowStack[..kiSliceCountU]
+            } else {
+                vMbWindowHeap.resize_with(kiSliceCountU, || None);
+                &mut vMbWindowHeap[..]
+            };
         {
-            let mut rest: &mut [SMB] = sTakenMbData.as_mut_slice();
+            let mut rest: &mut [SMB] = mb_data.as_mut_slice();
             let mut cursor = 0i32;
-            for (i, &(first, count)) in vSliceRanges.iter().enumerate() {
-                debug_assert!(
-                    first >= cursor && count > 0,
-                    "slice {i} claims mbs [{first}..{}) against a carve cursor at {cursor} — \
-                     the macroblock partition is not disjoint raster order",
-                    first as i64 + count as i64,
-                );
+            for s_idx in 0..kiSliceCountU {
+                let first = pCurDq.pFirstMbIdxOfSlice[s_idx];
+                let count = pCurDq.pCountMbNumInSlice[s_idx];
                 if first < cursor
                     || count <= 0
                     || (first - cursor) as usize + count as usize > rest.len()
@@ -1190,7 +1521,7 @@ pub fn EncodeFixedSlicesForked(pCtx: &mut sWelsEncCtx, kiSliceCount: i32) -> i32
                 }
                 let (_gap, tail) = rest.split_at_mut((first - cursor) as usize);
                 let (chunk, tail) = tail.split_at_mut(count as usize);
-                vMbPerWorker[i % iWidth as usize].push(crate::safe::mb_grid::MbWindow::new(
+                pAllMbWindows[s_idx] = Some(crate::safe::mb_grid::MbWindow::new(
                     chunk,
                     first as usize,
                     kiGridWidth,
@@ -1202,91 +1533,129 @@ pub fn EncodeFixedSlicesForked(pCtx: &mut sWelsEncCtx, kiSliceCount: i32) -> i32
         }
 
         if iErr == ENC_RETURN_SUCCESS {
-            let mut jobs: Vec<SliceJobHandle<'_>> = Vec::with_capacity(iWidth as usize);
-            for (((k, buf), slices), mbs) in vTakenBsBufs
-                .iter_mut()
-                .enumerate()
-                .zip(vPerWorker)
-                .zip(vMbPerWorker)
-            {
-                let k = k as i32;
-                jobs.push(SliceJobHandle::new(
-                    pCtx,
-                    buf.as_mut_slice(),
-                    slices,
-                    mbs,
-                    None,
-                    None,
-                    k,
-                    k,
-                    iWidth,
-                    kiSliceCount,
-                    bRecordsTime,
-                ));
-            }
+            let bank_len = bank.len().min(kiSliceCountU);
+            for wave_idx in 0..schedule.num_waves {
+                let w_count = schedule.wave_widths[wave_idx];
+                let wave_plans = &schedule.waves[wave_idx][..w_count];
+                let slice_wave_filter: Option<(&[u8], u8)> = if schedule.num_waves > 1 {
+                    Some((schedule.slice_waves(kiSliceCountU), wave_idx as u8))
+                } else {
+                    None
+                };
 
-            // The persistent workers, borrowed through the shared context like
-            // everything else the jobs see. `scope` has `std::thread::scope`'s
-            // guarantee: nothing below it returns until every job has.
-            if let Some(pSmt) = pCtx.pSliceThreading.as_deref() {
-                pSmt.pool.scope(|s| {
-                    let mut handles = Vec::with_capacity(jobs.len());
-                    for job in jobs {
-                        handles.push(s.spawn(move || {
-                            // `job` is the whole capture: nothing else crosses.
-                            let mut job = job;
-                            let mut iWorkerErr = ENC_RETURN_SUCCESS;
-                            let mut iSliceIdx = job.iFirstSlice;
-                            while iSliceIdx < job.iSliceCount {
-                                let r = EncodeOneSliceInJob(
-                                    job.pCtx,
-                                    iSliceIdx,
-                                    job.iBsSlot,
-                                    job.bRecordsTime,
-                                    &mut *job.pBsBuf,
-                                    &mut job.pSlices,
-                                    &mut job.pMbs,
-                                    job.iFirstSlice,
-                                    job.iSliceStep,
-                                );
-                                if !r.bInitFailed && r.iResult != ENC_RETURN_SUCCESS {
-                                    iWorkerErr |= r.iResult;
+                let mut vPerWorker: [&mut [SSlice]; MAX_THREADS_NUM] =
+                    std::array::from_fn(|_| &mut [][..]);
+                {
+                    let mut bank_rest = &mut bank[..bank_len];
+                    let mut bank_cursor = 0usize;
+                    for (&(s_start, s_end, _, _), slot) in
+                        wave_plans.iter().zip(vPerWorker[..w_count].iter_mut())
+                    {
+                        let skip = s_start.saturating_sub(bank_cursor).min(bank_rest.len());
+                        let (_, after_skip) = bank_rest.split_at_mut(skip);
+                        let take_n = (s_end - s_start).min(after_skip.len());
+                        let (chunk, tail) = after_skip.split_at_mut(take_n);
+                        *slot = chunk;
+                        bank_rest = tail;
+                        bank_cursor = s_start + take_n;
+                    }
+                }
+
+                let mut vRowRanges = [(0usize, 0usize); MAX_THREADS_NUM];
+                for (dst, &(_, _, r0, r1)) in vRowRanges[..w_count].iter_mut().zip(wave_plans) {
+                    *dst = (r0, r1);
+                }
+                let mut vBands: [SlicePicBands<'_>; MAX_THREADS_NUM] =
+                    std::array::from_fn(|_| SlicePicBands::empty());
+                pics.split_bands_into(&vRowRanges[..w_count], kiMbWidth, &mut vBands[..w_count]);
+
+                let mut jobs: [Option<FixedSliceJob<'_, '_>>; MAX_THREADS_NUM] =
+                    std::array::from_fn(|_| None);
+                let mut mb_rest: &mut [Option<crate::safe::mb_grid::MbWindow<'_, SMB>>] =
+                    &mut *pAllMbWindows;
+                let mut mb_cursor = 0usize;
+                for (k, ((((&plan, buf), slices), bands), job_slot)) in wave_plans
+                    .iter()
+                    .zip(bs_bufs[..w_count].iter_mut())
+                    .zip(vPerWorker[..w_count].iter_mut())
+                    .zip(vBands[..w_count].iter_mut())
+                    .zip(jobs[..w_count].iter_mut())
+                    .enumerate()
+                {
+                    let (s_start, s_end, _, _) = plan;
+                    let skip = s_start.saturating_sub(mb_cursor);
+                    let (_, after_skip) = mb_rest.split_at_mut(skip);
+                    let (w_mbs, tail) = after_skip.split_at_mut(s_end - s_start);
+                    mb_rest = tail;
+                    mb_cursor = s_end;
+                    debug_assert!(
+                        pCtx.pSliceThreading
+                            .as_deref()
+                            .is_some_and(|pSmt| k < pSmt.uiThreadBsBufferNum),
+                        "job slot {k} is outside the allocated bs buffers"
+                    );
+                    *job_slot = Some(FixedSliceJob {
+                        pCtx,
+                        pBsBuf: buf.as_mut_slice(),
+                        pSlices: std::mem::take(slices),
+                        pMbs: w_mbs,
+                        bands: std::mem::replace(bands, SlicePicBands::empty()),
+                        slice_wave_filter,
+                        iBsSlot: k as i32,
+                        iFirstSlice: s_start as i32,
+                        iSliceEnd: s_end as i32,
+                        bRecordsTime,
+                        iResult: ENC_RETURN_SUCCESS,
+                    });
+                }
+
+                if let Some(pSmt) = pCtx.pSliceThreading.as_deref() {
+                    let all_ok = pSmt.pool.for_each_mut(&mut jobs[..w_count], |slot| {
+                        let Some(job) = slot.as_mut() else {
+                            return;
+                        };
+                        let mut iWorkerErr = ENC_RETURN_SUCCESS;
+                        let mut iSliceIdx = job.iFirstSlice;
+                        while iSliceIdx < job.iSliceEnd {
+                            if let Some((tags, wave_id)) = job.slice_wave_filter {
+                                if tags[iSliceIdx as usize] != wave_id {
+                                    iSliceIdx += 1;
+                                    continue;
                                 }
-                                if r.bInitFailed {
-                                    // `Execute`'s early return: this task is over and
-                                    // reports nothing. The remaining slices of this worker
-                                    // were separate tasks and still run.
-                                }
-                                iSliceIdx += job.iSliceStep;
                             }
-                            iWorkerErr
-                        }));
+                            let r = EncodeOneSliceInJob(
+                                job.pCtx,
+                                iSliceIdx,
+                                job.iBsSlot,
+                                job.bRecordsTime,
+                                job.pBsBuf,
+                                job.pSlices,
+                                job.pMbs,
+                                &mut job.bands,
+                                job.iFirstSlice,
+                            );
+                            if r != ENC_RETURN_SUCCESS {
+                                iWorkerErr |= r;
+                            }
+                            iSliceIdx += 1;
+                        }
+                        job.iResult = iWorkerErr;
+                    });
+                    if !all_ok {
+                        iErr |= ENC_RETURN_UNEXPECTED;
                     }
-                    // The join is the barrier (`WelsTaskBarrier`).
-                    for h in handles {
-                        iErr |= h.join().unwrap_or(ENC_RETURN_UNEXPECTED);
+                    for job in jobs[..w_count].iter().flatten() {
+                        iErr |= job.iResult;
                     }
-                });
+                }
+                if iErr != ENC_RETURN_SUCCESS {
+                    break;
+                }
             }
         }
     }
 
-    // The buffers go back to their slots, contents carried — a worker's bytes
-    // live in the `Vec` it wrote, and post-join assembly (`WriteSliceIToFrameBs`
-    // and friends) reads them from the context exactly as before.
-    if let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() {
-        for (k, buf) in vTakenBsBufs.into_iter().enumerate() {
-            pSmt.pThreadBsBuffer[k] = buf;
-        }
-    }
-    {
-        // The bank goes back with them, and so does the grid — a pointer move
-        // each way, contents carried.
-        let pCurDq = current_layer_expect_mut(pCtx);
-        pCurDq.sSliceBufferInfo[0].pSliceBuffer = vTakenBank;
-        pCurDq.sMbDataP = sTakenMbData;
-    }
-
+    drop(guard);
     iErr
 }
 
@@ -1300,9 +1669,10 @@ pub fn EncodeFixedSlicesForked(pCtx: &mut sWelsEncCtx, kiSliceCount: i32) -> i32
 /// It fires only when `bNeedAdjustingSlicing` is set, which only
 /// `DynamicAdjustSlicing` does — so this path is reachable only with
 /// `bUseLoadBalancing` on.
-pub fn UpdateMbMapForked(pCtx: &mut sWelsEncCtx, kiTaskCount: i32) {
+#[must_use]
+pub fn UpdateMbMapForked(pCtx: &mut sWelsEncCtx, kiTaskCount: i32) -> i32 {
     if kiTaskCount <= 0 || current_layer_ref(pCtx).is_none() || pCtx.pSliceThreading.is_none() {
-        return;
+        return ENC_RETURN_SUCCESS;
     }
     let iWidth = ForkWidth(pCtx, kiTaskCount);
     // The layer and the pool are disjoint fields of the context, so the layer's
@@ -1314,14 +1684,14 @@ pub fn UpdateMbMapForked(pCtx: &mut sWelsEncCtx, kiTaskCount: i32) {
         ..
     } = &mut *pCtx;
     let Some(pSmt) = pSliceThreading.as_deref() else {
-        return;
+        return ENC_RETURN_SUCCESS;
     };
     let pool = &pSmt.pool;
     let Some(pCurDq) = iCurDqLayer
         .and_then(|idx| ppDqLayerList.get_mut(idx.get()))
         .and_then(|l| l.as_deref_mut())
     else {
-        return;
+        return ENC_RETURN_SUCCESS;
     };
 
     // The pre-fork partition: each slice's records are the contiguous run
@@ -1341,52 +1711,97 @@ pub fn UpdateMbMapForked(pCtx: &mut sWelsEncCtx, kiTaskCount: i32) {
     let kiGridWidth = sMbDataP.dims().mb_width();
 
     // The ranges, in macroblock order: an empty slice contributes no chunk.
-    let mut ranges: Vec<(i32, i32, i32)> = (0..kiTaskCount)
-        .filter_map(|idc| {
-            let first = *pFirstMbIdxOfSlice.get(idc as usize)?;
-            let count = *pCountMbNumInSlice.get(idc as usize)?;
-            (count > 0 && first >= 0).then_some((first, count, idc))
-        })
-        .collect();
+    // Avoids heap allocation when `kiTaskCount <= MAX_SLICES_NUM`.
+    let kiTaskCountU = kiTaskCount as usize;
+    let mut stack_ranges = [(0i32, 0i32, 0i32); MAX_SLICES_NUM];
+    let mut heap_ranges: Vec<(i32, i32, i32)> = Vec::new();
+    let ranges_buf: &mut [(i32, i32, i32)] = if kiTaskCountU <= MAX_SLICES_NUM {
+        &mut stack_ranges[..kiTaskCountU]
+    } else {
+        heap_ranges.resize(kiTaskCountU, (0, 0, 0));
+        &mut heap_ranges[..]
+    };
+    let mut range_len = 0usize;
+    for idc in 0..kiTaskCount {
+        let Some(&first) = pFirstMbIdxOfSlice.get(idc as usize) else {
+            continue;
+        };
+        let Some(&count) = pCountMbNumInSlice.get(idc as usize) else {
+            continue;
+        };
+        if count > 0 && first >= 0 {
+            ranges_buf[range_len] = (first, count, idc);
+            range_len += 1;
+        }
+    }
+    if range_len == 0 {
+        return ENC_RETURN_SUCCESS;
+    }
+    let ranges = &mut ranges_buf[..range_len];
     ranges.sort_unstable();
 
-    // One `&mut [SMB]` per slice, peeled off the front in order.
+    // One `&mut [SMB]` per slice, peeled off the front in order into a flat stack
+    // array (no heap allocation for `range_len <= MAX_SLICES_NUM`), then split
+    // contiguously across workers.
+    type MbMapTask<'a> = (i32, i32, i32, &'a mut [SMB]);
+    let mut stack_tasks: [MbMapTask<'_>; MAX_SLICES_NUM] =
+        std::array::from_fn(|_| (0, 0, 0, &mut [][..]));
+    let mut heap_tasks: Vec<MbMapTask<'_>> = Vec::new();
+    let tasks_buf: &mut [MbMapTask<'_>] = if range_len <= MAX_SLICES_NUM {
+        &mut stack_tasks[..range_len]
+    } else {
+        heap_tasks.resize_with(range_len, || (0, 0, 0, &mut [][..]));
+        &mut heap_tasks[..]
+    };
+
     let mut rest: &mut [SMB] = sMbDataP.as_mut_slice();
     let mut cursor = 0i32;
-    let mut per_worker: Vec<Vec<(i32, i32, i32, &mut [SMB])>> =
-        (0..iWidth).map(|_| Vec::new()).collect();
-    for (first, count, idc) in ranges {
+    for (&(first, count, idc), task_slot) in ranges.iter().zip(tasks_buf.iter_mut()) {
         debug_assert!(
             first >= cursor,
             "slice {idc} starts at mb {first}, inside the previous slice's records \
              (which end at {cursor}) — the macroblock partition is not disjoint"
         );
         if first < cursor || count <= 0 || (first - cursor) as usize + count as usize > rest.len() {
-            return;
+            return ENC_RETURN_UNEXPECTED;
         }
         let (_gap, tail) = rest.split_at_mut((first - cursor) as usize);
         let (chunk, tail) = tail.split_at_mut(count as usize);
-        per_worker[(idc % iWidth) as usize].push((idc, first, count, chunk));
+        *task_slot = (idc, first, count, chunk);
         rest = tail;
         cursor = first + count;
     }
 
+    let n_workers = (iWidth as usize).min(MAX_THREADS_NUM).min(range_len).max(1);
+    let mut per_worker: [&mut [MbMapTask<'_>]; MAX_THREADS_NUM] =
+        std::array::from_fn(|_| &mut [][..]);
+    let base = range_len / n_workers;
+    let rem = range_len % n_workers;
+    let mut task_rest = tasks_buf;
+    for (w, slot) in per_worker[..n_workers].iter_mut().enumerate() {
+        let take = base + usize::from(w < rem);
+        let (chunk, tail) = task_rest.split_at_mut(take);
+        *slot = chunk;
+        task_rest = tail;
+    }
+
     let pSliceCtx: &SSliceCtx = sSliceEncCtx;
-    pool.scope(|s| {
-        for group in per_worker {
-            s.spawn(move || {
-                for (idc, first, count, chunk) in group {
-                    let mut mbs = crate::safe::mb_grid::MbWindow::new(
-                        chunk,
-                        first as usize,
-                        kiGridWidth,
-                        first as usize,
-                    );
-                    UpdateMbListNeighborParallel(&mut mbs, pSliceCtx, kiMbWidth, idc, first, count);
-                }
-            });
+    let all_ok = pool.for_each_mut(&mut per_worker[..n_workers], |group| {
+        for &mut (idc, first, count, ref mut chunk) in group.iter_mut() {
+            let mut mbs = crate::safe::mb_grid::MbWindow::new(
+                chunk,
+                first as usize,
+                kiGridWidth,
+                first as usize,
+            );
+            UpdateMbListNeighborParallel(&mut mbs, pSliceCtx, kiMbWidth, idc, first, count);
         }
     });
+    if all_ok {
+        ENC_RETURN_SUCCESS
+    } else {
+        ENC_RETURN_UNEXPECTED
+    }
 }
 
 /// One partition's slices under `SM_SIZELIMITED_SLICE` —
@@ -1408,18 +1823,20 @@ pub fn UpdateMbMapForked(pCtx: &mut sWelsEncCtx, kiTaskCount: i32) {
 /// Worker `p` owns partition `p`, bank `p` and bs slot `p`, which also makes
 /// `NumSliceCodedOfPartition[p]` and `LastCodedMbIdxOfPartition[p]` — written from
 /// inside the encode — disjoint by construction.
+#[allow(clippy::too_many_arguments)]
 fn EncodeOnePartitionSizeLimited(
     pCtx: &sWelsEncCtx,
     iPartitionIdx: i32,
     iBsSlot: i32,
     pSlotBuf: &mut [u8],
-    // This partition's records, carved before the fork — every slice this worker
-    // discovers lies inside the run. A partition whose span is zero codes
-    // nothing and carries NO window: `MbWindow`'s invariant is that a window
-    // always has a current macroblock, so the empty partition cannot be given
-    // one. Every read below is past the `iDiffMbIdx == 0` guard, where the slice
-    // is known to hold exactly one.
-    pMbs: &mut [crate::safe::mb_grid::MbWindow<'_, SMB>],
+    // This partition's records, moved onto the worker's stack so `set_cur`
+    // mutates a thread-local `MbWindow` rather than the caller's job array.
+    // A partition whose span is zero codes nothing and carries `None`:
+    // `MbWindow`'s invariant is that a window always has a current macroblock,
+    // so the empty partition cannot be given one. Every read below is past the
+    // `iDiffMbIdx == 0` guard, where the partition is known to hold an MB window.
+    pMb: Option<crate::safe::mb_grid::MbWindow<'_, SMB>>,
+    bands: &mut SlicePicBands<'_>,
     // This partition's CABAC restore scratch, taken from the context beside the
     // bitstream slot — reborrowed per coded slice below.
     mut pRestoreBuf: Option<&mut [u8]>,
@@ -1429,7 +1846,7 @@ fn EncodeOnePartitionSizeLimited(
     // an exclusive borrow, and every resolve is an index. Restored after the
     // join.
     pBank: &mut SSliceBufferInfo,
-) -> SliceJobResult {
+) -> i32 {
     // ---- InitTask (base), minus the slot claim
     let eNalType = pCtx.eNalType;
     let eNalRefIdc = pCtx.eNalPriority;
@@ -1440,18 +1857,12 @@ fn EncodeOnePartitionSizeLimited(
     {
         let kiCur = pBank.iCodedSliceNum as usize;
         let Some(pSlice) = pBank.pSliceBuffer.get_mut(kiCur) else {
-            return SliceJobResult {
-                iResult: ENC_RETURN_UNEXPECTED,
-                bInitFailed: true,
-            };
+            return ENC_RETURN_UNEXPECTED;
         };
         InitOneSliceInThread(pCtx, pSlice, iBsSlot, iPartitionIdx);
         let iReturn = SetSliceBoundaryInfo(current_layer_ref(pCtx), pSlice, iPartitionIdx);
         if iReturn != ENC_RETURN_SUCCESS {
-            return SliceJobResult {
-                iResult: iReturn,
-                bInitFailed: true,
-            };
+            return iReturn;
         }
         pSlice.sSliceBs.sBsWrite = BsWriter::new();
     }
@@ -1480,6 +1891,9 @@ fn EncodeOnePartitionSizeLimited(
             pBank.pSliceBuffer[kiCodedSliceNumByThread].iSliceIdx = -1;
             return ENC_RETURN_SUCCESS;
         }
+        let Some(mut mb_window) = pMb else {
+            return ENC_RETURN_UNEXPECTED;
+        };
 
         let mut iAnyMbLeftInPartition = iDiffMbIdx + 1;
         let mut iLocalSliceIdx = iPartitionIdx;
@@ -1533,7 +1947,8 @@ fn EncodeOnePartitionSizeLimited(
                 eNalType as i32,
                 &mut *pSliceBsBuf,
                 &mut pCtxOutBs,
-                &mut pMbs[0],
+                &mut mb_window,
+                bands,
                 pRestoreBuf.as_deref_mut(),
                 pNextSlice,
             );
@@ -1549,17 +1964,17 @@ fn EncodeOnePartitionSizeLimited(
             }
             // The walker reuses the partition run the coding chain just wrote
             // through, carved before the fork. `uiFilterIdc == 1` keeps the walk
-            // and the neighbour reads inside the slice, hence inside the run.
-            if let (Some(pfDeblockingFilterSlice), Some(view)) = (
-                pCtx.func_list().pfDeblocking.pfDeblockingFilterSlice,
-                layer_rec_view(pCurDq),
-            ) {
+            // and the neighbour reads inside the slice, hence inside the partition's
+            // MB-row band.
+            if let Some(pfDeblockingFilterSlice) =
+                pCtx.func_list().pfDeblocking.pfDeblockingFilterSlice
+            {
                 pfDeblockingFilterSlice(
-                    view,
+                    &mut bands.rec,
                     &pCurDq.sSliceEncCtx,
                     &pCurDq.iCsStride,
                     pSlice,
-                    &mut pMbs[0],
+                    &mut mb_window,
                 );
             }
 
@@ -1573,13 +1988,10 @@ fn EncodeOnePartitionSizeLimited(
 
     // ---- FinishTask
     if let Some(kiSlot) = kiLastCodedSlot {
-        pBank.pSliceBuffer[kiSlot].uiSliceConsumeTime = (WelsTime() - iSliceStart) as u32;
+        pBank.pSliceBuffer[kiSlot].uiSliceConsumeTime = (WelsTime() - iSliceStart).max(0) as u32;
     }
 
-    SliceJobResult {
-        iResult,
-        bInitFailed: false,
-    }
+    iResult
 }
 
 /// The fork/join for `SM_SIZELIMITED_SLICE` —
@@ -1615,85 +2027,60 @@ pub fn EncodeSizeLimitedSlicesForked(pCtx: &mut sWelsEncCtx, kiPartitionCnt: i32
     // Hoisted out of the fork — see `EncodeFixedSlicesForked`.
     crate::encoder::svc_encode_slice::StampLayerIdrFlagForSliceType(pCtx);
 
-    // The pre-fork partition of the bitstream pool: the worker buffers leave the
-    // context while it is still `&mut`, so each worker's `&mut [u8]` borrows this
-    // local and never the shared context. Moved, not copied. Restored below, after
-    // the join, behind the same `&mut`.
-    let mut vTakenBsBufs: Vec<Vec<u8>> = {
-        let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() else {
-            return ENC_RETURN_SUCCESS;
-        };
-        (0..iWidth as usize)
-            .map(|k| {
-                let buf = std::mem::take(&mut pSmt.pThreadBsBuffer[k]);
-                debug_assert!(!buf.is_empty(), "job slot {k} has no buffer behind it");
-                buf
-            })
-            .collect()
-    };
-
-    // The grid is carved by *partition*. Slice extents are discovered while
-    // coding under `SM_SIZELIMITED_SLICE`, so per-slice runs are not knowable
-    // here — but worker `p` owns partition `p` for the whole frame (the
-    // static-partition argument above), and
-    // `FirstMbIdxOfPartition`/`EndMbIdxOfPartition` are stamped before the
-    // fork. One contiguous run each; every slice a worker discovers lies
-    // inside its run, which is what lets the coding chain, the boundary
-    // walker and the deblocking all write through the same window.
-    let (vPartRanges, kiGridWidth) = {
+    let iWidthU = (iWidth as usize).min(MAX_THREADS_NUM);
+    // Snapshot partition ranges on the stack before taking buffers out of `pCtx`.
+    let (vPartRanges, kiGridWidth, kiMbWidth) = {
         let pCurDq = current_layer_expect(pCtx);
-        let r: Vec<(i32, i32)> = (0..iWidth as usize)
-            .map(|p| {
-                let first = pCurDq.FirstMbIdxOfPartition[p];
-                let end = pCurDq.EndMbIdxOfPartition[p];
-                // A partition whose span is zero codes nothing, and the count must
-                // say so: `EncodeOnePartitionSizeLimited`'s `iDiffMbIdx == 0` guard
-                // stamps `iSliceIdx = -1` and returns before it reads the window.
-                // `WelsInitCurrentQBLayerMltslc` clamps `iPartitionNum` to 1 whenever
-                // `kiMbNumInFrame / iPartitionNum` is 0 or 1, then zeroes every
-                // remaining slot, while the fork still runs `iActiveThreadsNum`
-                // workers: 32x16 with 3 threads is two macroblocks and three workers.
-                let span = end - first;
-                (first, if span == 0 { 0 } else { span + 1 })
-            })
-            .collect();
-        (r, pCurDq.sMbDataP.dims().mb_width())
-    };
-    let mut sTakenMbData = {
-        let pCurDq = current_layer_expect_mut(pCtx);
-        std::mem::replace(&mut pCurDq.sMbDataP, MbArray::empty())
+        let mut ranges = [(0i32, 0i32); MAX_THREADS_NUM];
+        for (p, slot) in ranges[..iWidthU].iter_mut().enumerate() {
+            let first = pCurDq.FirstMbIdxOfPartition[p];
+            let end = pCurDq.EndMbIdxOfPartition[p];
+            // A partition whose span is zero codes nothing, and the count must
+            // say so: `EncodeOnePartitionSizeLimited`'s `iDiffMbIdx == 0` guard
+            // stamps `iSliceIdx = -1` and returns before it reads the window.
+            // `UpdateSlicepEncCtxWithPartition` clamps `iPartitionNum` whenever
+            // `kiMbHeight` or `base_rows * kiMbWidth` is too small, then zeroes every
+            // remaining slot, while the fork still runs `iActiveThreadsNum`
+            // workers: 32x16 with 3 threads is two macroblocks and three workers.
+            let span = end - first;
+            *slot = (first, if span == 0 { 0 } else { span + 1 });
+        }
+        (
+            ranges,
+            pCurDq.sMbDataP.dims().mb_width(),
+            pCurDq.iMbWidth as usize,
+        )
     };
 
-    // The CABAC restore scratch joins the pre-fork takes: one buffer per
-    // partition (`pDynamicBsBuffer[k]`), a `Vec` move each way, restored after
-    // the join.
-    let mut vTakenDynBufs: Vec<Vec<u8>> = (0..iWidth as usize)
-        .map(|k| std::mem::take(&mut pCtx.pDynamicBsBuffer[k]))
-        .collect();
-
-    // The slice banks join the takes: worker `k` owns bank `k` for the frame,
-    // growth is an owned `Vec` resize, and they are restored after the join with
-    // grown size and coded slices carried.
-    let mut vTakenBanks: Vec<SSliceBufferInfo> = {
-        let pCurDq = current_layer_expect_mut(pCtx);
-        (0..iWidth as usize)
-            .map(|k| std::mem::take(&mut pCurDq.sSliceBufferInfo[k]))
-            .collect()
-    };
+    // Move out the worker bs scratch buffers, CABAC restore buffers, slice banks,
+    // MB grid, and mutable picture planes under an RAII guard that restores all of
+    // them unconditionally on return or panic unwind.
+    let mut guard = SizeLimitedForkGuard::take(pCtx, iWidthU);
 
     let mut iErr = ENC_RETURN_SUCCESS;
     {
+        let SizeLimitedForkGuard {
+            pCtx,
+            bs_bufs,
+            dyn_bufs,
+            banks,
+            mb_data,
+            pics,
+            ..
+        } = &mut guard;
         let pCtx: &sWelsEncCtx = pCtx;
-        let mut vMbPerWorker: Vec<Vec<crate::safe::mb_grid::MbWindow<'_, SMB>>> =
-            (0..iWidth as usize).map(|_| Vec::new()).collect();
+
+        let mut vMbPerWorker: [Option<crate::safe::mb_grid::MbWindow<'_, SMB>>; MAX_THREADS_NUM] =
+            std::array::from_fn(|_| None);
+        let mut vRowRanges = [(0usize, 0usize); MAX_THREADS_NUM];
         {
-            let mut rest: &mut [SMB] = sTakenMbData.as_mut_slice();
+            let mut rest: &mut [SMB] = mb_data.as_mut_slice();
             let mut cursor = 0i32;
-            for (p, &(first, count)) in vPartRanges.iter().enumerate() {
+            for (p, &(first, count)) in vPartRanges[..iWidthU].iter().enumerate() {
                 if count == 0 {
-                    // No window: `MbWindow` requires a current macroblock and
-                    // this partition has none. The worker's own `iDiffMbIdx == 0`
-                    // guard returns before it would index one.
+                    // No window and empty picture band: `MbWindow` requires a current
+                    // macroblock and this partition has none. The worker's own
+                    // `iDiffMbIdx == 0` guard returns before touching either.
                     continue;
                 }
                 debug_assert!(
@@ -1702,117 +2089,102 @@ pub fn EncodeSizeLimitedSlicesForked(pCtx: &mut sWelsEncCtx, kiPartitionCnt: i32
                      the partition map is not disjoint raster order",
                     first as i64 + count as i64,
                 );
+                let first_u = first as usize;
+                let end_excl_u = (first + count) as usize;
+                debug_assert!(
+                    kiMbWidth > 0 && first_u % kiMbWidth == 0 && end_excl_u % kiMbWidth == 0,
+                    "partition {p} [{first_u}..{end_excl_u}) is not MB-row aligned (mb_width={kiMbWidth})"
+                );
                 if first < cursor
                     || count <= 0
                     || (first - cursor) as usize + count as usize > rest.len()
+                    || kiMbWidth == 0
+                    || first_u % kiMbWidth != 0
+                    || end_excl_u % kiMbWidth != 0
                 {
                     iErr |= ENC_RETURN_UNEXPECTED;
                     break;
                 }
                 let (_gap, tail) = rest.split_at_mut((first - cursor) as usize);
                 let (chunk, tail) = tail.split_at_mut(count as usize);
-                vMbPerWorker[p].push(crate::safe::mb_grid::MbWindow::new(
+                vMbPerWorker[p] = Some(crate::safe::mb_grid::MbWindow::new(
                     chunk,
-                    first as usize,
+                    first_u,
                     kiGridWidth,
-                    first as usize,
+                    first_u,
                 ));
+                vRowRanges[p] = (first_u / kiMbWidth, end_excl_u / kiMbWidth);
                 rest = tail;
                 cursor = first + count;
             }
         }
         if iErr == ENC_RETURN_SUCCESS {
-            let mut jobs: Vec<SliceJobHandle<'_>> = Vec::with_capacity(iWidth as usize);
-            for ((((k, buf), mbs), dynbuf), bank) in vTakenBsBufs
+            let mut vBands: [SlicePicBands<'_>; MAX_THREADS_NUM] =
+                std::array::from_fn(|_| SlicePicBands::empty());
+            pics.split_bands_into(&vRowRanges[..iWidthU], kiMbWidth, &mut vBands[..iWidthU]);
+
+            let mut jobs: [Option<SizeLimitedJob<'_>>; MAX_THREADS_NUM] =
+                std::array::from_fn(|_| None);
+            for (k, (((((buf, mb), bands), dynbuf), bank), job_slot)) in bs_bufs[..iWidthU]
                 .iter_mut()
+                .zip(vMbPerWorker[..iWidthU].iter_mut())
+                .zip(vBands[..iWidthU].iter_mut())
+                .zip(dyn_bufs[..iWidthU].iter_mut())
+                .zip(banks[..iWidthU].iter_mut())
+                .zip(jobs[..iWidthU].iter_mut())
                 .enumerate()
-                .zip(vMbPerWorker)
-                .zip(vTakenDynBufs.iter_mut())
-                .zip(vTakenBanks.iter_mut())
             {
-                let k = k as i32;
-                // The size-limited fork carries no carved slices — the whole bank
-                // instead, owned, because it grows in-fork — plus the partition's one
-                // macroblock window and the restore scratch, `None` where the buffer
-                // was never allocated.
                 let dynbuf = if dynbuf.is_empty() {
                     None
                 } else {
                     Some(dynbuf.as_mut_slice())
                 };
-                jobs.push(SliceJobHandle::new(
+                debug_assert!(
+                    pCtx.pSliceThreading
+                        .as_deref()
+                        .is_some_and(|pSmt| k < pSmt.uiThreadBsBufferNum),
+                    "job slot {k} is outside the allocated bs buffers"
+                );
+                *job_slot = Some(SizeLimitedJob {
                     pCtx,
-                    buf.as_mut_slice(),
-                    Vec::new(),
-                    mbs,
-                    dynbuf,
-                    Some(bank),
-                    k,
-                    k,
-                    iWidth,
-                    kiPartitionCnt,
-                    true,
-                ));
+                    pBsBuf: buf.as_mut_slice(),
+                    pMb: mb.take(),
+                    bands: std::mem::replace(bands, SlicePicBands::empty()),
+                    pDynBsBuf: dynbuf,
+                    pBank: bank,
+                    iBsSlot: k as i32,
+                    iPartitionIdx: k as i32,
+                    iResult: ENC_RETURN_SUCCESS,
+                });
             }
 
             if let Some(pSmt) = pCtx.pSliceThreading.as_deref() {
-                pSmt.pool.scope(|s| {
-                    let mut handles = Vec::with_capacity(jobs.len());
-                    for job in jobs {
-                        handles.push(s.spawn(move || {
-                            let mut job = job;
-                            let Some(bank) = job.pBank.take() else {
-                                return ENC_RETURN_UNEXPECTED;
-                            };
-                            let r = EncodeOnePartitionSizeLimited(
-                                job.pCtx,
-                                job.iFirstSlice,
-                                job.iBsSlot,
-                                &mut *job.pBsBuf,
-                                &mut job.pMbs[..],
-                                job.pDynBsBuf.take(),
-                                bank,
-                            );
-                            if !r.bInitFailed && r.iResult != ENC_RETURN_SUCCESS {
-                                r.iResult
-                            } else {
-                                ENC_RETURN_SUCCESS
-                            }
-                        }));
-                    }
-                    for h in handles {
-                        iErr |= h.join().unwrap_or(ENC_RETURN_UNEXPECTED);
-                    }
+                let all_ok = pSmt.pool.for_each_mut(&mut jobs[..iWidthU], |slot| {
+                    let Some(job) = slot.as_mut() else {
+                        return;
+                    };
+                    job.iResult = EncodeOnePartitionSizeLimited(
+                        job.pCtx,
+                        job.iPartitionIdx,
+                        job.iBsSlot,
+                        job.pBsBuf,
+                        job.pMb.take(),
+                        &mut job.bands,
+                        job.pDynBsBuf.take(),
+                        job.pBank,
+                    );
                 });
+                if !all_ok {
+                    iErr |= ENC_RETURN_UNEXPECTED;
+                }
+                for job in jobs[..iWidthU].iter().flatten() {
+                    iErr |= job.iResult;
+                }
             }
         }
     }
 
-    // The buffers go back to their slots, contents carried — a worker's bytes
-    // live in the `Vec` it wrote, and post-join assembly (`WriteSliceIToFrameBs`
-    // and friends) reads them from the context exactly as before.
-    if let Some(pSmt) = pCtx.pSliceThreading.as_deref_mut() {
-        for (k, buf) in vTakenBsBufs.into_iter().enumerate() {
-            pSmt.pThreadBsBuffer[k] = buf;
-        }
-    }
-    {
-        // The grid goes back with them, and so does the scratch.
-        let pCurDq = current_layer_expect_mut(pCtx);
-        pCurDq.sMbDataP = sTakenMbData;
-    }
-    for (k, buf) in vTakenDynBufs.into_iter().enumerate() {
-        pCtx.pDynamicBsBuffer[k] = buf;
-    }
-    {
-        // The banks go back — grown size and coded slices carried, which is what
-        // `ReOrderSliceInLayer` and the NAL assembly read after this.
-        let pCurDq = current_layer_expect_mut(pCtx);
-        for (k, bank) in vTakenBanks.into_iter().enumerate() {
-            pCurDq.sSliceBufferInfo[k] = bank;
-        }
-    }
-
+    drop(guard);
     iErr
 }
 
@@ -1825,6 +2197,140 @@ mod tests {
         assert_eq!(WelsDivRound(100, 10), 10);
         assert_eq!(WelsDivRound(105, 10), 11);
         assert_eq!(WelsDivRound(104, 10), 10);
+    }
+
+    #[test]
+    fn plan_fixed_slice_workers_merges_shared_rows_and_keeps_bands_disjoint() {
+        // 4 MB-row-aligned slices on 80x45: 1 wave, 4 independent workers.
+        let aligned = [(0, 960), (960, 880), (1840, 880), (2720, 880)];
+        let waves = plan_fixed_slice_workers(&aligned, 80, 4).expect("valid");
+        assert_eq!(
+            waves,
+            vec![vec![
+                (0, 1, 0, 12),
+                (1, 2, 12, 23),
+                (2, 3, 23, 34),
+                (3, 4, 34, 45)
+            ]]
+        );
+
+        // 8 MB-row-aligned slices across 4 workers: 1 wave, contiguous pairs.
+        let eight = [
+            (0, 16),
+            (16, 16),
+            (32, 16),
+            (48, 16),
+            (64, 16),
+            (80, 16),
+            (96, 16),
+            (112, 16),
+        ];
+        let waves = plan_fixed_slice_workers(&eight, 16, 4).expect("valid");
+        assert_eq!(
+            waves,
+            vec![vec![(0, 2, 0, 2), (2, 4, 2, 4), (4, 6, 4, 6), (6, 8, 6, 8)]]
+        );
+
+        // Unaligned 720p `[900; 4]` (e.g. custom mid-row `SM_RASTER_SLICE`): every adjacent
+        // pair shares a boundary row (11, 22, 33), so a 1-wave merge collapses to 1 worker;
+        // the 2-wave schedule runs `{0, 2}` then `{1, 3}` with 2 disjoint workers per wave.
+        let unaligned_720p_4 = [(0, 900), (900, 900), (1800, 900), (2700, 900)];
+        let waves = plan_fixed_slice_workers(&unaligned_720p_4, 80, 4).expect("valid");
+        assert_eq!(
+            waves,
+            vec![
+                vec![(0, 1, 0, 12), (2, 3, 22, 34)],
+                vec![(1, 2, 11, 23), (3, 4, 33, 45)],
+            ]
+        );
+
+        // Unaligned 720p `[450; 8]`: 2 waves of 4 disjoint workers each (full 4-way
+        // parallelism despite every adjacent boundary falling mid-row).
+        let unaligned_720p_8: Vec<(i32, i32)> = (0..8).map(|i| (i * 450, 450)).collect();
+        let waves = plan_fixed_slice_workers(&unaligned_720p_8, 80, 4).expect("valid");
+        assert_eq!(waves.len(), 2);
+        assert_eq!(waves[0].len(), 4);
+        assert_eq!(waves[1].len(), 4);
+        for wave in &waves {
+            for pair in wave.windows(2) {
+                assert!(pair[0].3 <= pair[1].2, "wave row bands must be disjoint");
+            }
+        }
+
+        // Custom mid-row split on 16x4: slices 0 ([0..20)) and 1 ([20..48)) share row 1,
+        // so single-wave merge (crit = 48) ties 2-wave (crit = 20 + 28 = 48) and avoids
+        // an unnecessary second wave barrier.
+        let mid_row = [(0, 20), (20, 28), (48, 16)];
+        let waves = plan_fixed_slice_workers(&mid_row, 16, 4).expect("valid");
+        assert_eq!(waves, vec![vec![(0, 2, 0, 3), (2, 3, 3, 4)]]);
+
+        // 3 slices inside a single MB row plus a later disjoint row: verifies sound merging
+        // when a slice overlaps both waves, keeping every wave's spans and rows disjoint.
+        let dense_row = [(0, 5), (5, 5), (10, 6), (16, 20), (36, 20), (56, 24)];
+        let firsts: Vec<i32> = dense_row.iter().map(|&(f, _)| f).collect();
+        let counts: Vec<i32> = dense_row.iter().map(|&(_, c)| c).collect();
+        let sched = plan_fixed_slice_schedule(&firsts, &counts, 16, 4).expect("valid");
+        let mut seen = vec![false; dense_row.len()];
+        let tags = sched.slice_waves(dense_row.len());
+        for w in 0..sched.num_waves {
+            let plans = &sched.waves[w][..sched.wave_widths[w]];
+            for pair in plans.windows(2) {
+                assert!(pair[0].1 <= pair[1].0, "slice spans must be disjoint");
+                assert!(pair[0].3 <= pair[1].2, "row bands must be disjoint");
+            }
+            for &(s0, s1, _, _) in plans {
+                for s in s0..s1 {
+                    if sched.num_waves == 1 || tags[s] == w as u8 {
+                        assert!(!seen[s], "slice {s} scheduled twice");
+                        seen[s] = true;
+                    }
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|x| x), "every slice must be scheduled");
+
+        // Overlapping / out-of-order ranges are rejected.
+        assert!(plan_fixed_slice_workers(&[(0, 20), (16, 16)], 16, 2).is_none());
+    }
+
+    #[test]
+    fn dynamic_adjust_slicing_rc_off_stays_mb_row_aligned() {
+        let mut dq_layer = layer_with_bank(4);
+        dq_layer.sSliceEncCtx.iMbWidth = 16;
+        dq_layer.sSliceEncCtx.iMbHeight = 12;
+        dq_layer.sSliceEncCtx.iMbNumInFrame = 192;
+        dq_layer
+            .sSliceEncCtx
+            .iSliceNumInFrame
+            .store(4, Ordering::Relaxed);
+        dq_layer.sSliceEncCtx.pOverallMbMap = (0..192).map(|_| AtomicU16::new(0)).collect();
+        dq_layer.pFirstMbIdxOfSlice = vec![0, 48, 96, 144];
+        dq_layer.pCountMbNumInSlice = vec![48, 48, 48, 48];
+        // Skewed complexity ratios whose unrounded assignments would fall mid-row.
+        dq_layer.sSliceBufferInfo[0].pSliceBuffer[0].iSliceComplexRatio = 37;
+        dq_layer.sSliceBufferInfo[0].pSliceBuffer[1].iSliceComplexRatio = 19;
+        dq_layer.sSliceBufferInfo[0].pSliceBuffer[2].iSliceComplexRatio = 23;
+        dq_layer.sSliceBufferInfo[0].pSliceBuffer[3].iSliceComplexRatio = 21;
+
+        let mut param = SWelsSvcCodingParam::default();
+        param.iRCMode = RCMode::RC_OFF_MODE;
+
+        DynamicAdjustSlicing(&param, &[], &mut dq_layer, 0);
+        assert!(dq_layer.bNeedAdjustingSlicing);
+        assert_eq!(dq_layer.pCountMbNumInSlice.iter().sum::<i32>(), 192);
+        for s in 0..4 {
+            assert_eq!(
+                dq_layer.pFirstMbIdxOfSlice[s] % 16,
+                0,
+                "slice {s} start must remain MB-row aligned"
+            );
+            assert_eq!(
+                dq_layer.pCountMbNumInSlice[s] % 16,
+                0,
+                "slice {s} count must remain a multiple of iMbWidth"
+            );
+            assert!(dq_layer.pCountMbNumInSlice[s] >= 16);
+        }
     }
 
     /// Two workers write distinct patterns into their own taken slots while
@@ -1880,12 +2386,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_dynamic_detect_cpu_cores() {
-        let cores = DynamicDetectCpuCores();
-        assert!(cores >= 1);
     }
 
     /// A layer with one bank of `n` slices and `ppSliceInLayer` naming them in
@@ -2040,5 +2540,236 @@ mod tests {
              frame's times: {:?}",
             frames.iter().map(|f| f.kind).collect::<Vec<_>>()
         );
+    }
+
+    /// `RequestMtResource` spawns `N - 1` background workers (since the calling
+    /// thread executes slot 0 directly via `WorkerPool::for_each_mut`).
+    #[test]
+    fn request_mt_resource_spawns_n_minus_1_background_workers() {
+        for threads in [2u16, 3, 4] {
+            let mut ctx = sWelsEncCtx::default();
+            let mut param = crate::encoder::param_svc::NewCodingParam();
+            param.iMultipleThreadIdc = threads;
+            ctx.pSvcParam = Some(param);
+            assert_eq!(RequestMtResource(&mut ctx, 1024, 512, false), 0);
+            let smt = ctx.pSliceThreading.as_deref().expect("mt resource built");
+            assert_eq!(smt.uiThreadBsBufferNum, threads as usize);
+            assert_eq!(smt.pool.workers(), threads as usize - 1);
+            ReleaseMtResource(&mut ctx);
+            assert!(ctx.pSliceThreading.is_none());
+        }
+    }
+
+    /// RAII fork guards (`FixedForkGuard` and `SizeLimitedForkGuard`) unconditionally
+    /// restore `pThreadBsBuffer`, slice banks, `sMbDataP`, `pDynamicBsBuffer`, and
+    /// picture planes back into `sWelsEncCtx` even when a panic unwinds.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn fork_guards_restore_context_on_panic_unwind() {
+        use crate::encoder::encoder_ext::{WelsInitEncoderExt, WelsUninitEncoderExt};
+        use crate::encoder::svc_encode_slice::{LayerIdx, set_current_layer};
+
+        let make_mt_ctx = |slice_mode: SliceMode| -> Box<sWelsEncCtx> {
+            let mut ext = crate::SEncParamExt::default();
+            SWelsSvcCodingParam::FillDefaultExt(&mut ext);
+            ext.iPicWidth = 320;
+            ext.iPicHeight = 192;
+            ext.iTargetBitrate = 500_000;
+            ext.fMaxFrameRate = 30.0;
+            ext.iSpatialLayerNum = 1;
+            ext.iMultipleThreadIdc = 2;
+            ext.iEntropyCodingModeFlag = 1;
+            ext.sSpatialLayers[0].iVideoWidth = 320;
+            ext.sSpatialLayers[0].iVideoHeight = 192;
+            ext.sSpatialLayers[0].iSpatialBitrate = 500_000;
+            ext.sSpatialLayers[0].fFrameRate = 30.0;
+            ext.sSpatialLayers[0].sSliceArgument.uiSliceMode = slice_mode;
+            ext.sSpatialLayers[0].sSliceArgument.uiSliceNum = 2;
+            ext.sSpatialLayers[0].sSliceArgument.uiSliceSizeConstraint = 800;
+
+            let mut param = SWelsSvcCodingParam::default();
+            assert_eq!(param.ParamTranscode(&ext), 0);
+            let mut pCtx: Option<Box<sWelsEncCtx>> = None;
+            assert_eq!(
+                WelsInitEncoderExt(
+                    &mut pCtx,
+                    &mut param,
+                    crate::common::wels_trace::SLogContext::default(),
+                    None,
+                ),
+                0
+            );
+            let mut ctx = pCtx.unwrap();
+            set_current_layer(&mut ctx, Some(LayerIdx(0)));
+            let id_dec = ctx.ref_list(0).and_then(|rl| rl.pNextBuffer);
+            current_layer_expect_mut(&mut ctx).pDecPic = id_dec;
+            ctx
+        };
+
+        // 1. FixedForkGuard unwind restoration.
+        let mut ctx = make_mt_ctx(SliceMode::SM_FIXEDSLCNUM_SLICE);
+        let bs0_len = ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[0].len();
+        let bs1_len = ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[1].len();
+        let bank0_len = current_layer_expect(&ctx).sSliceBufferInfo[0]
+            .pSliceBuffer
+            .len();
+        let mb_len = current_layer_expect(&ctx).sMbDataP.as_slice().len();
+        assert!(bs0_len > 0 && bs1_len > 0 && bank0_len > 0 && mb_len > 0);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = FixedForkGuard::take(&mut ctx, 2);
+            panic!("simulated fixed-fork setup panic");
+        }));
+        assert!(res.is_err());
+        assert_eq!(
+            ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[0].len(),
+            bs0_len
+        );
+        assert_eq!(
+            ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[1].len(),
+            bs1_len
+        );
+        assert_eq!(
+            current_layer_expect(&ctx).sSliceBufferInfo[0]
+                .pSliceBuffer
+                .len(),
+            bank0_len
+        );
+        assert_eq!(current_layer_expect(&ctx).sMbDataP.as_slice().len(), mb_len);
+        let id_dec = current_layer_expect(&ctx).pDecPic.unwrap();
+        assert!(
+            !ctx.ref_list(0)
+                .unwrap()
+                .pic(id_dec)
+                .plane_tail(0)
+                .is_empty()
+        );
+        WelsUninitEncoderExt(Some(ctx));
+
+        // 2. SizeLimitedForkGuard unwind restoration.
+        let mut ctx = make_mt_ctx(SliceMode::SM_SIZELIMITED_SLICE);
+        let bs0_len = ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[0].len();
+        let dyn0_len = ctx.pDynamicBsBuffer[0].len();
+        let dyn1_len = ctx.pDynamicBsBuffer[1].len();
+        let bank0_len = current_layer_expect(&ctx).sSliceBufferInfo[0]
+            .pSliceBuffer
+            .len();
+        let bank1_len = current_layer_expect(&ctx).sSliceBufferInfo[1]
+            .pSliceBuffer
+            .len();
+        let mb_len = current_layer_expect(&ctx).sMbDataP.as_slice().len();
+        assert!(bs0_len > 0 && dyn0_len > 0 && dyn1_len > 0 && bank0_len > 0 && bank1_len > 0);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SizeLimitedForkGuard::take(&mut ctx, 2);
+            panic!("simulated size-limited-fork setup panic");
+        }));
+        assert!(res.is_err());
+        assert_eq!(
+            ctx.pSliceThreading.as_deref().unwrap().pThreadBsBuffer[0].len(),
+            bs0_len
+        );
+        assert_eq!(ctx.pDynamicBsBuffer[0].len(), dyn0_len);
+        assert_eq!(ctx.pDynamicBsBuffer[1].len(), dyn1_len);
+        assert_eq!(
+            current_layer_expect(&ctx).sSliceBufferInfo[0]
+                .pSliceBuffer
+                .len(),
+            bank0_len
+        );
+        assert_eq!(
+            current_layer_expect(&ctx).sSliceBufferInfo[1]
+                .pSliceBuffer
+                .len(),
+            bank1_len
+        );
+        assert_eq!(current_layer_expect(&ctx).sMbDataP.as_slice().len(), mb_len);
+        let id_dec = current_layer_expect(&ctx).pDecPic.unwrap();
+        assert!(
+            !ctx.ref_list(0)
+                .unwrap()
+                .pic(id_dec)
+                .plane_tail(0)
+                .is_empty()
+        );
+        WelsUninitEncoderExt(Some(ctx));
+    }
+
+    /// `InitTask` failures (`SetSliceBoundaryInfo` / missing slice slot) propagate as
+    /// errors instead of being silently swallowed.
+    #[test]
+    fn init_task_failures_propagate_instead_of_being_swallowed() {
+        let mut ctx = sWelsEncCtx::default();
+        let mut param = crate::encoder::param_svc::NewCodingParam();
+        param.iMultipleThreadIdc = 2;
+        ctx.pSvcParam = Some(param);
+        assert_eq!(RequestMtResource(&mut ctx, 1024, 512, false), 0);
+
+        // Layer with empty `pFirstMbIdxOfSlice` causes `SetSliceBoundaryInfo` to fail.
+        let mut dq = Box::new(layer_with_bank(2));
+        dq.iMbWidth = 16;
+        dq.iMbHeight = 12;
+        ctx.ppDqLayerList = vec![Some(dq)];
+        set_current_layer(&mut ctx, Some(LayerIdx(0)));
+
+        // Direct `EncodeOneSliceInJob` with empty `pSlices` fails.
+        let mut bs_buf = vec![0u8; 256];
+        let mut bands = SlicePicBands::empty();
+        assert_eq!(
+            EncodeOneSliceInJob(
+                &ctx,
+                0,
+                0,
+                false,
+                &mut bs_buf,
+                &mut [],
+                &mut [],
+                &mut bands,
+                0
+            ),
+            ENC_RETURN_UNEXPECTED
+        );
+
+        // `EncodeFixedSlicesForked` propagates missing boundary tables as an error.
+        assert_eq!(EncodeFixedSlicesForked(&mut ctx, 2), ENC_RETURN_UNEXPECTED);
+
+        // `EncodeOnePartitionSizeLimited` with empty slice bank fails.
+        let mut empty_bank = SSliceBufferInfo::default();
+        assert_eq!(
+            EncodeOnePartitionSizeLimited(
+                &ctx,
+                0,
+                0,
+                &mut bs_buf,
+                None,
+                &mut bands,
+                None,
+                &mut empty_bank,
+            ),
+            ENC_RETURN_UNEXPECTED
+        );
+
+        // `EncodeOnePartitionSizeLimited` with valid bank slot but missing boundary
+        // tables (`SetSliceBoundaryInfo` failure) propagates the error.
+        let mut one_slot_bank = SSliceBufferInfo {
+            pSliceBuffer: vec![SSlice::new()],
+            iMaxSliceNum: 1,
+            iCodedSliceNum: 0,
+        };
+        assert_eq!(
+            EncodeOnePartitionSizeLimited(
+                &ctx,
+                0,
+                0,
+                &mut bs_buf,
+                None,
+                &mut bands,
+                None,
+                &mut one_slot_bank,
+            ),
+            ENC_RETURN_UNEXPECTED
+        );
+
+        ReleaseMtResource(&mut ctx);
     }
 }

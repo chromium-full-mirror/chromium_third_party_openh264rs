@@ -57,8 +57,8 @@ use crate::encoder::md::{
     PUpdateMbMvFunc, SMB, SSampleDealingFunc, SWelsMD,
 };
 use crate::encoder::paraset_strategy::CWelsParametersetIdStrategyObj;
+use crate::encoder::picture::{RecPicBand, SlicePicBands};
 use crate::encoder::rc::SWelsRcFunc;
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::set_mb_syn_cabac::SCabacCtx;
 use crate::encoder::svc_encode_mb::{PDeQuantization4x4Func, PDeQuantizationFunc};
 use crate::encoder::svc_encode_slice::{BsWriter, SDynamicSlicingStack, SSlice};
@@ -76,6 +76,7 @@ use crate::encoder::svc_set_mb_syn_cavlc::{
 };
 use crate::encoder::wels_preprocess::SVAAFrameInfoExt;
 use crate::safe::mb_grid::{MbSplit, MbWindow};
+use crate::safe::plane::PlaneCursor;
 
 // ============================================================================
 // Function pointer typedefs
@@ -84,17 +85,18 @@ use crate::safe::mb_grid::{MbSplit, MbWindow};
 /// Intra predictor for the 4x4 luma prediction block. There is one type per block
 /// size — 16, 64 or 256 bytes — so a predictor cannot be installed into the wrong
 /// table. `rec` is the reconstruction picture, read and never written.
-pub type PGetLumaI4x4PredFunc = fn(pred: &mut [u8; 16], rec: &RecCursor<'_>);
+pub type PGetLumaI4x4PredFunc = fn(pred: &mut [u8; 16], rec: &PlaneCursor<'_>);
 /// [`PGetLumaI4x4PredFunc`] for the 8x8 chroma prediction block.
-pub type PGetChromaPredFunc = fn(pred: &mut [u8; 64], rec: &RecCursor<'_>);
+pub type PGetChromaPredFunc = fn(pred: &mut [u8; 64], rec: &PlaneCursor<'_>);
 /// [`PGetLumaI4x4PredFunc`] for the 16x16 luma prediction block.
-pub type PGetLumaI16x16PredFunc = fn(pred: &mut [u8; 256], rec: &RecCursor<'_>);
+pub type PGetLumaI16x16PredFunc = fn(pred: &mut [u8; 256], rec: &PlaneCursor<'_>);
 
 pub type PIntraFineMdFunc = fn(
     pEncCtx: &sWelsEncCtx,
     pWelsMd: &mut SWelsMD<'_>,
     pCurMb: &mut SMB,
     pMbCache: &mut SMbCache,
+    bands: &mut SlicePicBands<'_>,
 ) -> i32;
 
 /// The context and the mode-decision record share a lifetime: the body resolves the
@@ -104,6 +106,7 @@ pub type PInterFineMdFunc = for<'a> fn(
     pWelsMd: &mut SWelsMD<'a>,
     slice: &mut SSlice,
     pCurMb: &mut SMB,
+    bands: &mut SlicePicBands<'_>,
     bestCost: i32,
 );
 
@@ -112,6 +115,7 @@ pub type PInterMdFirstIntraModeFunc = fn(
     pWelsMd: &mut SWelsMD<'_>,
     pCurMb: &mut SMB,
     pMbCache: &mut SMbCache,
+    bands: &mut SlicePicBands<'_>,
 ) -> bool;
 
 pub type PInterMdBackgroundDecisionFunc = fn(
@@ -119,12 +123,13 @@ pub type PInterMdBackgroundDecisionFunc = fn(
     pWelsMd: &mut SWelsMD<'_>,
     slice: &mut SSlice,
     pCurMb: &mut SMB,
+    bands: &mut SlicePicBands<'_>,
     pKeepPskip: &mut bool,
 ) -> bool;
 
 /// Function pointer callback for updating background macroblock information during inter mode decision.
-pub type PMdBackgroundInfoUpdateFunc = extern "C" fn(
-    kpRecView: &crate::encoder::rec_view::RecPicView,
+pub type PMdBackgroundInfoUpdateFunc = fn(
+    rec: &mut RecPicBand<'_>,
     pCurMb: &mut SMB,
     bFlag: bool,
     kiRefPictureType: i32,
@@ -136,6 +141,7 @@ pub type PInterMdScrollingPSkipDecisionFunc = fn(
     pWelsMd: &mut SWelsMD<'_>,
     slice: &mut SSlice,
     pCurMb: &mut SMB,
+    bands: &mut SlicePicBands<'_>,
 ) -> bool;
 
 /// `pVaaExt` is shared, not exclusive: this slot is fork-reachable, so N workers hold
@@ -156,6 +162,7 @@ pub type PInterMdFunc = for<'a> fn(
     pWelsMd: &mut SWelsMD<'a>,
     slice: &mut SSlice,
     mbs: &mut MbSplit<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
 );
 
 pub type PDeQuantizationHadamardFunc = fn(pRes: &mut [i16; 16], kuiMF: u16);

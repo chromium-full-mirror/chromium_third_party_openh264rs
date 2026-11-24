@@ -64,7 +64,6 @@ openh264rs_sources = [
   "src/encoder/paraset_strategy.rs",
   "src/encoder/picture.rs",
   "src/encoder/rc.rs",
-  "src/encoder/rec_view.rs",
   "src/encoder/ref_list_mgr_svc.rs",
   "src/encoder/sample.rs",
   "src/encoder/set_mb_syn_cabac.rs",

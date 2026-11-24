@@ -41,7 +41,6 @@
 #![forbid(unsafe_code)]
 
 use crate::common::intra_pred_common::{i16x16_luma_pred_h, i16x16_luma_pred_v};
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::svc_base_layer_md::{
     C_PRED_DC, C_PRED_DC_128, C_PRED_DC_L, C_PRED_DC_T, C_PRED_H, C_PRED_P, C_PRED_V, I4_PRED_DC,
     I4_PRED_DC_128, I4_PRED_DC_L, I4_PRED_DC_T, I4_PRED_DDL, I4_PRED_DDL_TOP, I4_PRED_DDR,
@@ -51,7 +50,7 @@ use crate::encoder::svc_mode_decision::{
     I16_PRED_DC, I16_PRED_DC_128, I16_PRED_DC_L, I16_PRED_DC_T, I16_PRED_H, I16_PRED_P, I16_PRED_V,
 };
 use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
-use crate::safe::plane::RefSamples;
+use crate::safe::plane::{PlaneCursor, RefSamples};
 
 use crate::common::cpu_core::WELS_CPU_SSE2;
 /// The kernel set the dispatch sites below call: `simd::x86_64` or `simd::aarch64` by
@@ -798,7 +797,7 @@ pub fn i16x16_luma_pred_dc_na(pred: &mut [u8; 256]) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredV_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredV_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_v(pred, &rec.row_n::<4>(-1, 0))
 }
 
@@ -809,7 +808,7 @@ pub fn WelsI4x4LumaPredV_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredH_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredH_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_h(pred, rec) // reach: REACH_I4X4_LEFT
 }
 
@@ -820,7 +819,7 @@ pub fn WelsI4x4LumaPredH_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDc_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDc_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_dc(pred, rec) // reach: REACH_I4X4_DC
 }
 
@@ -831,7 +830,7 @@ pub fn WelsI4x4LumaPredDc_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDcLeft_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDcLeft_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_dc_left(pred, rec) // reach: REACH_I4X4_LEFT
 }
 
@@ -842,7 +841,7 @@ pub fn WelsI4x4LumaPredDcLeft_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDcTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDcTop_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_dc_top(pred, &rec.row_n::<4>(-1, 0))
 }
 
@@ -850,7 +849,7 @@ pub fn WelsI4x4LumaPredDcTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// Reads nothing ([`REACH_NONE`]) — neither neighbour exists; the reference
 /// parameter is kept only to fit the dispatch table's signature.
-pub fn WelsI4x4LumaPredDcNA_c(pred: &mut [u8; 16], _rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDcNA_c(pred: &mut [u8; 16], _rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_dc_na(pred)
 }
 
@@ -862,7 +861,7 @@ pub fn WelsI4x4LumaPredDcNA_c(pred: &mut [u8; 16], _rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDDL_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDDL_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_ddl(pred, &rec.row_n::<8>(-1, 0))
 }
 
@@ -874,7 +873,7 @@ pub fn WelsI4x4LumaPredDDL_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDDLTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDDLTop_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_ddl_top(pred, &rec.row_n::<4>(-1, 0))
 }
 
@@ -885,7 +884,7 @@ pub fn WelsI4x4LumaPredDDLTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredDDR_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredDDR_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_ddr(pred, rec) // reach: REACH_I4X4_DDR
 }
 
@@ -896,7 +895,7 @@ pub fn WelsI4x4LumaPredDDR_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredVL_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredVL_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_vl(pred, &rec.row_n::<7>(-1, 0))
 }
 
@@ -908,7 +907,7 @@ pub fn WelsI4x4LumaPredVL_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredVLTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredVLTop_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_vl_top(pred, &rec.row_n::<4>(-1, 0))
 }
 
@@ -919,7 +918,7 @@ pub fn WelsI4x4LumaPredVLTop_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredVR_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredVR_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_vr(pred, rec) // reach: REACH_I4X4_VR
 }
 
@@ -929,7 +928,7 @@ pub fn WelsI4x4LumaPredVR_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredHU_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredHU_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_hu(pred, rec) // reach: REACH_I4X4_LEFT
 }
 
@@ -940,7 +939,7 @@ pub fn WelsI4x4LumaPredHU_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI4x4LumaPredHD_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn WelsI4x4LumaPredHD_c(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     i4x4_luma_pred_hd(pred, rec) // reach: REACH_I4X4_HD
 }
 
@@ -952,7 +951,7 @@ pub fn WelsI4x4LumaPredHD_c(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredV_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredV_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_v(pred, &rec.row_n::<8>(-1, 0))
 }
 
@@ -962,7 +961,7 @@ pub fn WelsIChromaPredV_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredH_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredH_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_h(pred, rec) // reach: REACH_CHROMA_LEFT
 }
 
@@ -974,7 +973,7 @@ pub fn WelsIChromaPredH_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredPlane_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredPlane_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_plane(pred, rec) // reach: REACH_CHROMA_PLANE
 }
 
@@ -985,7 +984,7 @@ pub fn WelsIChromaPredPlane_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredDc_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredDc_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_dc(pred, rec) // reach: REACH_CHROMA_DC
 }
 
@@ -995,7 +994,7 @@ pub fn WelsIChromaPredDc_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredDcLeft_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredDcLeft_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_dc_left(pred, rec) // reach: REACH_CHROMA_LEFT
 }
 
@@ -1006,7 +1005,7 @@ pub fn WelsIChromaPredDcLeft_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsIChromaPredDcTop_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredDcTop_c(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     chroma_pred_dc_top(pred, &rec.row_n::<8>(-1, 0))
 }
 
@@ -1014,7 +1013,7 @@ pub fn WelsIChromaPredDcTop_c(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
 ///
 /// Reads nothing ([`REACH_NONE`]) — neither neighbour exists; the reference
 /// parameter is kept only to fit the dispatch table's signature.
-pub fn WelsIChromaPredDcNA_c(pred: &mut [u8; 64], _rec: &RecCursor<'_>) {
+pub fn WelsIChromaPredDcNA_c(pred: &mut [u8; 64], _rec: &PlaneCursor<'_>) {
     chroma_pred_dc_na(pred)
 }
 
@@ -1028,7 +1027,7 @@ pub fn WelsIChromaPredDcNA_c(pred: &mut [u8; 64], _rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredPlane_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredPlane_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_plane(pred, rec) // reach: REACH_I16X16_PLANE
 }
 
@@ -1039,7 +1038,7 @@ pub fn WelsI16x16LumaPredPlane_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredDc_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredDc_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_dc(pred, rec) // reach: REACH_I16X16_DC
 }
 
@@ -1050,7 +1049,7 @@ pub fn WelsI16x16LumaPredDc_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredDcTop_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredDcTop_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_dc_top(pred, &rec.row_n::<16>(-1, 0))
 }
 
@@ -1061,7 +1060,7 @@ pub fn WelsI16x16LumaPredDcTop_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredDcLeft_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredDcLeft_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_dc_left(pred, rec) // reach: REACH_I16X16_LEFT
 }
 
@@ -1069,7 +1068,7 @@ pub fn WelsI16x16LumaPredDcLeft_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
 ///
 /// Reads nothing ([`REACH_NONE`]) — neither neighbour exists; the reference
 /// parameter is kept only to fit the dispatch table's signature.
-pub fn WelsI16x16LumaPredDcNA_c(pred: &mut [u8; 256], _rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredDcNA_c(pred: &mut [u8; 256], _rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_dc_na(pred)
 }
 
@@ -1081,7 +1080,7 @@ pub fn WelsI16x16LumaPredDcNA_c(pred: &mut [u8; 256], _rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredV_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredV_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_v(pred, &rec.row_n::<16>(-1, 0))
 }
 
@@ -1093,7 +1092,7 @@ pub fn WelsI16x16LumaPredV_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
 ///
 /// # Panics
 /// If `rec` is anchored so that this reach leaves the plane.
-pub fn WelsI16x16LumaPredH_c(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn WelsI16x16LumaPredH_c(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     i16x16_luma_pred_h(pred, rec)
 }
 
@@ -1163,7 +1162,6 @@ pub fn WelsInitIntraPredFuncs(pFuncList: &mut SWelsFuncPtrList, kuiCpuFlag: u32)
 mod tests {
     use super::*;
 
-    use crate::encoder::rec_view::shared_plane_for_test;
     use crate::safe::plane::PaddedPlane;
 
     /// A reference plane with a known ramp, and the seam cursor at its `(0, 0)`.
@@ -1189,28 +1187,25 @@ mod tests {
 
     #[test]
     fn i4x4_dc_na_fills_0x80() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
+        let plane = ramp_at_origin(16, 16, 16, 48);
         let mut pred = [0u8; 16];
-        WelsI4x4LumaPredDcNA_c(&mut pred, &view.cursor(0, 0));
+        WelsI4x4LumaPredDcNA_c(&mut pred, &plane.cursor(0, 0));
         assert_eq!(pred, [0x80u8; 16]);
     }
 
     #[test]
     fn i16x16_dc_na_fills_0x80() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
+        let plane = ramp_at_origin(16, 16, 16, 48);
         let mut pred = [0u8; 256];
-        WelsI16x16LumaPredDcNA_c(&mut pred, &view.cursor(0, 0));
+        WelsI16x16LumaPredDcNA_c(&mut pred, &plane.cursor(0, 0));
         assert!(pred.iter().all(|&b| b == 0x80));
     }
 
     #[test]
     fn chroma_dc_na_fills_0x80() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
+        let plane = ramp_at_origin(16, 16, 16, 48);
         let mut pred = [0u8; 64];
-        WelsIChromaPredDcNA_c(&mut pred, &view.cursor(0, 0));
+        WelsIChromaPredDcNA_c(&mut pred, &plane.cursor(0, 0));
         assert_eq!(pred, [0x80u8; 64]);
     }
 
@@ -1218,9 +1213,8 @@ mod tests {
     /// replicates each left sample across its row.
     #[test]
     fn i4x4_v_and_h_replicate_their_edge() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
-        let rec = view.cursor(0, 0);
+        let plane = ramp_at_origin(16, 16, 16, 48);
+        let rec = plane.cursor(0, 0);
 
         let top: [u8; 4] = core::array::from_fn(|i| rec.at(i as isize, -1));
         let mut pred = [0u8; 16];
@@ -1240,9 +1234,8 @@ mod tests {
     /// DcLeft use only one edge with a different rounding shift.
     #[test]
     fn i16x16_dc_variants_match_their_definitions() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
-        let rec = view.cursor(0, 0);
+        let plane = ramp_at_origin(16, 16, 16, 48);
+        let rec = plane.cursor(0, 0);
 
         let top_sum: i32 = (0..16).map(|i| rec.at(i, -1) as i32).sum();
         let left_sum: i32 = (0..16).map(|i| rec.at(-1, i) as i32).sum();
@@ -1263,9 +1256,8 @@ mod tests {
     /// stride-8 prediction block; horizontal broadcasts each left sample.
     #[test]
     fn chroma_v_and_h_replicate_their_edge() {
-        let mut plane = ramp_at_origin(16, 16, 16, 48);
-        let view = shared_plane_for_test(&mut plane);
-        let rec = view.cursor(0, 0);
+        let plane = ramp_at_origin(16, 16, 16, 48);
+        let rec = plane.cursor(0, 0);
         let top: Vec<u8> = (0..8).map(|i| rec.at(i, -1)).collect();
 
         let mut pred = [0u8; 64];
@@ -1285,9 +1277,8 @@ mod tests {
     /// cheapest check that the DDL/DDR/VL/VR/HU/HD tap patterns cover all 16 samples.
     #[test]
     fn all_i4x4_modes_are_flat_on_a_flat_plane() {
-        let mut plane = flat_at_origin(16, 16, 16, 48, 137);
-        let view = shared_plane_for_test(&mut plane);
-        let rec = view.cursor(0, 0);
+        let plane = flat_at_origin(16, 16, 16, 48, 137);
+        let rec = plane.cursor(0, 0);
 
         let mut fl = SWelsFuncPtrList::default();
         WelsInitIntraPredFuncs(&mut fl, 0);
@@ -1313,9 +1304,8 @@ mod tests {
     /// Same for chroma and I16x16.
     #[test]
     fn all_chroma_and_i16x16_modes_are_flat_on_a_flat_plane() {
-        let mut plane = flat_at_origin(16, 16, 24, 64, 91);
-        let view = shared_plane_for_test(&mut plane);
-        let rec = view.cursor(0, 0);
+        let plane = flat_at_origin(16, 16, 24, 64, 91);
+        let rec = plane.cursor(0, 0);
 
         let mut fl = SWelsFuncPtrList::default();
         WelsInitIntraPredFuncs(&mut fl, 0);

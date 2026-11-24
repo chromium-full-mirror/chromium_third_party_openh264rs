@@ -52,8 +52,6 @@ pub fn satd_4x4<A: RefSamples + Copy, B: RefSamples + Copy>(c1: &A, c2: &B) -> i
     let mut mix = [[0i32; 4]; 4];
 
     for (i, row) in mix.iter_mut().enumerate() {
-        // `RecCursor::row` is const-sized and returns by value — a shared
-        // cell view cannot lend a row.
         let r1: [u8; 4] = c1.row_n::<4>(i as isize, 0);
         let r2: [u8; 4] = c2.row_n::<4>(i as isize, 0);
         for k in 0..4 {

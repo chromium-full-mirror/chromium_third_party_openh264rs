@@ -44,12 +44,12 @@ pub use crate::encoder::encoder_context::SMVUnitXY;
 pub use crate::encoder::md::SSampleDealingFunc;
 pub use crate::encoder::picture::SPicture;
 pub use crate::encoder::picture::SScreenBlockFeatureStorage;
-use crate::encoder::rec_view::{RecCursor, SharedPlane};
 pub use crate::encoder::slice_multi_threading::SSliceCtx;
 pub use crate::encoder::svc_encode_slice::SDqLayer;
 pub use crate::encoder::svc_encode_slice::SSlice;
 pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
 use crate::safe::mvd_cost::MvdCostCursor;
+use crate::safe::plane::{PaddedPlane, PlaneBand, PlaneCursor};
 use crate::simd::kernels;
 
 // Constants, Limits, and Enums
@@ -173,8 +173,8 @@ pub struct SFeatureSearchIn<'a> {
     pub pLocationPointer: &'a [u16],
     pub pMvdCostX: MvdCostCursor<'a>,
     pub pMvdCostY: MvdCostCursor<'a>,
-    pub pEncPlane: Option<&'a SharedPlane>,
-    pub pRefPlane: Option<&'a SharedPlane>,
+    pub pEncPlane: Option<&'a PlaneBand<'a>>,
+    pub pRefPlane: Option<&'a PaddedPlane>,
     pub uiSadCostThresh: u16,
     pub iFeatureOfCurrent: i32,
     pub iCurPixX: i32,
@@ -227,15 +227,15 @@ pub use crate::encoder::md::PSampleSadSatdCostFunc;
 /// `sample1`'s block against `sample2`'s at each whole-sample neighbour, written to
 /// `sad[0..4]` in the order up, down, left, right
 /// (`common/sad_common.rs::sample_sad_four::<W, H>`).
-pub type PSample4SadCostFunc = fn(&RecCursor<'_>, &RecCursor<'_>, &mut [i32; 4]);
+pub type PSample4SadCostFunc = fn(&PlaneCursor<'_>, &PlaneCursor<'_>, &mut [i32; 4]);
 
 pub type PMotionSearchFunc = fn(
     pMeFuncs: &SMeFuncs,
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 );
 
 pub type PSearchMethodFunc = fn(
@@ -243,15 +243,15 @@ pub type PSearchMethodFunc = fn(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 );
 
 pub type PCalculateSatdFunc = fn(
     pSatd: Option<PSampleSadSatdCostFunc>,
     pMe: &mut SWelsME<'_>,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 );
 
 pub type PCheckDirectionalMv = fn(
@@ -259,8 +259,8 @@ pub type PCheckDirectionalMv = fn(
     pMe: &mut SWelsME<'_>,
     ksMinMv: SMVUnitXY,
     ksMaxMv: SMVUnitXY,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
     iBestSadCost: &mut i32,
 ) -> bool;
 
@@ -268,8 +268,8 @@ pub type PLineFullSearchFunc = fn(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pMvdTable: MvdCostCursor<'_>,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
     kiMinMv: i16,
     kiMaxMv: i16,
     bVerticalSearch: bool,
@@ -299,7 +299,7 @@ pub type PCalculateBlockFeatureOfFrame = fn(
     pTimesOfFeatureValue: &mut [u32],
 );
 
-pub type PCalculateSingleBlockFeature = fn(cRef: &RecCursor<'_>) -> i32;
+pub type PCalculateSingleBlockFeature = fn(cRef: &PlaneCursor<'_>) -> i32;
 
 pub type PUpdateFMESwitch = fn(pCurLayer: &mut SDqLayer);
 
@@ -454,8 +454,8 @@ pub fn WelsMotionEstimateSearch(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     if crate::encoder::dump_enabled(&ME_DUMP, "OH264_MEDUMP") {
         let mut mvc = String::new();
@@ -529,8 +529,8 @@ pub fn WelsMotionEstimateSearchStatic(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     _pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     let block_size = pMe.uiBlockSize as usize;
     let kiX = pMe.iCurMeBlockPixX as isize;
@@ -561,8 +561,8 @@ pub fn WelsMotionEstimateSearchScrolled(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     _pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     let block_size = pMe.uiBlockSize as usize;
     let kiX = pMe.iCurMeBlockPixX as isize;
@@ -601,8 +601,8 @@ pub fn WelsMotionEstimateInitialPoint(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) -> bool {
     let block_size = pMe.uiBlockSize as usize;
     let pSad = sdf.pfSampleSad[block_size];
@@ -697,8 +697,8 @@ pub fn WelsMotionEstimateInitialPoint(
 pub fn CalculateSatdCost(
     pSatd: Option<PSampleSadSatdCostFunc>,
     pMe: &mut SWelsME<'_>,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     if let Some(satd_fn) = pSatd {
         let kiX = pMe.iCurMeBlockPixX as isize;
@@ -720,8 +720,8 @@ pub fn CalculateSatdCost(
 pub fn NotCalculateSatdCost(
     _pSatd: Option<PSampleSadSatdCostFunc>,
     _pMe: &mut SWelsME<'_>,
-    _pEncPlane: &SharedPlane,
-    _pRefPlane: &SharedPlane,
+    _pEncPlane: &PlaneBand<'_>,
+    _pRefPlane: &PaddedPlane,
 ) {
 }
 
@@ -775,8 +775,8 @@ pub fn WelsDiamondSearch(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     {
         let block_size = pMe.uiBlockSize as usize;
@@ -853,8 +853,8 @@ pub fn CheckDirectionalMv(
     pMe: &mut SWelsME<'_>,
     ksMinMv: SMVUnitXY,
     ksMaxMv: SMVUnitXY,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
     iBestSadCost: &mut i32,
 ) -> bool {
     {
@@ -893,8 +893,8 @@ pub fn CheckDirectionalMvFalse(
     _pMe: &mut SWelsME<'_>,
     _ksMinMv: SMVUnitXY,
     _ksMaxMv: SMVUnitXY,
-    _pEncPlane: &SharedPlane,
-    _pRefPlane: &SharedPlane,
+    _pEncPlane: &PlaneBand<'_>,
+    _pRefPlane: &PaddedPlane,
     _iBestSadCost: &mut i32,
 ) -> bool {
     false
@@ -938,15 +938,15 @@ thread_local! {
 
 /// Quadrant sums `[TL, TR, BL, BR]` of the `N`x`N` block at `c`.
 #[inline(always)]
-fn sea_block_quads<const N: usize>(c: &RecCursor<'_>) -> [u16; 4] {
+fn sea_block_quads<const N: usize>(c: &PlaneCursor<'_>) -> [u16; 4] {
     let mut q = [0u16; 4];
     for (y, row) in c.row_windows::<N>(0, 0, N).enumerate() {
         let (mut l, mut r) = (0u16, 0u16);
-        for (x, cell) in row.iter().enumerate() {
+        for (x, &b) in row.iter().enumerate() {
             if x < N / 2 {
-                l += cell.get() as u16;
+                l += b as u16;
             } else {
-                r += cell.get() as u16;
+                r += b as u16;
             }
         }
         let k = if y < N / 2 { 0 } else { 2 };
@@ -975,8 +975,8 @@ fn sea_window_sum<const H: usize>(src: &[u16], dst: &mut [u16]) {
 #[inline(never)]
 fn sea_line_search<const N: usize>(
     sad_fn: PSampleSadSatdCostFunc,
-    cEnc: &RecCursor<'_>,
-    cRefStart: RecCursor<'_>,
+    cEnc: &PlaneCursor<'_>,
+    cRefStart: PlaneCursor<'_>,
     n: usize,
     vertical: bool,
     iFixedMvd: u16,
@@ -1061,7 +1061,7 @@ fn sea_line_search<const N: usize>(
 
 /// Left/right half sums of each `N`-wide row at `c`, one row per entry of `a0`.
 #[inline(always)]
-pub fn sea_row_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_row_half_sums_c<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     let rows = a0.len();
     let a1 = &mut a1[..rows];
     for ((row, l), r) in c
@@ -1070,11 +1070,11 @@ pub fn sea_row_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1
         .zip(a1.iter_mut())
     {
         let (mut sl, mut sr) = (0u16, 0u16);
-        for (x, cell) in row.iter().enumerate() {
+        for (x, &b) in row.iter().enumerate() {
             if x < N / 2 {
-                sl += cell.get() as u16;
+                sl += b as u16;
             } else {
-                sr += cell.get() as u16;
+                sr += b as u16;
             }
         }
         *l = sl;
@@ -1084,7 +1084,7 @@ pub fn sea_row_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1
 
 /// Top/bottom half sums of each `N`-tall column at `c`, one column per entry of `a0`.
 #[inline(always)]
-pub fn sea_col_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_col_half_sums_c<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     let cols = a0.len();
     let a1 = &mut a1[..cols];
     // A ragged tail overlaps the previous chunk rather than reading past the end.
@@ -1092,8 +1092,8 @@ pub fn sea_col_half_sums_c<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1
         let (mut t, mut b) = ([0u16; 16], [0u16; 16]);
         for (y, row) in c.row_windows::<16>(0, x0 as isize, N).enumerate() {
             let acc = if y < N / 2 { &mut t } else { &mut b };
-            for (s, cell) in acc.iter_mut().zip(row.iter()) {
-                *s += cell.get() as u16;
+            for (s, &v) in acc.iter_mut().zip(row.iter()) {
+                *s += v as u16;
             }
         }
         a0[x0..x0 + 16].copy_from_slice(&t);
@@ -1156,8 +1156,8 @@ pub fn LineFullSearch_c(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pMvdTable: MvdCostCursor<'_>,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
     iMinMv: i16,
     iMaxMv: i16,
     bVerticalSearch: bool,
@@ -1304,8 +1304,8 @@ pub fn WelsMotionCrossSearch(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     if let Some(vert_fn) = pMeFuncs.pfVerticalFullSearch {
         vert_fn(
@@ -1341,8 +1341,8 @@ pub fn WelsDiamondCrossSearch(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     WelsDiamondSearch(pMeFuncs, sdf, pMe, pSlice, pEncPlane, pRefPlane);
 
@@ -1360,8 +1360,8 @@ pub fn WelsDiamondCrossFeatureSearch(
     sdf: &SSampleDealingFunc,
     pMe: &mut SWelsME<'_>,
     pSlice: &mut SSlice,
-    pEncPlane: &SharedPlane,
-    pRefPlane: &SharedPlane,
+    pEncPlane: &PlaneBand<'_>,
+    pRefPlane: &PaddedPlane,
 ) {
     WelsDiamondCrossSearch(pMeFuncs, sdf, pMe, pSlice, pEncPlane, pRefPlane);
 
@@ -1418,10 +1418,10 @@ pub fn SetMeMethod(uiMethod: u32, pSearchMethodFunc: &mut Option<PSearchMethodFu
 
 /// The per-block twin of [`SumOf8x8SingleBlock_c`] — what the
 /// `pfCalculateSingleBlockFeature` slot holds.
-pub fn sum_of_8x8_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_8x8_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     let mut iSum = 0i32;
-    for y in 0..8 {
-        for b in cRef.row::<8>(y, 0) {
+    for row in cRef.row_windows::<8>(0, 0, 8) {
+        for &b in row {
             iSum += b as i32;
         }
     }
@@ -1433,10 +1433,10 @@ pub fn sum_of_8x8_single_block(cRef: &RecCursor<'_>) -> i32 {
 /// `pfCalculateSingleBlockFeature[1]` is reached only by a `BLOCK_16x16` feature
 /// search, which `encoder_ext.cpp:1030-1031` never configures: `kiMe16x16` carries no
 /// `ME_FME` bit, so the feature search lands in `pfSearchMethod[BLOCK_8x8]`.
-pub fn sum_of_16x16_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_16x16_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     let mut iSum = 0i32;
-    for y in 0..16 {
-        for b in cRef.row::<16>(y, 0) {
+    for row in cRef.row_windows::<16>(0, 0, 16) {
+        for &b in row {
             iSum += b as i32;
         }
     }
@@ -1787,8 +1787,8 @@ pub fn SetFeatureSearchIn<'a>(
     sMe: &SWelsME<'a>,
     pSlice: &SSlice,
     pRefFeatureStorage: Option<&'a SScreenBlockFeatureStorage>,
-    pEncPlane: &'a SharedPlane,
-    pRefPlane: &'a SharedPlane,
+    pEncPlane: &'a PlaneBand<'a>,
+    pRefPlane: &'a PaddedPlane,
     pFeatureSearchIn: &mut SFeatureSearchIn<'a>,
 ) -> bool {
     let block_size = sMe.uiBlockSize as usize;
@@ -2506,14 +2506,10 @@ mod tests {
                     "8x8 simd times mismatch at {width}x{height}"
                 );
 
-                let mut owned = pic.clone();
                 for y in [0, (height - 1) as usize] {
                     for x in [0, (width - 1) as usize] {
-                        let cursor = RecCursor::over_owned(
-                            &mut owned,
-                            y * stride as usize + x,
-                            stride as usize,
-                        );
+                        let cursor =
+                            PlaneCursor::new(&pic, y * stride as usize + x, stride as usize);
                         let expected = ref_feat[y * width as usize + x] as i32;
                         assert_eq!(sum_of_8x8_single_block(&cursor), expected);
                         assert_eq!(kernels::me::sum_of_8x8_single_block(&cursor), expected);
@@ -2572,14 +2568,10 @@ mod tests {
                     "16x16 simd times mismatch at {width}x{height}"
                 );
 
-                let mut owned = pic.clone();
                 for y in [0, (height - 1) as usize] {
                     for x in [0, (width - 1) as usize] {
-                        let cursor = RecCursor::over_owned(
-                            &mut owned,
-                            y * stride as usize + x,
-                            stride as usize,
-                        );
+                        let cursor =
+                            PlaneCursor::new(&pic, y * stride as usize + x, stride as usize);
                         let expected = ref_feat[y * width as usize + x] as i32;
                         assert_eq!(sum_of_16x16_single_block(&cursor), expected);
                         assert_eq!(kernels::me::sum_of_16x16_single_block(&cursor), expected);
@@ -2645,7 +2637,7 @@ mod sea_tests {
             .collect()
     }
 
-    fn sad<const N: usize>(a: &RecCursor<'_>, b: &RecCursor<'_>) -> i32 {
+    fn sad<const N: usize>(a: &PlaneCursor<'_>, b: &PlaneCursor<'_>) -> i32 {
         let mut s = 0i32;
         for y in 0..N as isize {
             for x in 0..N as isize {
@@ -2657,8 +2649,8 @@ mod sea_tests {
 
     /// The unpruned loop.
     fn plain<const N: usize>(
-        cEnc: &RecCursor<'_>,
-        cRefStart: RecCursor<'_>,
+        cEnc: &PlaneCursor<'_>,
+        cRefStart: PlaneCursor<'_>,
         n: usize,
         vertical: bool,
         iFixedMvd: u16,
@@ -2692,8 +2684,8 @@ mod sea_tests {
                     } else {
                         (rows - 1) * stride + N
                     };
-                    let mut buf = pixels(rng, len.max(1));
-                    let c = RecCursor::over_owned(&mut buf, 0, stride);
+                    let buf = pixels(rng, len.max(1));
+                    let c = PlaneCursor::new(&buf, 0, stride);
                     let (mut w0, mut w1) = (vec![0u16; rows], vec![0u16; rows]);
                     let (mut g0, mut g1) = (vec![1u16; rows], vec![1u16; rows]);
                     sea_row_half_sums_c::<N>(&c, &mut w0, &mut w1);
@@ -2706,8 +2698,8 @@ mod sea_tests {
             for cols in 1..=50usize {
                 for stride in [cols, cols + 5, 80] {
                     let len = (N - 1) * stride + cols;
-                    let mut buf = pixels(rng, len);
-                    let c = RecCursor::over_owned(&mut buf, 0, stride);
+                    let buf = pixels(rng, len);
+                    let c = PlaneCursor::new(&buf, 0, stride);
                     let (mut w0, mut w1) = (vec![0u16; cols], vec![0u16; cols]);
                     let (mut g0, mut g1) = (vec![1u16; cols], vec![1u16; cols]);
                     sea_col_half_sums_c::<N>(&c, &mut w0, &mut w1);
@@ -2757,7 +2749,7 @@ mod sea_tests {
     fn sea_line_search_matches_the_plain_loop() {
         let mut rng = Prng::new(0x5EA_0002);
         fn case<const N: usize>(rng: &mut Prng, n: usize, vertical: bool) {
-            let mut enc = pixels(rng, N * N);
+            let enc = pixels(rng, N * N);
             // Copies of the block create ties; the first must win.
             let (rows, cols) = if vertical {
                 (n + N - 1, N)
@@ -2802,8 +2794,8 @@ mod sea_tests {
                     .collect(),
             };
             let fixed = rng.below(50) as u16;
-            let cEnc = RecCursor::over_owned(&mut enc, 0, N);
-            let cRef = RecCursor::over_owned(&mut refb, 0, stride);
+            let cEnc = PlaneCursor::new(&enc, 0, N);
+            let cRef = PlaneCursor::new(&refb, 0, stride);
             let want = plain::<N>(&cEnc, cRef, n, vertical, fixed, &mvd);
             for accept in [
                 u32::MAX,

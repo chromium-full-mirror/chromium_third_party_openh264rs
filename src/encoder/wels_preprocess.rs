@@ -437,16 +437,12 @@ pub struct SVAAFrameInfo {
     pub iPicStride: i32,
     pub iPicStrideUV: i32,
 
-    /// The reference and current **source** pictures, as pool handles and shared
-    /// three-plane views.
+    /// The reference and current **source** pictures, as pool handles.
     ///
     /// The operands of `VaaBackgroundMbDataUpdate`'s three copies, which run *previous
-    /// source -> current source*, so `pCurView` is the **destination**. The copy happens
-    /// in-fork, per macroblock, into the picture the encoder is simultaneously reading.
+    /// source -> current source*, writing into each worker's carved `EncPicBand`.
     pub pRefPic: Option<SrcPicId>,
     pub pCurPic: Option<SrcPicId>,
-    pub(crate) pRefView: Option<RoPicView>,
-    pub(crate) pCurView: Option<RoPicView>,
 
     /// One byte per macroblock.
     pub pVaaBackgroundMbFlag: Vec<i8>,
@@ -501,8 +497,6 @@ impl Default for SVAAFrameInfo {
             iPicStrideUV: 0,
             pRefPic: None,
             pCurPic: None,
-            pRefView: None,
-            pCurView: None,
             pVaaBackgroundMbFlag: Vec::new(),
             pMotionTextureUnit: Vec::new(),
             pMotionTextureIndexToDeltaQp: Vec::new(),
@@ -695,7 +689,6 @@ pub use crate::common::wels_common_defs::EWelsSliceType;
 use crate::common::wels_trace::{WELS_LOG_DEBUG, WELS_LOG_ERROR, WelsLog};
 pub use crate::encoder::encoder_context::{SSpatialPicIndex, sWelsEncCtx};
 use crate::encoder::picture::SScreenBlockFeatureStorage;
-use crate::encoder::rec_view::RoPicView;
 use crate::processing::SWelsVpContext;
 use crate::processing::background_detection::BgdPlanes;
 use crate::processing::denoise::DenoisePlanes;
@@ -1323,8 +1316,6 @@ impl CWelsPreProcess {
             } else if let Some(pVaa) = pCtx.vaa_mut() {
                 pVaa.pCurPic = None;
                 pVaa.pRefPic = None;
-                pVaa.pCurView = None;
-                pVaa.pRefView = None;
             }
             if bNeededMbAq {
                 if let Some(pVaa) = pCtx.vaa_mut() {
@@ -1357,8 +1348,6 @@ impl CWelsPreProcess {
             } else if let Some(pVaa) = pCtx.vaa_mut() {
                 pVaa.pCurPic = None;
                 pVaa.pRefPic = None;
-                pVaa.pCurView = None;
-                pVaa.pRefView = None;
             }
 
             if bNeededMbAq {
@@ -1729,8 +1718,6 @@ impl CWelsPreProcess {
         let Some(idCur) = pCurPicture else {
             pVaaInfo.pCurPic = None;
             pVaaInfo.pRefPic = None;
-            pVaaInfo.pCurView = None;
-            pVaaInfo.pRefView = None;
             return;
         };
         // As at `VaaCalculation` — the plugin and the pool split by destructure.
@@ -1794,17 +1781,11 @@ impl CWelsPreProcess {
                     pVaaBackgroundMbFlag,
                 );
             }
-            // Record the current and reference source picture handles; `PreprocessSliceCoding`
-            // builds `pCurView` and `pRefView` once after all preprocessing slice borrows end.
             pVaaInfo.pCurPic = Some(idCur);
             pVaaInfo.pRefPic = Some(idRef);
-            pVaaInfo.pCurView = None;
-            pVaaInfo.pRefView = None;
         } else {
             pVaaInfo.pCurPic = None;
             pVaaInfo.pRefPic = None;
-            pVaaInfo.pCurView = None;
-            pVaaInfo.pRefView = None;
             let kpCur = m_pSpatialPicPool.get(idCur);
             let iPicWidthInMb = (kpCur.iWidthInPixel + 15) >> 4;
             let iPicHeightInMb = (kpCur.iHeightInPixel + 15) >> 4;

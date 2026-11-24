@@ -5,9 +5,8 @@
 //! SSE2 implementations of Forward 4x4 DCT and Inverse DCT (IDCT) with Prediction Addition.
 #![deny(unsafe_code)]
 
-use super::lanes::{ld8_i16, ld16, st8_i16, st16, to16};
+use super::lanes::{ld8_i16, ld16, st8_i16, st16};
 use super::sse2_token;
-use crate::encoder::rec_view::RecCursor;
 use crate::safe::plane::{BlockRows, PlaneCursor, PlaneCursorMut, RefSamples, SampleCursor};
 use crate::simd::{simd_entry, tokens::Sse2Token};
 use core::arch::x86_64::*;
@@ -431,78 +430,6 @@ simd_entry! {
     }
 
     #[target_feature(enable = "sse2")]
-    fn idct_t4_rec_to_view_sse2(
-        rec: &RecCursor<'_>,
-        pred: &[u8],
-        pred_stride: usize,
-        dct: &[i16; 16],
-        _token: Sse2Token,
-    ) {
-        let (res0, res1, res2, res3) = compute_idct_residuals!(dct);
-        let d = rec.span::<4, 4>(0, 0);
-        for (dy, res) in [res0, res1, res2, res3].into_iter().enumerate() {
-            let p: [u8; 4] = pred[dy * pred_stride..][..4].try_into().unwrap();
-            let out = add_res_and_clip(p, res);
-            d.set_row::<4>(dy, &out);
-        }
-    }
-
-    #[target_feature(enable = "sse2")]
-    fn idct_four_t4_rec_to_view_sse2(
-        rec: &RecCursor<'_>,
-        pred: &[u8],
-        pred_stride: usize,
-        dct: &[i16; 64],
-        _token: Sse2Token,
-    ) {
-        let d = rec.span::<8, 8>(0, 0);
-        for k in 0..2usize {
-            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().unwrap();
-            let rows = compute_idct_residuals_two!(sub);
-            for (j, res) in rows.into_iter().enumerate() {
-                let y = 4 * k + j;
-                let p: [u8; 8] = pred[y * pred_stride..][..8].try_into().unwrap();
-                let out = add_res_and_clip8(p, res);
-                d.set_row::<8>(y, &out);
-            }
-        }
-    }
-
-    #[target_feature(enable = "sse2")]
-    fn idct_t4_rec_in_place_view_sse2(
-        rec: &RecCursor<'_>,
-        dct: &[i16; 16],
-        _token: Sse2Token,
-    ) {
-        let (res0, res1, res2, res3) = compute_idct_residuals!(dct);
-        let s = rec.span::<4, 4>(0, 0);
-        for (dy, res) in [res0, res1, res2, res3].into_iter().enumerate() {
-            let cur = s.row::<4>(dy, 0);
-            let out = add_res_and_clip(cur, res);
-            s.set_row::<4>(dy, &out);
-        }
-    }
-
-    #[target_feature(enable = "sse2")]
-    fn idct_four_t4_rec_in_place_view_sse2(
-        rec: &RecCursor<'_>,
-        dct: &[i16; 64],
-        _token: Sse2Token,
-    ) {
-        let s = rec.span::<8, 8>(0, 0);
-        for k in 0..2usize {
-            let sub: &[i16; 32] = (&dct[k * 32..][..32]).try_into().unwrap();
-            let rows = compute_idct_residuals_two!(sub);
-            for (j, res) in rows.into_iter().enumerate() {
-                let y = 4 * k + j;
-                let cur = s.row::<8>(y, 0);
-                let out = add_res_and_clip8(cur, res);
-                s.set_row::<8>(y, &out);
-            }
-        }
-    }
-
-    #[target_feature(enable = "sse2")]
     fn idct_rec_i16x16_dc_sse2_impl(
         rec: &mut PlaneCursorMut<'_>,
         pred: &PlaneCursor<'_>,
@@ -528,36 +455,6 @@ simd_entry! {
                 let sum_lo = _mm_add_epi16(_mm_unpacklo_epi8(p_vec, zero), dc_lo);
                 let sum_hi = _mm_add_epi16(_mm_unpackhi_epi8(p_vec, zero), dc_hi);
                 st16(wd.row_mut::<16>(j, 0), _mm_packus_epi16(sum_lo, sum_hi));
-            }
-        }
-    }
-
-    #[target_feature(enable = "sse2")]
-    fn idct_rec_i16x16_dc_to_view_sse2_impl(
-        rec: &RecCursor<'_>,
-        pred: &[u8],
-        pred_stride: usize,
-        dc: &[i16; 16],
-        _token: Sse2Token,
-    ) {
-        let zero = _mm_setzero_si128();
-        let d = rec.span::<16, 16>(0, 0);
-
-        for k in 0..4usize {
-            let wd = d.window::<16>(4 * k, 4);
-            let dc_row = 4 * k;
-            let d0 = ((dc[dc_row] as i32 + 32) >> 6) as i16;
-            let d1 = ((dc[dc_row + 1] as i32 + 32) >> 6) as i16;
-            let d2 = ((dc[dc_row + 2] as i32 + 32) >> 6) as i16;
-            let d3 = ((dc[dc_row + 3] as i32 + 32) >> 6) as i16;
-            let dc_lo = _mm_set_epi16(d1, d1, d1, d1, d0, d0, d0, d0);
-            let dc_hi = _mm_set_epi16(d3, d3, d3, d3, d2, d2, d2, d2);
-            for j in 0..4usize {
-                let i = 4 * k + j;
-                let p_vec = ld16(&pred[i * pred_stride..][..16]);
-                let sum_lo = _mm_add_epi16(_mm_unpacklo_epi8(p_vec, zero), dc_lo);
-                let sum_hi = _mm_add_epi16(_mm_unpackhi_epi8(p_vec, zero), dc_hi);
-                wd.set_row::<16>(j, &to16(_mm_packus_epi16(sum_lo, sum_hi)));
             }
         }
     }
@@ -619,42 +516,13 @@ pub fn idct_four_t4_rec_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 64]) 
     idct_four_t4_rec_in_place_sse2(rec, dct, sse2_token());
 }
 
-/// [`idct_t4_rec_to_view`] using SSE2.
+/// [`idct_four_t4_rec_in_place`] over all four 8x8 quadrants of a 16x16 macroblock.
 #[inline(always)]
-pub fn idct_t4_rec_to_view(rec: &RecCursor<'_>, pred: &[u8], pred_stride: usize, dct: &[i16; 16]) {
-    idct_t4_rec_to_view_sse2(rec, pred, pred_stride, dct, sse2_token());
-}
-
-/// [`idct_four_t4_rec_to_view`] using SSE2.
-#[inline(always)]
-pub fn idct_four_t4_rec_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 64],
-) {
-    idct_four_t4_rec_to_view_sse2(rec, pred, pred_stride, dct, sse2_token());
-}
-
-/// [`idct_t4_rec_in_place_view`] using SSE2.
-#[inline(always)]
-pub fn idct_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    idct_t4_rec_in_place_view_sse2(rec, dct, sse2_token());
-}
-
-/// [`idct_four_t4_rec_in_place_view`] using SSE2.
-#[inline(always)]
-pub fn idct_four_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    idct_four_t4_rec_in_place_view_sse2(rec, dct, sse2_token());
-}
-
-/// [`idct_t4_rec_on_mb_in_place_view`] using SSE2.
-#[inline(always)]
-pub fn idct_t4_rec_on_mb_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 256]) {
+pub fn idct_t4_rec_on_mb_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 256]) {
     const QUADS: [(isize, isize); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for (k, &(dx, dy)) in QUADS.iter().enumerate() {
         let sub: &[i16; 64] = (&dct[k << 6..][..64]).try_into().unwrap();
-        idct_four_t4_rec_in_place_view(&rec.advance(dx, dy), sub);
+        idct_four_t4_rec_in_place(&mut rec.reborrow(dx, dy), sub);
     }
 }
 
@@ -664,17 +532,6 @@ pub fn idct_t4_rec_on_mb_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 256]) {
 #[inline]
 pub fn idct_rec_i16x16_dc(rec: &mut PlaneCursorMut<'_>, pred: &PlaneCursor<'_>, dc: &[i16; 16]) {
     idct_rec_i16x16_dc_sse2_impl(rec, pred, dc, sse2_token());
-}
-
-/// 16x16 macroblock DC luma reconstruction to view using SSE2.
-#[inline]
-pub fn idct_rec_i16x16_dc_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dc: &[i16; 16],
-) {
-    idct_rec_i16x16_dc_to_view_sse2_impl(rec, pred, pred_stride, dc, sse2_token());
 }
 
 // ============================================================================
@@ -691,7 +548,6 @@ mod tests {
     use crate::encoder::decode_mb_aux::{
         idct_rec_i16x16_dc_c, idct_t4_rec_c, idct_t4_rec_in_place_c,
     };
-    use crate::encoder::rec_view::shared_plane_for_test;
     use crate::safe::plane::PaddedPlane;
 
     fn lcg(seed: &mut u64) -> u8 {
@@ -979,76 +835,10 @@ mod tests {
         assert_eq!(pa.as_slice(), pb.as_slice());
     }
 
-    #[test]
-    fn idct_t4_rec_to_view_matches_the_scalar() {
-        let mut seed = 0x1D87_2E7F_0000_0001u64;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 16] = coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 4);
-        let pp = pred_as_plane(&pred, 16, 4);
-
-        idct_t4_rec_c(&mut pa.cursor_mut(5, 7), &pp.cursor(0, 0), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_to_view(&view.cursor(5, 7), &pred, 16, &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_four_t4_rec_to_view_matches_four_scalar_blocks() {
-        let mut seed = 0x6C07_8965_0000_0001u64;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 64] = coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 8);
-        let pp = pred_as_plane(&pred, 16, 8);
-
-        for (k, &(dx, dy)) in SUBS.iter().enumerate() {
-            let sub: &[i16; 16] = (&dct[k << 4..][..16]).try_into().unwrap();
-            idct_t4_rec_c(&mut pa.cursor_mut(6 + dx, 9 + dy), &pp.cursor(dx, dy), sub);
-        }
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_four_t4_rec_to_view(&view.cursor(6, 9), &pred, 16, &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_t4_rec_in_place_view_matches_the_scalar() {
-        let mut seed = 0x41C6_4E6D_0000_0001u64;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 16] = coeffs(&mut seed);
-
-        idct_t4_rec_in_place_c(&mut pa.cursor_mut(5, 7), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_in_place_view(&view.cursor(5, 7), &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_four_t4_rec_in_place_view_matches_four_scalar_blocks() {
-        let mut seed = 0x3C6E_F35F_0000_0001u64;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 64] = coeffs(&mut seed);
-
-        for (k, &(dx, dy)) in SUBS.iter().enumerate() {
-            let sub: &[i16; 16] = (&dct[k << 4..][..16]).try_into().unwrap();
-            idct_t4_rec_in_place_c(&mut pa.cursor_mut(6 + dx, 9 + dy), sub);
-        }
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_four_t4_rec_in_place_view(&view.cursor(6, 9), &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
     /// The 16x16 form: four quadrants of four blocks, so a quadrant-level `(dx, dy)`
     /// swap and a block-level one are both visible.
     #[test]
-    fn idct_t4_rec_on_mb_in_place_view_matches_sixteen_scalar_blocks() {
+    fn idct_t4_rec_on_mb_in_place_matches_sixteen_scalar_blocks() {
         let mut seed = 0x9E37_79B9_0000_0001u64;
         let (mut pa, mut pb) = twin_planes(&mut seed);
         let dct: [i16; 256] = coeffs(&mut seed);
@@ -1061,24 +851,7 @@ mod tests {
             }
         }
 
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_on_mb_in_place_view(&view.cursor(4, 6), &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_rec_i16x16_dc_to_view_matches_the_scalar() {
-        let mut seed = 0xB502_6F5A_0000_0001u64;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dc: [i16; 16] = coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 16);
-        let pp = pred_as_plane(&pred, 16, 16);
-
-        idct_rec_i16x16_dc_c(&mut pa.cursor_mut(5, 7), &pp.cursor(0, 0), &dc);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_rec_i16x16_dc_to_view(&view.cursor(5, 7), &pred, 16, &dc);
+        idct_t4_rec_on_mb_in_place(&mut pb.cursor_mut(4, 6), &dct);
 
         assert_eq!(pa.as_slice(), pb.as_slice());
     }

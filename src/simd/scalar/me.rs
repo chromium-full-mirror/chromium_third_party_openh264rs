@@ -5,16 +5,16 @@
 #![forbid(unsafe_code)]
 //! Scalar forwards for the motion-estimation feature kernels.
 
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::svc_motion_estimate;
+use crate::safe::plane::PlaneCursor;
 
 #[inline(always)]
-pub fn sum_of_8x8_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_8x8_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     svc_motion_estimate::sum_of_8x8_single_block(cRef)
 }
 
 #[inline(always)]
-pub fn sum_of_16x16_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_16x16_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     svc_motion_estimate::sum_of_16x16_single_block(cRef)
 }
 
@@ -57,12 +57,12 @@ pub fn sum_of_16x16_block_of_frame(
 }
 
 #[inline(always)]
-pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_row_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     svc_motion_estimate::sea_row_half_sums_c::<N>(c, a0, a1);
 }
 
 #[inline(always)]
-pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_col_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     svc_motion_estimate::sea_col_half_sums_c::<N>(c, a0, a1);
 }
 

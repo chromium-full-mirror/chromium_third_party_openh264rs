@@ -19,11 +19,10 @@ use crate::encoder::get_intra_predictor::{
     WelsI16x16LumaPredV_c, WelsIChromaPredDc_c, WelsIChromaPredH_c, WelsIChromaPredPlane_c,
     WelsIChromaPredV_c,
 };
-use crate::encoder::rec_view::RecCursor;
-use crate::safe::plane::{PlaneCursorMut, RefSamples};
+use crate::safe::plane::{PlaneCursor, PlaneCursorMut, RefSamples};
 
 #[inline(always)]
-pub fn enc_i16x16_luma_pred_v(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_v(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     WelsI16x16LumaPredV_c(pred, rec)
 }
 
@@ -33,7 +32,7 @@ pub fn dec_i16x16_luma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i16x16_luma_pred_h(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_h(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     WelsI16x16LumaPredH_c(pred, rec)
 }
 
@@ -43,7 +42,7 @@ pub fn dec_i16x16_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i16x16_luma_pred_dc(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_dc(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     WelsI16x16LumaPredDc_c(pred, rec)
 }
 
@@ -68,7 +67,7 @@ pub fn dec_i16x16_luma_pred_dc_na(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i16x16_luma_pred_plane(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_plane(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     WelsI16x16LumaPredPlane_c(pred, rec)
 }
 
@@ -78,7 +77,7 @@ pub fn dec_i16x16_luma_pred_plane(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_chroma_pred_v(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_v(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     WelsIChromaPredV_c(pred, rec)
 }
 
@@ -88,7 +87,7 @@ pub fn dec_chroma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_chroma_pred_h(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_h(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     WelsIChromaPredH_c(pred, rec)
 }
 
@@ -98,7 +97,7 @@ pub fn dec_chroma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     WelsIChromaPredDc_c(pred, rec)
 }
 
@@ -113,7 +112,7 @@ pub fn dec_chroma_pred_dc_top(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_chroma_pred_plane(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_plane(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     WelsIChromaPredPlane_c(pred, rec)
 }
 
@@ -123,7 +122,7 @@ pub fn dec_chroma_pred_plane(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_v(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_v(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredV_c(pred, rec)
 }
 
@@ -133,7 +132,7 @@ pub fn dec_i4x4_luma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_h(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_h(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredH_c(pred, rec)
 }
 
@@ -143,7 +142,7 @@ pub fn dec_i4x4_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_dc(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_dc(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredDc_c(pred, rec)
 }
 
@@ -153,7 +152,7 @@ pub fn dec_i4x4_luma_pred_dc(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_ddl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_ddl(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredDDL_c(pred, rec)
 }
 
@@ -163,7 +162,7 @@ pub fn dec_i4x4_luma_pred_ddl(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_ddr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_ddr(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredDDR_c(pred, rec)
 }
 
@@ -173,7 +172,7 @@ pub fn dec_i4x4_luma_pred_ddr(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_vr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_vr(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredVR_c(pred, rec)
 }
 
@@ -183,7 +182,7 @@ pub fn dec_i4x4_luma_pred_vr(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_hd(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_hd(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredHD_c(pred, rec)
 }
 
@@ -193,7 +192,7 @@ pub fn dec_i4x4_luma_pred_hd(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_vl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_vl(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredVL_c(pred, rec)
 }
 
@@ -203,7 +202,7 @@ pub fn dec_i4x4_luma_pred_vl(pred: &mut PlaneCursorMut<'_>) {
 }
 
 #[inline(always)]
-pub fn enc_i4x4_luma_pred_hu(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_hu(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     WelsI4x4LumaPredHU_c(pred, rec)
 }
 
@@ -215,8 +214,8 @@ pub fn dec_i4x4_luma_pred_hu(pred: &mut PlaneCursorMut<'_>) {
 #[inline(always)]
 pub fn intra_16x16_combined3_sad(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     let top = rec.row_n::<16>(-1, 0);
@@ -291,7 +290,7 @@ fn hdm4_1d(a0: i32, a1: i32, a2: i32, a3: i32) -> [i32; 4] {
 
 #[inline(always)]
 fn satd_4x4_modes(
-    enc: &RecCursor<'_>,
+    enc: &PlaneCursor<'_>,
     dx: isize,
     dy: isize,
     ht: &[i32; 4],
@@ -336,8 +335,8 @@ fn satd_4x4_modes(
 #[inline(always)]
 pub fn intra_4x4_combined3_satd(
     pred: &mut [u8; 16],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda_dc: i32,
     lambda_h: i32,
     lambda_v: i32,
@@ -377,8 +376,8 @@ pub fn intra_4x4_combined3_satd(
 #[inline(always)]
 pub fn intra_16x16_combined3_satd(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     let top = rec.row_n::<16>(-1, 0);
@@ -511,10 +510,10 @@ fn write_chroma_pred(
 #[inline(always)]
 pub fn intra_chroma_8x8_combined3_sad(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     let top_cb = rec_cb.row_n::<8>(-1, 0);
@@ -588,10 +587,10 @@ pub fn intra_chroma_8x8_combined3_sad(
 #[inline(always)]
 pub fn intra_chroma_8x8_combined3_satd(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     let top_cb = rec_cb.row_n::<8>(-1, 0);

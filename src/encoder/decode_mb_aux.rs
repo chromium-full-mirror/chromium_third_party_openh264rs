@@ -45,7 +45,6 @@ pub use crate::encoder::svc_encode_mb::{
 
 use crate::common::macros::WelsClip1;
 
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::svc_encode_mb::g_kuiDequantCoeff;
 use crate::safe::plane::{PlaneCursor, PlaneCursorMut};
 
@@ -257,158 +256,21 @@ pub fn idct_four_t4_rec_in_place_c(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 64]
     }
 }
 
-/// The reconstruction-seam flavour of [`idct_t4_rec`]: 4x4 residual added to an arena
-/// prediction, saturated into the shared view.
-///
-/// Destination writes go through [`RecCursor::write_row`] by value rather than a
-/// `&mut [u8]`: a macroblock's contiguous plane span is the full width of its rows, so
-/// a `&mut` over it would claim the neighbouring slice's columns. The arithmetic is
-/// [`idct_t4_residual`], shared with the `PlaneCursorMut` forms.
-///
-/// `pred` is a flat `sMemPredMb` arena buffer at `pred_stride`, never the picture.
-pub fn idct_t4_rec_to_view(rec: &RecCursor<'_>, pred: &[u8], pred_stride: usize, dct: &[i16; 16]) {
-    kernels::dct::idct_t4_rec_to_view(rec, pred, pred_stride, dct)
+/// `WelsIDctT4RecOnMb`: the 16x16 luma inter reconstruction, four 8x8 quadrants of
+/// [`idct_four_t4_rec_in_place`]. In-place only — one cursor, one stride.
+pub fn idct_t4_rec_on_mb_in_place(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 256]) {
+    kernels::dct::idct_t4_rec_on_mb_in_place(rec, dct)
 }
 
-/// Scalar reference body of [`idct_t4_rec_to_view`]; never dispatched.
-pub fn idct_t4_rec_to_view_c(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 16],
-) {
-    let res = idct_t4_residual(dct);
-    for (dy, r) in res.iter().enumerate() {
-        let Some(p) = pred
-            .get(dy * pred_stride..)
-            .and_then(|s| s.first_chunk::<4>())
-        else {
-            return;
-        };
-        let mut out = [0u8; 4];
-        for ((o, &pv), &v) in out.iter_mut().zip(p.iter()).zip(r.iter()) {
-            *o = WelsClip1(pv as i32 + ((v + 32) >> 6));
-        }
-        rec.write_row::<4>(dy as isize, 0, &out);
-    }
-}
-
-/// [`idct_t4_rec_to_view`] over the four 4x4 blocks of one 8x8 quadrant.
-pub fn idct_four_t4_rec_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 64],
-) {
-    kernels::dct::idct_four_t4_rec_to_view(rec, pred, pred_stride, dct)
-}
-
-/// Scalar reference body of [`idct_four_t4_rec_to_view`]; never dispatched, and its
-/// inner calls name the `_c` bodies.
-pub fn idct_four_t4_rec_to_view_c(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dct: &[i16; 64],
-) {
-    const SUBS: [(isize, isize); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
-    for (k, &(dx, dy)) in SUBS.iter().enumerate() {
-        let Some(sub) = dct[k << 4..].first_chunk::<16>() else {
-            return;
-        };
-        let off = dy as usize * pred_stride + dx as usize;
-        if let Some(pred_sub) = pred.get(off..) {
-            idct_t4_rec_to_view_c(&rec.advance(dx, dy), pred_sub, pred_stride, sub);
-        }
-    }
-}
-
-/// [`idct_rec_i16x16_dc`]'s seam flavour: the DC-only I16x16 luma reconstruction.
-pub fn idct_rec_i16x16_dc_to_view(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dc: &[i16; 16],
-) {
-    kernels::dct::idct_rec_i16x16_dc_to_view(rec, pred, pred_stride, dc)
-}
-
-/// Scalar reference body of [`idct_rec_i16x16_dc_to_view`]; never dispatched.
-pub fn idct_rec_i16x16_dc_to_view_c(
-    rec: &RecCursor<'_>,
-    pred: &[u8],
-    pred_stride: usize,
-    dc: &[i16; 16],
-) {
-    for i in 0..16usize {
-        let Some(p) = pred
-            .get(i * pred_stride..)
-            .and_then(|s| s.first_chunk::<16>())
-        else {
-            return;
-        };
-        let mut out = [0u8; 16];
-        for (j, (o, &pv)) in out.iter_mut().zip(p.iter()).enumerate() {
-            let d = dc[(i & 0x0C) + (j >> 2)] as i32;
-            *o = WelsClip1(pv as i32 + ((d + 32) >> 6));
-        }
-        rec.write_row::<16>(i as isize, 0, &out);
-    }
-}
-
-/// [`idct_t4_rec_in_place`]'s seam flavour — the inter reconstruction where the
-/// prediction is already in the picture. Reads and writes the same four rows through
-/// `RecCursor`'s by-value `row`/`write_row` pair, never naming a `&mut [u8]`.
-pub fn idct_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    kernels::dct::idct_t4_rec_in_place_view(rec, dct)
-}
-
-/// Scalar reference body of [`idct_t4_rec_in_place_view`]; never dispatched.
-pub fn idct_t4_rec_in_place_view_c(rec: &RecCursor<'_>, dct: &[i16; 16]) {
-    let res = idct_t4_residual(dct);
-    for (dy, r) in res.iter().enumerate() {
-        let cur = rec.row::<4>(dy as isize, 0);
-        let mut out = [0u8; 4];
-        for ((o, &c), &v) in out.iter_mut().zip(cur.iter()).zip(r.iter()) {
-            *o = WelsClip1(c as i32 + ((v + 32) >> 6));
-        }
-        rec.write_row::<4>(dy as isize, 0, &out);
-    }
-}
-
-/// [`idct_t4_rec_in_place_view`] over the four 4x4 blocks of one 8x8 quadrant.
-pub fn idct_four_t4_rec_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    kernels::dct::idct_four_t4_rec_in_place_view(rec, dct)
-}
-
-/// Scalar reference body of [`idct_four_t4_rec_in_place_view`]; never dispatched, and
+/// Scalar reference body of [`idct_t4_rec_on_mb_in_place`]; never dispatched, and
 /// its inner calls name the `_c` bodies.
-pub fn idct_four_t4_rec_in_place_view_c(rec: &RecCursor<'_>, dct: &[i16; 64]) {
-    const SUBS: [(isize, isize); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
-    for (k, &(dx, dy)) in SUBS.iter().enumerate() {
-        let Some(sub) = dct[k << 4..].first_chunk::<16>() else {
-            return;
-        };
-        idct_t4_rec_in_place_view_c(&rec.advance(dx, dy), sub);
-    }
-}
-
-/// `WelsIDctT4RecOnMb`'s seam flavour: the 16x16 luma inter reconstruction, four
-/// 8x8 quadrants of [`idct_four_t4_rec_in_place_view`]. In-place only — one cursor,
-/// one stride.
-pub fn idct_t4_rec_on_mb_in_place_view(rec: &RecCursor<'_>, dct: &[i16; 256]) {
-    kernels::dct::idct_t4_rec_on_mb_in_place_view(rec, dct)
-}
-
-/// Scalar reference body of [`idct_t4_rec_on_mb_in_place_view`]; never dispatched, and
-/// its inner calls name the `_c` bodies.
-pub fn idct_t4_rec_on_mb_in_place_view_c(rec: &RecCursor<'_>, dct: &[i16; 256]) {
+pub fn idct_t4_rec_on_mb_in_place_c(rec: &mut PlaneCursorMut<'_>, dct: &[i16; 256]) {
     const QUADS: [(isize, isize); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
     for (k, &(dx, dy)) in QUADS.iter().enumerate() {
         let Some(sub) = dct[k << 6..].first_chunk::<64>() else {
             return;
         };
-        idct_four_t4_rec_in_place_view_c(&rec.advance(dx, dy), sub);
+        idct_four_t4_rec_in_place_c(&mut rec.reborrow(dx, dy), sub);
     }
 }
 
@@ -507,10 +369,9 @@ pub fn WelsInitReconstructionFuncs(pFuncList: &mut SWelsFuncPtrList, uiCpuFlag: 
 mod tests {
     use super::*;
 
-    use crate::encoder::rec_view::shared_plane_for_test;
     use crate::safe::plane::PaddedPlane;
 
-    /// 64-bit LCG, seeded per test. The seam tests compare whole allocations, so a
+    /// 64-bit LCG, seeded per test. The tests compare whole allocations, so a
     /// constant pattern would not distinguish a transposed write from a correct one.
     fn lcg(seed: &mut u64) -> u32 {
         *seed = seed
@@ -540,102 +401,10 @@ mod tests {
         core::array::from_fn(|_| (lcg(seed) as u16) as i16)
     }
 
-    /// The arena prediction operand: a flat owned buffer at a fixed stride.
-    fn noisy_pred(seed: &mut u64, stride: usize, rows: usize) -> Vec<u8> {
-        (0..stride * rows)
-            .map(|_| (lcg(seed) & 0xFF) as u8)
-            .collect()
-    }
-
+    /// The 16x16 composite, against the four `PlaneCursorMut` quadrant calls —
+    /// same quadrant order, same coefficient offsets.
     #[test]
-    fn idct_t4_rec_to_view_matches_the_plane_cursor_form() {
-        let mut seed = 0x9E3779B97F4A7C15;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 16] = noisy_coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 4);
-
-        // The `PlaneCursorMut` twin needs its prediction as a plane, so give it one
-        // whose rows are the same bytes at the same stride.
-        let mut pp = PaddedPlane::new(16, 16, 0, 16);
-        for y in 0..4isize {
-            for x in 0..16isize {
-                pp.set(x, y, pred[y as usize * 16 + x as usize]);
-            }
-        }
-        idct_t4_rec(&mut pa.cursor_mut(5, 7), &pp.cursor(0, 0), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_to_view(&view.cursor(5, 7), &pred, 16, &dct);
-
-        assert_eq!(
-            pa.as_slice(),
-            pb.as_slice(),
-            "whole allocation, not just the block"
-        );
-    }
-
-    #[test]
-    fn idct_four_t4_rec_to_view_matches_the_plane_cursor_form() {
-        let mut seed = 0xD1B54A32D192ED03;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 64] = noisy_coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 8);
-
-        let mut pp = PaddedPlane::new(16, 16, 0, 16);
-        for y in 0..8isize {
-            for x in 0..16isize {
-                pp.set(x, y, pred[y as usize * 16 + x as usize]);
-            }
-        }
-        idct_four_t4_rec(&mut pa.cursor_mut(6, 9), &pp.cursor(0, 0), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_four_t4_rec_to_view(&view.cursor(6, 9), &pred, 16, &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_rec_i16x16_dc_to_view_matches_the_plane_cursor_form() {
-        let mut seed = 0xA24BAED4963EE407;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dc: [i16; 16] = noisy_coeffs(&mut seed);
-        let pred = noisy_pred(&mut seed, 16, 16);
-
-        let mut pp = PaddedPlane::new(16, 16, 0, 16);
-        for y in 0..16isize {
-            for x in 0..16isize {
-                pp.set(x, y, pred[y as usize * 16 + x as usize]);
-            }
-        }
-        idct_rec_i16x16_dc(&mut pa.cursor_mut(3, 4), &pp.cursor(0, 0), &dc);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_rec_i16x16_dc_to_view(&view.cursor(3, 4), &pred, 16, &dc);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    /// The in-place pair reads *and* writes the same block, so the twin planes must
-    /// start equal and the prediction is whatever noise is already there.
-    #[test]
-    fn idct_t4_rec_in_place_view_matches_the_plane_cursor_form() {
-        let mut seed = 0x2545F4914F6CDD1D;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 16] = noisy_coeffs(&mut seed);
-
-        idct_t4_rec_in_place(&mut pa.cursor_mut(8, 5), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_in_place_view(&view.cursor(8, 5), &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    /// The 16x16 composite, against the four `PlaneCursorMut` quadrant calls
-    /// `WelsIDctT4RecOnMb` makes — same quadrant order, same coefficient offsets.
-    #[test]
-    fn idct_t4_rec_on_mb_in_place_view_matches_four_plane_cursor_quadrants() {
+    fn idct_t4_rec_on_mb_in_place_matches_four_plane_cursor_quadrants() {
         let mut seed = 0xBF58476D1CE4E5B9;
         let (mut pa, mut pb) = twin_planes(&mut seed);
         let dct: [i16; 256] = noisy_coeffs(&mut seed);
@@ -648,22 +417,7 @@ mod tests {
             idct_four_t4_rec_in_place(&mut pa.cursor_mut(4 + dx, 4 + dy), sub);
         }
 
-        let view = shared_plane_for_test(&mut pb);
-        idct_t4_rec_on_mb_in_place_view(&view.cursor(4, 4), &dct);
-
-        assert_eq!(pa.as_slice(), pb.as_slice());
-    }
-
-    #[test]
-    fn idct_four_t4_rec_in_place_view_matches_the_plane_cursor_form() {
-        let mut seed = 0x14057B7EF767814F;
-        let (mut pa, mut pb) = twin_planes(&mut seed);
-        let dct: [i16; 64] = noisy_coeffs(&mut seed);
-
-        idct_four_t4_rec_in_place(&mut pa.cursor_mut(2, 11), &dct);
-
-        let view = shared_plane_for_test(&mut pb);
-        idct_four_t4_rec_in_place_view(&view.cursor(2, 11), &dct);
+        idct_t4_rec_on_mb_in_place(&mut pb.cursor_mut(4, 4), &dct);
 
         assert_eq!(pa.as_slice(), pb.as_slice());
     }

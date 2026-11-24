@@ -349,21 +349,21 @@ pub mod tokens {
 
     #[cfg(target_arch = "x86_64")]
     impl Avx2Token {
-        /// Reifies a stateless [`super::Avx2RecSadKernel`] into a plain function pointer,
+        /// Reifies a stateless [`super::Avx2PlaneSadKernel`] into a plain function pointer,
         /// amortizing the capability check across `SWelsSampleDealingFunc::pfSampleSad`.
         ///
         /// Sound because `self` witnesses that AVX2 is supported on the host CPU for the
         /// lifetime of the process.
         #[inline]
-        pub(crate) fn into_rec_sad_fn<K: super::Avx2RecSadKernel>(
+        pub(crate) fn into_plane_sad_fn<K: super::Avx2PlaneSadKernel>(
             self,
         ) -> fn(
-            &crate::encoder::rec_view::RecCursor<'_>,
-            &crate::encoder::rec_view::RecCursor<'_>,
+            &crate::safe::plane::PlaneCursor<'_>,
+            &crate::safe::plane::PlaneCursor<'_>,
         ) -> i32 {
-            fn call<K: super::Avx2RecSadKernel>(
-                a: &crate::encoder::rec_view::RecCursor<'_>,
-                b: &crate::encoder::rec_view::RecCursor<'_>,
+            fn call<K: super::Avx2PlaneSadKernel>(
+                a: &crate::safe::plane::PlaneCursor<'_>,
+                b: &crate::safe::plane::PlaneCursor<'_>,
             ) -> i32 {
                 K::run(a, b, Avx2Token(()))
             }
@@ -438,13 +438,13 @@ macro_rules! simd_entry {
 pub(crate) use simd_entry;
 
 /// Stateless two-cursor AVX2 SAD kernel that can be reified into a higher-ranked
-/// `fn(&RecCursor<'_>, &RecCursor<'_>) -> i32` pointer once an
+/// `fn(&PlaneCursor<'_>, &PlaneCursor<'_>) -> i32` pointer once an
 /// [`Avx2Token`](tokens::Avx2Token) has been witnessed at table-init time.
 #[cfg(target_arch = "x86_64")]
-pub(crate) trait Avx2RecSadKernel {
+pub(crate) trait Avx2PlaneSadKernel {
     fn run(
-        a: &crate::encoder::rec_view::RecCursor<'_>,
-        b: &crate::encoder::rec_view::RecCursor<'_>,
+        a: &crate::safe::plane::PlaneCursor<'_>,
+        b: &crate::safe::plane::PlaneCursor<'_>,
         token: tokens::Avx2Token,
     ) -> i32;
 }

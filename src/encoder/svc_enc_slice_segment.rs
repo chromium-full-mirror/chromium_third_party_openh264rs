@@ -107,6 +107,41 @@ pub fn CheckFixedSliceNumMultiSliceSetting(
     true
 }
 
+/// Row-aligned slice split for `SM_FIXEDSLCNUM_SLICE` in `RC_OFF_MODE`.
+///
+/// When `kiMbHeight >= uiSliceNum`, distributes whole macroblock rows evenly across
+/// `uiSliceNum` slices (`base + 1` rows for the first `kiMbHeight % uiSliceNum` slices,
+/// `base` rows for the rest) so every slice boundary falls on an MB-row boundary and
+/// multithreaded encoding runs all workers in a single disjoint wave. When
+/// `kiMbHeight % uiSliceNum == 0`, this produces the exact same per-slice macroblock
+/// counts as [`CheckFixedSliceNumMultiSliceSetting`].
+///
+/// Falls back to [`CheckFixedSliceNumMultiSliceSetting`] when `kiMbHeight < uiSliceNum`.
+///
+/// # Panics
+/// Panics if `uiSliceNum` is greater than `uiSliceMbNum`'s length.
+pub fn CheckFixedSliceNumMultiSliceSettingRowAligned(
+    kiMbWidth: i32,
+    kiMbHeight: i32,
+    pSliceArg: &mut SSliceArgument,
+) -> bool {
+    let kuiSliceNum = pSliceArg.uiSliceNum;
+    if kiMbWidth <= 0 || kiMbHeight <= 0 || kuiSliceNum == 0 {
+        return false;
+    }
+    if kiMbHeight < kuiSliceNum as i32 {
+        return CheckFixedSliceNumMultiSliceSetting(kiMbWidth * kiMbHeight, pSliceArg);
+    }
+
+    let base_rows = kiMbHeight / kuiSliceNum as i32;
+    let rem_rows = kiMbHeight % kuiSliceNum as i32;
+    for uiSliceIdx in 0..kuiSliceNum {
+        let rows = base_rows + i32::from((uiSliceIdx as i32) < rem_rows);
+        pSliceArg.uiSliceMbNum[uiSliceIdx as usize] = (rows * kiMbWidth) as u32;
+    }
+    true
+}
+
 /// `CheckRowMbMultiSliceSetting` — svc_enc_slice_segment.cpp:150.
 ///
 /// Slice parameter check for `SM_ROWMB_SLICE`: one macroblock row per slice.
@@ -331,7 +366,7 @@ pub fn SliceArgumentValidationFixedSliceMode(
         {
             return ENC_RETURN_UNSUPPORTED_PARA;
         }
-    } else if !CheckFixedSliceNumMultiSliceSetting(iMbNumInFrame, pSliceArgument) {
+    } else if !CheckFixedSliceNumMultiSliceSettingRowAligned(iMbWidth, iMbHeight, pSliceArgument) {
         // check uiSliceMbNum with the current uiSliceNum
         pSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
         pSliceArgument.uiSliceNum = 1;
@@ -686,5 +721,56 @@ mod tests {
         );
         assert_eq!(ret, ENC_RETURN_SUCCESS);
         assert!(a.uiSliceNum <= MAX_SLICES_NUM as u32);
+    }
+
+    /// `RC_OFF_MODE` fixed-slice mode aligns boundaries to whole MB rows whenever
+    /// `iMbHeight >= uiSliceNum`, matching C++ exactly when `iMbHeight % uiSliceNum == 0`
+    /// and falling back to mid-row division when `iMbHeight < uiSliceNum`.
+    #[test]
+    fn fixed_slice_num_row_aligned_splits_whole_mb_rows() {
+        // 1280x720 (80x45 MBs), 4 slices -> [12, 11, 11, 11] rows.
+        let mut a = arg(4);
+        assert_eq!(
+            SliceArgumentValidationFixedSliceMode(
+                SLogContext::default(),
+                &mut a,
+                RC_OFF_MODE,
+                1280,
+                720,
+            ),
+            ENC_RETURN_SUCCESS
+        );
+        assert_eq!(&a.uiSliceMbNum[0..4], &[960, 880, 880, 880]);
+
+        // 1280x720 (80x45 MBs), 8 slices -> [6, 6, 6, 6, 6, 5, 5, 5] rows.
+        let mut a8 = arg(8);
+        assert!(CheckFixedSliceNumMultiSliceSettingRowAligned(
+            80, 45, &mut a8
+        ));
+        assert_eq!(
+            &a8.uiSliceMbNum[0..8],
+            &[480, 480, 480, 480, 480, 400, 400, 400]
+        );
+
+        // 640x360 (40x23 MBs), 4 slices -> [6, 6, 6, 5] rows.
+        let mut a360 = arg(4);
+        assert!(CheckFixedSliceNumMultiSliceSettingRowAligned(
+            40, 23, &mut a360
+        ));
+        assert_eq!(&a360.uiSliceMbNum[0..4], &[240, 240, 240, 200]);
+
+        // 1920x1088 (120x68 MBs), 4 slices -> exact match with unaligned division.
+        let mut a1088 = arg(4);
+        assert!(CheckFixedSliceNumMultiSliceSettingRowAligned(
+            120, 68, &mut a1088
+        ));
+        assert_eq!(&a1088.uiSliceMbNum[0..4], &[2040, 2040, 2040, 2040]);
+
+        // Fewer MB rows than slices (80x2 with 4 slices): falls back to MB-level split.
+        let mut tiny = arg(4);
+        assert!(CheckFixedSliceNumMultiSliceSettingRowAligned(
+            80, 2, &mut tiny
+        ));
+        assert_eq!(&tiny.uiSliceMbNum[0..4], &[40, 40, 40, 40]);
     }
 }

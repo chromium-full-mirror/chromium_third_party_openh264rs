@@ -299,7 +299,7 @@ pub fn sample_sad_16x16<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn sample_sad_16x16_avx2() -> Option<
-    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+    fn(&crate::safe::plane::PlaneCursor<'_>, &crate::safe::plane::PlaneCursor<'_>) -> i32,
 > {
     None
 }
@@ -315,7 +315,7 @@ pub fn sample_sad_16x8<S: RefSamples>(sample1: &S, sample2: &S) -> i32 {
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn sample_sad_16x8_avx2() -> Option<
-    fn(&crate::encoder::rec_view::RecCursor<'_>, &crate::encoder::rec_view::RecCursor<'_>) -> i32,
+    fn(&crate::safe::plane::PlaneCursor<'_>, &crate::safe::plane::PlaneCursor<'_>) -> i32,
 > {
     None
 }
@@ -400,7 +400,6 @@ pub fn sample_sad_four_4x8<S: RefSamples>(sample1: &S, sample2: &S, sad: &mut [i
 mod tests {
     use super::*;
     use crate::common::sad_common::{sample_sad, sample_sad_four};
-    use crate::encoder::rec_view::RecCursor;
     use crate::safe::plane::PlaneCursor;
 
     fn make_test_planes(stride: usize, height: usize) -> (Vec<u8>, Vec<u8>) {
@@ -607,37 +606,6 @@ mod tests {
                 sample_sad_four::<4, 8, _>(&c1, &c2, &mut want);
                 sample_sad_four_4x8(&c1, &c2, &mut got);
                 assert_eq!(got, want, "4x8 four-point {at}");
-            }
-        }
-    }
-
-    /// The tables hand these kernels `RecCursor`s, whose rows arrive by value
-    /// (`RowBuf`) rather than as a borrowed slice — the other `Row` type the loads
-    /// have to accept.
-    #[test]
-    fn sad_parity_through_the_shared_cursor() {
-        for (name, mut p1, mut p2) in input_pairs(64, 64) {
-            for anchor in ANCHORS {
-                let (want, want4) = {
-                    let c1 = PlaneCursor::new(&p1, anchor, 64);
-                    let c2 = PlaneCursor::new(&p2, anchor, 64);
-                    let mut s = [0i32; 4];
-                    sample_sad_four::<16, 16, _>(&c1, &c2, &mut s);
-                    (sample_sad::<16, 16, _>(&c1, &c2), s)
-                };
-                let c1 = RecCursor::over_owned(&mut p1, anchor, 64);
-                let c2 = RecCursor::over_owned(&mut p2, anchor, 64);
-                assert_eq!(
-                    sample_sad_16x16(&c1, &c2),
-                    want,
-                    "16x16 via RecCursor, {name} @ {anchor}"
-                );
-                let mut got = [0i32; 4];
-                sample_sad_four_16x16(&c1, &c2, &mut got);
-                assert_eq!(
-                    got, want4,
-                    "16x16 four-point via RecCursor, {name} @ {anchor}"
-                );
             }
         }
     }

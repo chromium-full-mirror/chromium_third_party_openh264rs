@@ -35,9 +35,9 @@
 //! `RequestMemorySvc`, `GetMultipleThreadIdc`, `WelsInitEncoderExt` and
 //! `WelsEncoderEncodeExt`.
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 use crate::encoder::md::CostFamily;
-use crate::encoder::picture::{PicRef, RecPicId, RecPicPool, SPicture};
+use crate::encoder::picture::{RecPicId, RecPicPool, SPicture};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::api::codec_api::EUsageType::{CAMERA_VIDEO_REAL_TIME, SCREEN_CONTENT_REAL_TIME};
@@ -59,8 +59,8 @@ use crate::encoder::svc_enc_slice_segment::{GetInitialSliceNum, InitSlicePEncCtx
 use crate::encoder::svc_encode_slice::{
     FrameBsRealloc, FreeSliceBuffer, GetCurrentSliceNum, InitAllSlicesInThread, LayerSps,
     ReallocSliceBuffer, SetSliceBoundaryInfo, SliceLayerInfoUpdate, StampLayerIdrFlagForSliceType,
-    UpdateMbNeighbor, WelsCodeOneSlice, ctx_pic_mut, ctx_pic_ref, ctx_sps_ref, current_layer_mut,
-    set_current_layer, slice_in_layer_mut,
+    TakenFramePics, UpdateMbNeighbor, WelsCodeOneSlice, ctx_pic_ref, ctx_sps_ref,
+    current_layer_mut, set_current_layer, slice_in_layer_mut,
 };
 use crate::encoder::svc_encode_slice::{InitSliceInLayer, WelsMbToSliceIdc, current_layer_ref};
 use crate::encoder::svc_encode_slice::{LayerIdx, SDqLayer, SMB};
@@ -110,7 +110,6 @@ use crate::encoder::rc::{
     GetTimestampForRc, RcTraceFrameBits, WelsRcCheckFrameStatus, WelsRcInitModule,
     WelsRcPostFrameSkippedUpdate,
 };
-use crate::encoder::rec_view::{RecPicView, RoPicView};
 use crate::encoder::ref_list_mgr_svc::{
     LTR_MARKING_PROCESS_MODE, MAX_TEMPORAL_LAYER_NUM, RefStrategyKind, ResetLtrState, SLTRState,
     WelsUpdateRefSyntax,
@@ -627,6 +626,41 @@ pub fn InitMbListD(ctx: &mut sWelsEncCtx) -> i32 {
     0
 }
 
+/// Applies `pParam`'s deblocking loop filter settings and parallel-deblocking flag
+/// to one spatial DQ layer. Shared by [`InitDqLayers`] and `WelsEncoderParamAdjust`.
+///
+/// Parallel deblocking is only enabled when `iMultipleThreadIdc > 1` and the layer is
+/// multi-slice with slice-boundary filtering disabled (`iLoopFilterDisableIdc != 0`).
+pub(crate) fn sync_layer_deblocking_params(
+    pDqLayer: &mut SDqLayer,
+    pParam: &SWelsSvcCodingParam,
+    iDlayerIndex: usize,
+) {
+    // target-layer deblocking
+    pDqLayer.iLoopFilterDisableIdc = pParam.iLoopFilterDisableIdc as u8;
+    pDqLayer.iLoopFilterAlphaC0Offset = (pParam.iLoopFilterAlphaC0Offset << 1) as i8;
+    pDqLayer.iLoopFilterBetaOffset = (pParam.iLoopFilterBetaOffset << 1) as i8;
+    // parallel deblocking requires multithreading (`iMultipleThreadIdc > 1`)
+    pDqLayer.bDeblockingParallelFlag =
+        pParam.bDeblockingParallelFlag && pParam.iMultipleThreadIdc > 1;
+
+    // deblocking parameter adjustment
+    if SM_SINGLE_SLICE
+        == pParam.sSpatialLayers[iDlayerIndex]
+            .sSliceArgument
+            .uiSliceMode
+    {
+        // iLoopFilterDisableIdc will be 0 or 1 under single slice
+        if 2 == pParam.iLoopFilterDisableIdc {
+            pDqLayer.iLoopFilterDisableIdc = 0;
+        }
+        pDqLayer.bDeblockingParallelFlag = false;
+    } else if 0 == pDqLayer.iLoopFilterDisableIdc {
+        // multi-slice with cross-boundary deblocking cannot run in parallel per slice
+        pDqLayer.bDeblockingParallelFlag = false;
+    }
+}
+
 /// `InitDqLayers` — encoder_ext.cpp:1008 (file-static inline).
 ///
 /// Allocates the reference lists and DQ layers, then
@@ -741,29 +775,7 @@ pub fn InitDqLayers(
         }
 
         // deblocking parameters initialization; target-layer deblocking
-        pDqLayerBox.iLoopFilterDisableIdc = ctx.param().iLoopFilterDisableIdc as u8;
-        pDqLayerBox.iLoopFilterAlphaC0Offset = (ctx.param().iLoopFilterAlphaC0Offset << 1) as i8;
-        pDqLayerBox.iLoopFilterBetaOffset = (ctx.param().iLoopFilterBetaOffset << 1) as i8;
-        // parallel deblocking
-        pDqLayerBox.bDeblockingParallelFlag = ctx.param().bDeblockingParallelFlag;
-
-        // deblocking parameter adjustment
-        if SM_SINGLE_SLICE
-            == ctx.param().sSpatialLayers[iDlayerIndex as usize]
-                .sSliceArgument
-                .uiSliceMode
-        {
-            // iLoopFilterDisableIdc will be 0 or 1 under single slice
-            if 2 == ctx.param().iLoopFilterDisableIdc {
-                pDqLayerBox.iLoopFilterDisableIdc = 0;
-            }
-            pDqLayerBox.bDeblockingParallelFlag = false;
-        } else {
-            // multi-slice
-            if 0 == pDqLayerBox.iLoopFilterDisableIdc {
-                pDqLayerBox.bDeblockingParallelFlag = false;
-            }
-        }
+        sync_layer_deblocking_params(&mut pDqLayerBox, ctx.param(), iDlayerIndex as usize);
 
         // encoder_ext.cpp:1125-1135 — the last layer alone carries the preparation.
         if kiNeedFeatureStorage != 0 && iDlayerIndex == iDlayerCount - 1 {
@@ -1259,6 +1271,11 @@ pub fn GetMultipleThreadIdc(
     if InitSliceSettings(pLogCtx, pCodingParam, uiCpuCores, iSliceNum) != 0 {
         return 1;
     }
+    // `ParamValidationExt` runs before `GetMultipleThreadIdc` and sets
+    // `bDeblockingParallelFlag = (iMultipleThreadIdc != 1)`, which is `true` for
+    // `iMultipleThreadIdc == 0`. Recompute it now that `iMultipleThreadIdc` is finalized
+    // so a single-threaded resolution never silently skips `PerformDeblockingFilter`.
+    pCodingParam.bDeblockingParallelFlag = pCodingParam.iMultipleThreadIdc > 1;
     0
 }
 
@@ -1477,16 +1494,12 @@ pub fn PrefetchReferencePicture(pCtx: &mut sWelsEncCtx, keFrameType: EVideoFrame
         pCtx.pRefPic = ref_pic;
         let pCurDq = current_layer_expect_mut(pCtx);
         pCurDq.pRefPic = ref_pic;
-        pCurDq.pRefView = None;
-        pCurDq.pRefOriView = None;
         uiRefIdx = 0; // reordered reference index
     } else {
         // safe for IDR coding
         pCtx.pRefPic = None;
         let pCurDq = current_layer_expect_mut(pCtx);
         pCurDq.pRefPic = None;
-        pCurDq.pRefView = None;
-        pCurDq.pRefOriView = None;
     }
 
     let mut iIdx = 0;
@@ -1564,7 +1577,7 @@ pub fn StackBackEncoderStatus(pEncCtx: &mut sWelsEncCtx, keFrameType: EVideoFram
 
 /// `encoder_ext.cpp:2534`. Bind the current DQ layer to this frame's parameter sets,
 /// NAL header and picture buffers.
-pub fn WelsInitCurrentLayer(pCtx: &mut sWelsEncCtx, _kiWidth: i32, _kiHeight: i32) {
+pub fn WelsInitCurrentLayer(pCtx: &mut sWelsEncCtx, _kiWidth: i32, _kiHeight: i32) -> i32 {
     // The layer is stamped with this frame's picture handles here, once a frame,
     // and the per-macroblock mode-decision family resolves them through it.
     let kiCurDid = pCtx.uiDependencyId;
@@ -1629,24 +1642,20 @@ pub fn WelsInitCurrentLayer(pCtx: &mut sWelsEncCtx, _kiWidth: i32, _kiHeight: i3
 
     // pEncPic data.
     let (Some(idEnc), Some(idDec)) = (pCtx.pEncPic, pCtx.pDecPic) else {
-        return;
+        return ENC_RETURN_SUCCESS;
     };
     if pCtx.pVpp.is_none() {
-        return;
+        return ENC_RETURN_SUCCESS;
     }
     current_layer_expect_mut(pCtx).pEncPic = Some(idEnc);
 
     let Some(pRefList) = pCtx.ref_list_mut(kiCurDid as usize) else {
-        return;
+        return ENC_RETURN_SUCCESS;
     };
     let pDecPic = pRefList.pic_mut(idDec).planes();
     let pEncPic = ctx_vpp_mut(pCtx).m_pSpatialPicPool.get_mut(idEnc).planes();
 
     let pCurDq = current_layer_expect_mut(pCtx);
-    pCurDq.pRecView = None;
-    pCurDq.pEncView = None;
-    pCurDq.pRefView = None;
-    pCurDq.pRefOriView = None;
 
     pCurDq.iEncStride[0] = pEncPic.iLineSize[0];
     pCurDq.iEncStride[1] = pEncPic.iLineSize[1];
@@ -1664,14 +1673,18 @@ pub fn WelsInitCurrentLayer(pCtx: &mut sWelsEncCtx, _kiWidth: i32, _kiHeight: i3
     // `DynamicAdjustSlicing` alone, which only `AdjustBaseLayer`/`AdjustEnhanceLayer`
     // call, and only on the `SM_FIXEDSLCNUM_SLICE` arm.
     if pCtx.pSliceThreading.is_some()
-        && !current_layer_ref(pCtx).is_none()
-        && current_layer_expect(pCtx).bNeedAdjustingSlicing
+        && current_layer_ref(pCtx).is_some_and(|dq| dq.bNeedAdjustingSlicing)
     {
         let kiTaskCount = pCtx.param().sSpatialLayers[kiCurDid as usize]
             .sSliceArgument
             .uiSliceNum as i32;
-        UpdateMbMapForked(pCtx, kiTaskCount);
+        let ret = UpdateMbMapForked(pCtx, kiTaskCount);
+        if ret != ENC_RETURN_SUCCESS {
+            return ret;
+        }
+        current_layer_expect_mut(pCtx).bNeedAdjustingSlicing = false;
     }
+    ENC_RETURN_SUCCESS
 }
 
 /// `encoder_ext.cpp:2954`. Emit the SVC prefix NAL that precedes each VCL NAL when
@@ -1840,93 +1853,9 @@ fn SetNormalCodingFunc(pFuncList: &mut SWelsFuncPtrList) {
 // `svc_motion_estimate::SetMeMethod`, beside the four search families it selects
 // between.
 
-/// Builds and installs all frame-scoped picture views (`RecPicView` and `RoPicView`)
-/// onto the current DQ layer and VAA state.
-///
-/// The caller must hold a [`LayerViewsGuard`] so that all views are cleared before any
-/// underlying `SPicture` is borrowed `&mut` or returned to a pool.
-#[allow(unsafe_code)]
-fn install_layer_views(pCtx: &mut sWelsEncCtx) {
-    // Build all frame-scoped picture views (`RecPicView` and `RoPicView`) from `&mut SPicture`
-    // (`Vec::as_mut_ptr`) now that every preprocessing stage that takes `&[u8]` (`as_slice`)
-    // on the source or reference planes (`AnalyzeSpatialPic`, `AnalyzePictureComplexity`,
-    // `PerformFMEPreprocess`) has finished. Each distinct picture is borrowed `&mut` at most
-    // once here, and views naming the same picture share the same `Copy` `RoPicView`.
-    //
-    // SAFETY:
-    // - All referenced `SPicture` instances live in `pCtx`'s reference picture list or
-    //   `pVpp.m_pSpatialPicPool` and are neither dropped nor reallocated while the
-    //   enclosing `LayerViewsGuard` is alive.
-    // - No `&mut SPicture` (or whole-plane `&[u8]` on written planes) is taken again until
-    //   `LayerViewsGuard::drop` runs `clear_layer_views(pCtx)` after slice coding and
-    //   deblocking complete (or on early return / unwind).
-    // - Concurrent worker threads only write to disjoint macroblock regions assigned to
-    //   their slice partitions.
-    if pCtx.pVpp.is_some() {
-        let kiLayerDid = pCtx.uiDependencyId as usize;
-        let idDec = pCtx.pDecPic;
-        let sRecView = idDec.and_then(|id| {
-            pCtx.ref_list_mut(kiLayerDid)
-                .map(|rl| unsafe { RecPicView::build(rl.pic_mut(id)) })
-        });
-        let idEnc = current_layer_ref(pCtx).and_then(|l| l.pEncPic);
-        let sEncView = idEnc
-            .map(|id| unsafe { RoPicView::build(ctx_vpp_mut(pCtx).m_pSpatialPicPool.get_mut(id)) });
-        let (vaa_cur, vaa_ref) = pCtx
-            .vaa()
-            .map(|v| (v.pCurPic, v.pRefPic))
-            .unwrap_or((None, None));
-        let vaa_cur_view = if vaa_cur.is_some() && vaa_cur == idEnc {
-            sEncView
-        } else {
-            vaa_cur.map(|id| unsafe {
-                RoPicView::build(ctx_vpp_mut(pCtx).m_pSpatialPicPool.get_mut(id))
-            })
-        };
-        let vaa_ref_view = if vaa_ref.is_some() && vaa_ref == idEnc {
-            sEncView
-        } else if vaa_ref.is_some() && vaa_ref == vaa_cur {
-            vaa_cur_view
-        } else {
-            vaa_ref.map(|id| unsafe {
-                RoPicView::build(ctx_vpp_mut(pCtx).m_pSpatialPicPool.get_mut(id))
-            })
-        };
-        if let Some(pVaa) = pCtx.vaa_mut() {
-            pVaa.pCurView = vaa_cur_view;
-            pVaa.pRefView = vaa_ref_view;
-        }
-        let idRefPic = current_layer_ref(pCtx).and_then(|l| l.pRefPic);
-        let sRefView = idRefPic.and_then(|id| {
-            pCtx.ref_list_mut(kiLayerDid)
-                .map(|rl| unsafe { RoPicView::build(rl.pic_mut(id)) })
-        });
-        let pRefOri0 = current_layer_ref(pCtx).and_then(|l| l.pRefOri[0]);
-        let sRefOriView = match pRefOri0 {
-            Some(PicRef::Rec(id)) if Some(id) == idRefPic => sRefView,
-            Some(PicRef::Src(id)) if Some(id) == idEnc => sEncView,
-            Some(PicRef::Src(id)) if Some(id) == vaa_cur => vaa_cur_view,
-            Some(PicRef::Src(id)) if Some(id) == vaa_ref => vaa_ref_view,
-            Some(r) => ctx_pic_mut(pCtx, r).map(|pic| unsafe { RoPicView::build(pic) }),
-            None => None,
-        };
-        if let Some(pCurDq) = current_layer_mut(pCtx) {
-            pCurDq.pRecView = sRecView;
-            pCurDq.pEncView = sEncView;
-            pCurDq.pRefView = sRefView;
-            pCurDq.pRefOriView = sRefOriView;
-        }
-    }
-}
-
-/// Per-frame function-pointer selection and picture-view installation. MUST be called
-/// after `pfWelsRcPictureInit()` and `WelsInitCurrentLayer()`.
-///
-/// Returns a [`LayerViewsGuard`] that automatically calls [`clear_layer_views`] when
-/// dropped at the end of the layer's slice-coding/deblocking scope.
-pub fn PreprocessSliceCoding(pCtx: &mut sWelsEncCtx) -> LayerViewsGuard<'_> {
-    let mut guard = LayerViewsGuard(pCtx);
-    let pCtx: &mut sWelsEncCtx = &mut guard;
+/// Per-frame function-pointer selection. MUST be called after `pfWelsRcPictureInit()`
+/// and `WelsInitCurrentLayer()`.
+pub fn PreprocessSliceCoding(pCtx: &mut sWelsEncCtx) {
     let pCurLayer = current_layer_expect(pCtx);
     let bFastMode = pCtx.param().iComplexityMode == LOW_COMPLEXITY;
     let kiUsageType = pCtx.param().iUsageType;
@@ -2059,8 +1988,6 @@ pub fn PreprocessSliceCoding(pCtx: &mut sWelsEncCtx) -> LayerViewsGuard<'_> {
         (false, false)
     };
 
-    install_layer_views(pCtx);
-
     let fl: &mut SWelsFuncPtrList = pCtx.func_list_mut();
 
     // function pointers conditional assignment under sWelsEncCtx
@@ -2191,7 +2118,6 @@ pub fn PreprocessSliceCoding(pCtx: &mut sWelsEncCtx) -> LayerViewsGuard<'_> {
     };
 
     current_layer_expect_mut(pCtx).bSatdInMdFlag = kbSatdInMd;
-    guard
 }
 
 /// Point to the next `SLayerBSInfo`: bump `*iLbi` and stamp the new slot with the
@@ -2561,19 +2487,17 @@ pub fn WelsInitCurrentQBLayerMltslc(pCtx: &mut sWelsEncCtx) {
 
 /// `UpdateSlicepEncCtxWithPartition` — encoder_ext.cpp.
 ///
-/// Splits the frame into `iPartitionNum` macroblock ranges and stamps `pOverallMbMap`
-/// with the partition index. `iPartitionNum` is clamped to `MAX_THREADS_NUM`, the capacity
-/// of the four partition arrays, so the write loop and the trailing clear loop share one
-/// bound. The trailing loop clears the whole of those arrays, not just the entries beyond
-/// `iPartitionNum` that this call wrote.
+/// Splits the frame into `iPartitionNum` macroblock-row-aligned ranges and stamps
+/// `pOverallMbMap` with the partition index. `iPartitionNum` is clamped to
+/// `MAX_THREADS_NUM` (the capacity of the four partition arrays) and to the frame's
+/// MB-row count so every inter-worker partition boundary falls on a macroblock-row
+/// boundary. Slices *within* a single worker's partition may still split mid-row when
+/// the byte-size constraint triggers.
 pub fn UpdateSlicepEncCtxWithPartition(pCurDq: &mut SDqLayer, mut iPartitionNum: i32) {
     let pSliceCtx = &mut pCurDq.sSliceEncCtx;
+    let kiMbWidth = pSliceCtx.iMbWidth as i32;
+    let kiMbHeight = pSliceCtx.iMbHeight as i32;
     let kiMbNumInFrame = pSliceCtx.iMbNumInFrame;
-    let mut iCountMbNumPerPartition = kiMbNumInFrame;
-    let mut iAssignableMbLeft = kiMbNumInFrame;
-    let mut iCountMbNumInPartition;
-    let mut iFirstMbIdx = 0i32;
-    let mut i: usize;
 
     if iPartitionNum <= 0 {
         iPartitionNum = 1;
@@ -2584,23 +2508,39 @@ pub fn UpdateSlicepEncCtxWithPartition(pCurDq: &mut SDqLayer, mut iPartitionNum:
         // WELS_CLIP3'd to MAX_THREADS_NUM in GetMultipleThreadIdc.
         iPartitionNum = MAX_THREADS_NUM as i32;
     }
-    iCountMbNumPerPartition /= iPartitionNum;
-    if iCountMbNumPerPartition == 0 || iCountMbNumPerPartition == 1 {
-        iCountMbNumPerPartition = kiMbNumInFrame;
+    let (base_rows, rem_rows) = if kiMbWidth > 0 && kiMbHeight > 0 {
+        if iPartitionNum > kiMbHeight {
+            iPartitionNum = kiMbHeight;
+        }
+        let base = kiMbHeight / iPartitionNum;
+        let rem = kiMbHeight % iPartitionNum;
+        // `EncodeOnePartitionSizeLimited` treats a 1-MB span (`end - first == 0`) as an
+        // empty-partition sentinel, so never emit a 1-MB partition.
+        if base == 0 || base * kiMbWidth <= 1 {
+            iPartitionNum = 1;
+            (kiMbHeight, 0)
+        } else {
+            (base, rem)
+        }
+    } else {
         iPartitionNum = 1;
-    }
+        (0, 0)
+    };
 
     pSliceCtx
         .iSliceNumInFrame
         .store(iPartitionNum, Ordering::Relaxed);
 
-    i = 0;
+    let mut iFirstMbIdx = 0i32;
+    let mut iAssignableMbLeft = kiMbNumInFrame;
+    let mut i = 0usize;
     while i < iPartitionNum as usize {
-        if i + 1 == iPartitionNum as usize {
-            iCountMbNumInPartition = iAssignableMbLeft;
+        let iCountMbNumInPartition = if i + 1 == iPartitionNum as usize {
+            iAssignableMbLeft
         } else {
-            iCountMbNumInPartition = iCountMbNumPerPartition;
-        }
+            let rows_i = base_rows + i32::from((i as i32) < rem_rows);
+            rows_i * kiMbWidth
+        };
 
         pCurDq.FirstMbIdxOfPartition[i] = iFirstMbIdx;
         pCurDq.EndMbIdxOfPartition[i] = iFirstMbIdx + iCountMbNumInPartition - 1;
@@ -2727,6 +2667,62 @@ enum SliceCodeMode {
 /// # Panics
 /// Panics if the frame's current DQ layer has not been stamped, or if the output
 /// block has not been built.
+/// RAII guard restoring the slice bank, output bitstream buffer/writer, MB array,
+/// CABAC restore buffer, and taken picture planes back into `sWelsEncCtx` on normal
+/// return or panic unwind.
+struct SingleSliceGuard<'ctx> {
+    pCtx: &'ctx mut sWelsEncCtx,
+    uSlcBuffIdx: usize,
+    bank: crate::encoder::svc_encode_slice::SSliceBufferInfo,
+    out_bs_buf: Vec<u8>,
+    out_bs_write: BsWriter,
+    mb_data: MbArray<SMB>,
+    restore_buf: Vec<u8>,
+    pics: TakenFramePics,
+}
+
+impl<'ctx> SingleSliceGuard<'ctx> {
+    fn take(pCtx: &'ctx mut sWelsEncCtx, uSlcBuffIdx: usize) -> Self {
+        let bank =
+            std::mem::take(&mut current_layer_expect_mut(pCtx).sSliceBufferInfo[uSlcBuffIdx]);
+        let pOutRef = pCtx.out_mut();
+        let out_bs_buf = std::mem::take(&mut pOutRef.sBsBuffer);
+        let out_bs_write = pOutRef.sBsWrite;
+        let mb_data = std::mem::replace(
+            &mut current_layer_expect_mut(pCtx).sMbDataP,
+            MbArray::empty(),
+        );
+        // The CABAC restore scratch — partition 0 is the only one a
+        // single-threaded encode names (`kiSliceIdx % iActiveThreadsNum` with one
+        // thread). Empty means never allocated for this configuration.
+        let restore_buf = std::mem::take(&mut pCtx.pDynamicBsBuffer[0]);
+        let pics = TakenFramePics::take(pCtx);
+        Self {
+            pCtx,
+            uSlcBuffIdx,
+            bank,
+            out_bs_buf,
+            out_bs_write,
+            mb_data,
+            restore_buf,
+            pics,
+        }
+    }
+}
+
+impl Drop for SingleSliceGuard<'_> {
+    fn drop(&mut self) {
+        self.pics.restore_mut(self.pCtx);
+        self.pCtx.pDynamicBsBuffer[0] = std::mem::take(&mut self.restore_buf);
+        let pCurLayer = current_layer_expect_mut(self.pCtx);
+        pCurLayer.sMbDataP = std::mem::replace(&mut self.mb_data, MbArray::empty());
+        pCurLayer.sSliceBufferInfo[self.uSlcBuffIdx] = std::mem::take(&mut self.bank);
+        let pOutRef = self.pCtx.out_mut();
+        pOutRef.sBsBuffer = std::mem::take(&mut self.out_bs_buf);
+        pOutRef.sBsWrite = self.out_bs_write;
+    }
+}
+
 fn code_and_encapsulate_slice(
     pCtx: &mut sWelsEncCtx,
     uSlcBuffIdx: usize,
@@ -2735,78 +2731,81 @@ fn code_and_encapsulate_slice(
     keNalType: EWelsNalUnitType,
     iNalIdxInLayer: i32,
 ) -> Result<i32, i32> {
-    let mut sBank =
-        std::mem::take(&mut current_layer_expect_mut(pCtx).sSliceBufferInfo[uSlcBuffIdx]);
     let kiCurSlot = iSliceIdx as usize;
-    if kiCurSlot >= sBank.pSliceBuffer.len() {
-        current_layer_expect_mut(pCtx).sSliceBufferInfo[uSlcBuffIdx] = sBank;
-        return Err(ENC_RETURN_UNEXPECTED);
+    {
+        let pCurLayer = current_layer_expect(pCtx);
+        if kiCurSlot >= pCurLayer.sSliceBufferInfo[uSlcBuffIdx].pSliceBuffer.len() {
+            return Err(ENC_RETURN_UNEXPECTED);
+        }
+        if matches!(eMode, SliceCodeMode::FixedPreStamped)
+            && (pCurLayer.pFirstMbIdxOfSlice.is_empty() || pCurLayer.pCountMbNumInSlice.is_empty())
+        {
+            return Err(ENC_RETURN_UNEXPECTED);
+        }
     }
-
-    let iPrepareRet = match eMode {
-        SliceCodeMode::DynamicPartition { .. } => {
-            sBank.pSliceBuffer[kiCurSlot].iSliceIdx = iSliceIdx;
-            ENC_RETURN_SUCCESS
-        }
-        SliceCodeMode::FixedPreStamped => {
-            let pCurSlice = &mut sBank.pSliceBuffer[kiCurSlot];
-            debug_assert_eq!(iSliceIdx, pCurSlice.iSliceIdx);
-            SetSliceBoundaryInfo(current_layer_ref(pCtx), pCurSlice, iSliceIdx)
-        }
-    };
-    if iPrepareRet != ENC_RETURN_SUCCESS {
-        current_layer_expect_mut(pCtx).sSliceBufferInfo[uSlcBuffIdx] = sBank;
-        return Err(iPrepareRet);
-    }
-
-    let (kpHead, kpTail) = sBank.pSliceBuffer.split_at_mut(kiCurSlot + 1);
-    let pCurSlice = &mut kpHead[kiCurSlot];
-    let pNextSlice = match eMode {
-        // The forward slot at the old ST index exactly (`iSliceIdx + step`,
-        // i.e. `tail[step - 1]`).
-        SliceCodeMode::DynamicPartition { iSliceIdxStep } => {
-            kpTail.get_mut((iSliceIdxStep - 1) as usize)
-        }
-        SliceCodeMode::FixedPreStamped => None,
-    };
 
     StampLayerIdrFlagForSliceType(pCtx);
 
-    let pOutRef = pCtx.out_mut();
-    let mut vOutBsBuf = std::mem::take(&mut pOutRef.sBsBuffer);
-    let mut sOutBsWrite = pOutRef.sBsWrite;
-    let mut pCtxOutBs: Option<&mut BsWriter> = Some(&mut sOutBsWrite);
-    let mut sMbData = std::mem::replace(
-        &mut current_layer_expect_mut(pCtx).sMbDataP,
-        MbArray::empty(),
-    );
-    let mut sMbWindow = MbWindow::whole(&mut sMbData, 0);
-    // The CABAC restore scratch — partition 0 is the only one a
-    // single-threaded encode names (`kiSliceIdx % iActiveThreadsNum` with one
-    // thread). Empty means never allocated for this configuration.
-    let mut vRestoreBuf = std::mem::take(&mut pCtx.pDynamicBsBuffer[0]);
-    let pRestoreBuf = if vRestoreBuf.is_empty() {
-        None
-    } else {
-        Some(vRestoreBuf.as_mut_slice())
+    let iCodeRet = {
+        let mut guard = SingleSliceGuard::take(pCtx, uSlcBuffIdx);
+        let SingleSliceGuard {
+            pCtx,
+            bank,
+            out_bs_buf,
+            out_bs_write,
+            mb_data,
+            restore_buf,
+            pics,
+            ..
+        } = &mut guard;
+        let pCtx: &sWelsEncCtx = pCtx;
+
+        let iPrepareRet = match eMode {
+            SliceCodeMode::DynamicPartition { .. } => {
+                bank.pSliceBuffer[kiCurSlot].iSliceIdx = iSliceIdx;
+                ENC_RETURN_SUCCESS
+            }
+            SliceCodeMode::FixedPreStamped => {
+                let pCurSlice = &mut bank.pSliceBuffer[kiCurSlot];
+                debug_assert_eq!(iSliceIdx, pCurSlice.iSliceIdx);
+                SetSliceBoundaryInfo(current_layer_ref(pCtx), pCurSlice, iSliceIdx)
+            }
+        };
+        if iPrepareRet != ENC_RETURN_SUCCESS {
+            return Err(iPrepareRet);
+        }
+
+        let (kpHead, kpTail) = bank.pSliceBuffer.split_at_mut(kiCurSlot + 1);
+        let pCurSlice = &mut kpHead[kiCurSlot];
+        let pNextSlice = match eMode {
+            // The forward slot at the old ST index exactly (`iSliceIdx + step`,
+            // i.e. `tail[step - 1]`).
+            SliceCodeMode::DynamicPartition { iSliceIdxStep } => {
+                kpTail.get_mut((iSliceIdxStep - 1) as usize)
+            }
+            SliceCodeMode::FixedPreStamped => None,
+        };
+
+        let mut pCtxOutBs: Option<&mut BsWriter> = Some(out_bs_write);
+        let mut sMbWindow = MbWindow::whole(mb_data, 0);
+        let pRestoreBuf = if restore_buf.is_empty() {
+            None
+        } else {
+            Some(restore_buf.as_mut_slice())
+        };
+        let mut sBands = pics.whole_bands();
+        WelsCodeOneSlice(
+            pCtx,
+            &mut *pCurSlice,
+            keNalType as i32,
+            out_bs_buf.as_mut_slice(),
+            &mut pCtxOutBs,
+            &mut sMbWindow,
+            &mut sBands,
+            pRestoreBuf,
+            pNextSlice,
+        )
     };
-    let iCodeRet = WelsCodeOneSlice(
-        pCtx,
-        &mut *pCurSlice,
-        keNalType as i32,
-        vOutBsBuf.as_mut_slice(),
-        &mut pCtxOutBs,
-        &mut sMbWindow,
-        pRestoreBuf,
-        pNextSlice,
-    );
-    pCtx.pDynamicBsBuffer[0] = vRestoreBuf;
-    drop(sMbWindow);
-    current_layer_expect_mut(pCtx).sMbDataP = sMbData;
-    current_layer_expect_mut(pCtx).sSliceBufferInfo[uSlcBuffIdx] = sBank;
-    let pOutRef = pCtx.out_mut();
-    pOutRef.sBsBuffer = vOutBsBuf;
-    pOutRef.sBsWrite = sOutBsWrite;
     if iCodeRet != ENC_RETURN_SUCCESS {
         return Err(iCodeRet);
     }
@@ -2963,52 +2962,6 @@ pub fn WelsCodeOnePicPartition(
     pFbi.sLayerInfo[iLbi].uiQualityId = 0;
     pFbi.sLayerInfo[iLbi].iNalCount = iNalIdxInLayer;
     ENC_RETURN_SUCCESS
-}
-
-/// Clears all frame-scoped `RecPicView` and `RoPicView` stamps on the current DQ layer
-/// and VAA state so no raw-pointer view outlives the slice-coding/deblocking phase of
-/// the layer that built it.
-fn clear_layer_views(pCtx: &mut sWelsEncCtx) {
-    if let Some(pCurDq) = current_layer_mut(pCtx) {
-        pCurDq.pRecView = None;
-        pCurDq.pEncView = None;
-        pCurDq.pRefView = None;
-        pCurDq.pRefOriView = None;
-    }
-    if let Some(pVaa) = pCtx.vaa_mut() {
-        pVaa.pCurView = None;
-        pVaa.pRefView = None;
-    }
-}
-
-/// RAII guard returned by [`PreprocessSliceCoding`] that clears all frame-scoped
-/// `RecPicView` and `RoPicView` stamps on the current DQ layer and VAA state when
-/// dropped, ensuring no raw-pointer view outlives the slice-coding/deblocking phase
-/// (including on early return or panic unwind).
-#[must_use]
-pub struct LayerViewsGuard<'a>(&'a mut sWelsEncCtx);
-
-impl std::ops::Deref for LayerViewsGuard<'_> {
-    type Target = sWelsEncCtx;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl std::ops::DerefMut for LayerViewsGuard<'_> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-    }
-}
-
-impl Drop for LayerViewsGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        clear_layer_views(self.0);
-    }
 }
 
 /// `encoder_ext.cpp:3448` — the core SVC encoding process.
@@ -3265,7 +3218,10 @@ pub fn WelsEncoderEncodeExt(
             }
         }
 
-        WelsInitCurrentLayer(pCtx, iCurWidth, iCurHeight);
+        let iInitLayerRet = WelsInitCurrentLayer(pCtx, iCurWidth, iCurHeight);
+        if iInitLayerRet != ENC_RETURN_SUCCESS {
+            return iInitLayerRet;
+        }
 
         let eRefStrategy = pCtx.eRefStrategy;
         eRefStrategy.MarkPic(pCtx);
@@ -3308,8 +3264,7 @@ pub fn WelsEncoderEncodeExt(
             .WelsRcPictureInit(pCtx, pFbi.uiTimeStamp);
         // MUST be called after pfWelsRcPictureInit() and WelsInitCurrentLayer()
         {
-            let mut view_guard = PreprocessSliceCoding(pCtx);
-            let pCtx: &mut sWelsEncCtx = &mut view_guard;
+            PreprocessSliceCoding(pCtx);
 
             iLayerSize = 0;
             let slice_coding_res: Result<(), i32> = (|| {
@@ -3552,11 +3507,6 @@ pub fn WelsEncoderEncodeExt(
             {
                 PerformDeblockingFilter(pCtx);
             }
-
-            // End of the view lifetime for this layer: `view_guard` drops here, clearing
-            // all frame-scoped `RecPicView` and `RoPicView` stamps before `pic_mut`
-            // (`iFrameAverageQp`, `UpdateRefList`) or the next frame's pool reuse can
-            // touch the underlying pictures.
         }
 
         pCtx.func_list()
@@ -3984,72 +3934,234 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_slice_coding_guard_clears_views_on_drop_and_unwind() {
+    fn update_slice_partition_aligns_boundaries_to_mb_rows() {
+        let make_layer = |mb_w: i16, mb_h: i16| {
+            let mut dq = SDqLayer::default();
+            let mb_num = mb_w as i32 * mb_h as i32;
+            dq.sSliceEncCtx.iMbWidth = mb_w;
+            dq.sSliceEncCtx.iMbHeight = mb_h;
+            dq.sSliceEncCtx.iMbNumInFrame = mb_num;
+            dq.sSliceEncCtx.pOverallMbMap = (0..mb_num).map(|_| AtomicU16::new(0)).collect();
+            dq
+        };
+
+        // 720p (80x45 MBs) across 4 partitions: 45 = 12 + 11 + 11 + 11 rows.
+        let mut dq = make_layer(80, 45);
+        UpdateSlicepEncCtxWithPartition(&mut dq, 4);
+        assert_eq!(dq.sSliceEncCtx.iSliceNumInFrame.load(Ordering::Relaxed), 4);
+        assert_eq!(dq.FirstMbIdxOfPartition, [0, 960, 1840, 2720]);
+        assert_eq!(dq.EndMbIdxOfPartition, [959, 1839, 2719, 3599]);
+        for p in 0..4 {
+            assert_eq!(dq.FirstMbIdxOfPartition[p] % 80, 0);
+            assert_eq!((dq.EndMbIdxOfPartition[p] + 1) % 80, 0);
+        }
+
+        // 112x112 (7x7 MBs) across 2 partitions: 7 = 4 + 3 rows.
+        let mut dq = make_layer(7, 7);
+        UpdateSlicepEncCtxWithPartition(&mut dq, 2);
+        assert_eq!(dq.sSliceEncCtx.iSliceNumInFrame.load(Ordering::Relaxed), 2);
+        assert_eq!(dq.FirstMbIdxOfPartition, [0, 28, 0, 0]);
+        assert_eq!(dq.EndMbIdxOfPartition, [27, 48, 0, 0]);
+
+        // Fewer MB rows than requested threads (2x2 MBs, 4 threads): clamped to 2 partitions.
+        let mut dq = make_layer(2, 2);
+        UpdateSlicepEncCtxWithPartition(&mut dq, 4);
+        assert_eq!(dq.sSliceEncCtx.iSliceNumInFrame.load(Ordering::Relaxed), 2);
+        assert_eq!(dq.FirstMbIdxOfPartition, [0, 2, 0, 0]);
+        assert_eq!(dq.EndMbIdxOfPartition, [1, 3, 0, 0]);
+
+        // 1-MB-wide frame (1x4 MBs, 4 threads): 1 row = 1 MB would hit the empty-partition
+        // sentinel (`end - first == 0`), so it must collapse to 1 partition.
+        let mut dq = make_layer(1, 4);
+        UpdateSlicepEncCtxWithPartition(&mut dq, 4);
+        assert_eq!(dq.sSliceEncCtx.iSliceNumInFrame.load(Ordering::Relaxed), 1);
+        assert_eq!(dq.FirstMbIdxOfPartition, [0, 0, 0, 0]);
+        assert_eq!(dq.EndMbIdxOfPartition, [3, 0, 0, 0]);
+    }
+
+    /// Issue #1: `iMultipleThreadIdc = 0` and `SM_FIXEDSLCNUM_SLICE` with
+    /// `uiSliceNum = 0` detect host parallelism instead of hardcoding 1 core.
+    #[test]
+    fn auto_thread_and_slice_detection_uses_host_parallelism() {
+        let host_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected_threads = host_cores.clamp(1, MAX_THREADS_NUM) as u16;
+
+        let mut ext = crate::SEncParamExt::default();
+        SWelsSvcCodingParam::FillDefaultExt(&mut ext);
+        ext.iPicWidth = 320;
+        ext.iPicHeight = 192;
+        ext.iTargetBitrate = 500_000;
+        ext.fMaxFrameRate = 30.0;
+        ext.iSpatialLayerNum = 1;
+        ext.iMultipleThreadIdc = 0; // auto
+        ext.sSpatialLayers[0].iVideoWidth = 320;
+        ext.sSpatialLayers[0].iVideoHeight = 192;
+        ext.sSpatialLayers[0].iSpatialBitrate = 500_000;
+        ext.sSpatialLayers[0].fFrameRate = 30.0;
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceMode = SliceModeEnum::SM_FIXEDSLCNUM_SLICE;
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceNum = 0; // auto
+
+        let mut param = SWelsSvcCodingParam::default();
+        assert_eq!(param.ParamTranscode(&ext), 0);
+        assert_eq!(
+            crate::encoder::wels_encoder_ext::ParamValidationExt(
+                SLogContext::default(),
+                &mut param
+            ),
+            ENC_RETURN_SUCCESS
+        );
+        let mut iSliceNum = 1i16;
+        let mut iCacheLineSize = 16i32;
+        let mut uiCpuFlags = 0u32;
+        assert_eq!(
+            GetMultipleThreadIdc(
+                SLogContext::default(),
+                &mut param,
+                &mut iSliceNum,
+                &mut iCacheLineSize,
+                &mut uiCpuFlags,
+            ),
+            0
+        );
+        if host_cores > 1 {
+            assert_eq!(
+                param.sSpatialLayers[0].sSliceArgument.uiSliceMode,
+                SliceModeEnum::SM_FIXEDSLCNUM_SLICE
+            );
+            assert!(param.sSpatialLayers[0].sSliceArgument.uiSliceNum > 1);
+            assert_eq!(
+                param.iMultipleThreadIdc,
+                expected_threads.min(param.sSpatialLayers[0].sSliceArgument.uiSliceNum as u16)
+            );
+            assert!(param.bDeblockingParallelFlag);
+        } else {
+            assert_eq!(param.iMultipleThreadIdc, 1);
+            assert!(!param.bDeblockingParallelFlag);
+        }
+    }
+
+    /// Issue #2: When `iMultipleThreadIdc = 0` resolves to 1 thread with multi-slice
+    /// and `iLoopFilterDisableIdc = 2`, `bDeblockingParallelFlag` must be `false` so
+    /// `PerformDeblockingFilter` is not silently skipped.
+    #[test]
+    fn single_thread_resolution_disables_parallel_deblocking() {
+        let mut ext = crate::SEncParamExt::default();
+        SWelsSvcCodingParam::FillDefaultExt(&mut ext);
+        ext.iPicWidth = 320;
+        ext.iPicHeight = 192;
+        ext.iTargetBitrate = 500_000;
+        ext.fMaxFrameRate = 30.0;
+        ext.iSpatialLayerNum = 1;
+        ext.iMultipleThreadIdc = 0;
+        ext.iLoopFilterDisableIdc = 2;
+        ext.sSpatialLayers[0].iVideoWidth = 320;
+        ext.sSpatialLayers[0].iVideoHeight = 192;
+        ext.sSpatialLayers[0].iSpatialBitrate = 500_000;
+        ext.sSpatialLayers[0].fFrameRate = 30.0;
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceMode = SliceModeEnum::SM_FIXEDSLCNUM_SLICE;
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceNum = 2;
+
+        let mut param = SWelsSvcCodingParam::default();
+        assert_eq!(param.ParamTranscode(&ext), 0);
+        // `ParamValidationExt` sets `bDeblockingParallelFlag = (iMultipleThreadIdc != 1)`,
+        // which is `true` for `0` before thread resolution.
+        assert_eq!(
+            crate::encoder::wels_encoder_ext::ParamValidationExt(
+                SLogContext::default(),
+                &mut param
+            ),
+            ENC_RETURN_SUCCESS
+        );
+        assert!(param.bDeblockingParallelFlag);
+
+        // Simulate a 1-core host resolving `iMultipleThreadIdc` to 1.
+        let mut max_slices = 1i16;
+        assert_eq!(
+            InitSliceSettings(SLogContext::default(), &mut param, 1, &mut max_slices),
+            ENC_RETURN_SUCCESS
+        );
+        assert_eq!(param.iMultipleThreadIdc, 1);
+        // Even if `param.bDeblockingParallelFlag` is still `true`, `sync_layer_deblocking_params`
+        // must refuse parallel deblocking when `iMultipleThreadIdc == 1`.
+        let mut dq = SDqLayer::default();
+        sync_layer_deblocking_params(&mut dq, &param, 0);
+        assert_eq!(dq.iLoopFilterDisableIdc, 2);
+        assert!(!dq.bDeblockingParallelFlag);
+
+        // Also test `GetMultipleThreadIdc` when `iMaxSliceCount == 1` (e.g. single slice
+        // with `iMultipleThreadIdc = 0`): `bDeblockingParallelFlag` is cleared on `param`.
+        let mut param_st = SWelsSvcCodingParam::default();
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+        ext.sSpatialLayers[0].sSliceArgument.uiSliceNum = 1;
+        assert_eq!(param_st.ParamTranscode(&ext), 0);
+        assert_eq!(
+            crate::encoder::wels_encoder_ext::ParamValidationExt(
+                SLogContext::default(),
+                &mut param_st
+            ),
+            ENC_RETURN_SUCCESS
+        );
+        assert!(param_st.bDeblockingParallelFlag);
+        let mut iSliceNum = 1i16;
+        let mut iCacheLineSize = 16i32;
+        let mut uiCpuFlags = 0u32;
+        assert_eq!(
+            GetMultipleThreadIdc(
+                SLogContext::default(),
+                &mut param_st,
+                &mut iSliceNum,
+                &mut iCacheLineSize,
+                &mut uiCpuFlags,
+            ),
+            0
+        );
+        assert_eq!(param_st.iMultipleThreadIdc, 1);
+        assert!(!param_st.bDeblockingParallelFlag);
+    }
+
+    /// Issue #7: `SingleSliceGuard` restores all taken buffers and picture planes on
+    /// panic unwind.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn single_slice_guard_restores_context_on_panic_unwind() {
         let mut pCtx = build_gate_context();
-        let mut vpp = CWelsPreProcess::CreatePreProcess(&mut pCtx).expect("vpp created");
-        assert_eq!(vpp.AllocSpatialPictures(&mut pCtx), 0);
-        pCtx.pVpp = Some(vpp);
-        pCtx.uiDependencyId = 0;
-        pCtx.iCurDqLayer = Some(LayerIdx(0));
-        let src_id = pCtx
-            .pVpp
-            .as_ref()
-            .expect("vpp present")
-            .m_pSpatialPicPool
-            .ids()
-            .next()
-            .expect("at least one spatial pic");
-        let rec_id = pCtx.pDecPic.expect("dec pic present");
-        if let Some(layer) = current_layer_mut(&mut pCtx) {
-            layer.pEncPic = Some(src_id);
-            layer.pRefPic = Some(rec_id);
-            layer.pRefOri[0] = Some(PicRef::Src(src_id));
-        }
-        if let Some(vaa) = pCtx.vaa_mut() {
-            vaa.pCurPic = Some(src_id);
-            vaa.pRefPic = Some(src_id);
-        }
+        set_current_layer(&mut pCtx, Some(LayerIdx(0)));
+        let id_dec = pCtx.ref_list(0).and_then(|rl| rl.pNextBuffer);
+        current_layer_expect_mut(&mut pCtx).pDecPic = id_dec;
 
-        // 1. Normal scope exit: views are populated while guard lives and cleared on drop.
-        {
-            let guard = PreprocessSliceCoding(&mut pCtx);
-            let layer = current_layer_ref(&guard).expect("layer present");
-            assert!(layer.pRecView.is_some());
-            assert!(layer.pEncView.is_some());
-            assert!(layer.pRefView.is_some());
-            assert!(layer.pRefOriView.is_some());
-            let vaa = guard.vaa().expect("vaa present");
-            assert!(vaa.pCurView.is_some());
-            assert!(vaa.pRefView.is_some());
-        }
-        {
-            let layer = current_layer_ref(&pCtx).expect("layer present");
-            assert!(layer.pRecView.is_none());
-            assert!(layer.pEncView.is_none());
-            assert!(layer.pRefView.is_none());
-            assert!(layer.pRefOriView.is_none());
-            let vaa = pCtx.vaa().expect("vaa present");
-            assert!(vaa.pCurView.is_none());
-            assert!(vaa.pRefView.is_none());
-        }
+        let out_bs_len = pCtx.out().sBsBuffer.len();
+        let bank_len = current_layer_expect(&pCtx).sSliceBufferInfo[0]
+            .pSliceBuffer
+            .len();
+        let mb_len = current_layer_expect(&pCtx).sMbDataP.as_slice().len();
+        assert!(out_bs_len > 0 && bank_len > 0 && mb_len > 0);
 
-        // 2. Unwind exit: views are cleared even if a panic unwinds through the guard.
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let guard = PreprocessSliceCoding(&mut pCtx);
-            assert!(current_layer_ref(&guard).unwrap().pRecView.is_some());
-            panic!("simulated mid-frame panic");
+            let _guard = SingleSliceGuard::take(&mut pCtx, 0);
+            panic!("simulated single-slice unwind");
         }));
         assert!(res.is_err());
-        {
-            let layer = current_layer_ref(&pCtx).expect("layer present");
-            assert!(layer.pRecView.is_none());
-            assert!(layer.pEncView.is_none());
-            assert!(layer.pRefView.is_none());
-            assert!(layer.pRefOriView.is_none());
-            let vaa = pCtx.vaa().expect("vaa present");
-            assert!(vaa.pCurView.is_none());
-            assert!(vaa.pRefView.is_none());
-        }
+        assert_eq!(pCtx.out().sBsBuffer.len(), out_bs_len);
+        assert_eq!(
+            current_layer_expect(&pCtx).sSliceBufferInfo[0]
+                .pSliceBuffer
+                .len(),
+            bank_len
+        );
+        assert_eq!(
+            current_layer_expect(&pCtx).sMbDataP.as_slice().len(),
+            mb_len
+        );
+        assert!(
+            !pCtx
+                .ref_list(0)
+                .unwrap()
+                .pic(id_dec.unwrap())
+                .plane_tail(0)
+                .is_empty()
+        );
 
         WelsUninitEncoderExt(Some(pCtx));
     }

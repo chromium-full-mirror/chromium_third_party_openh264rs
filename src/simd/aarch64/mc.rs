@@ -1273,7 +1273,6 @@ mod tests {
         mc_hor_ver20_c as scalar_hor_ver20, mc_hor_ver22_c as scalar_hor_ver22,
         mc_luma_c as scalar_luma, pixel_avg_c as scalar_pixel_avg,
     };
-    use crate::encoder::rec_view::RecCursor;
     use crate::safe::plane::PlaneCursor;
 
     const STRIDE: usize = 64;
@@ -1548,121 +1547,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    /// The same kernels reached through the shared cursor, whose rows arrive by
-    /// value: the encoder's reference picture is one of these, and it is what the
-    /// half-pel refinement filters read at `kiW + 1` by `kiH + 1`.
-    #[test]
-    fn mc_parity_through_the_shared_cursor() {
-        let mut base = filled_plane();
-        let src_c = 10 * STRIDE + 10;
-        let dst_c = 20 * STRIDE + 10;
-        let mut want = vec![0u8; STRIDE * ROWS];
-        let mut got = vec![0u8; STRIDE * ROWS];
-        macro_rules! pair {
-            ($scalar:expr, $simd:expr) => {{
-                want.iter_mut().for_each(|b| *b = 0);
-                got.iter_mut().for_each(|b| *b = 0);
-                {
-                    let src = PlaneCursor::new(&base, src_c, STRIDE);
-                    let mut d = PlaneCursorMut::new(&mut want, dst_c, STRIDE);
-                    #[allow(clippy::redundant_closure_call)]
-                    ($scalar)(&src, &mut d);
-                }
-                {
-                    let src = RecCursor::over_owned(&mut base, src_c, STRIDE);
-                    let mut d = PlaneCursorMut::new(&mut got, dst_c, STRIDE);
-                    #[allow(clippy::redundant_closure_call)]
-                    ($simd)(&src, &mut d);
-                }
-                assert_eq!(want, got);
-            }};
-        }
-        for (qx, qy) in [
-            (0i16, 0i16),
-            (1, 0),
-            (2, 0),
-            (3, 0),
-            (0, 1),
-            (0, 2),
-            (0, 3),
-            (1, 1),
-            (2, 2),
-            (3, 3),
-        ] {
-            for (w, h) in [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)] {
-                pair!(
-                    |s: &PlaneCursor<'_>, d: &mut PlaneCursorMut<'_>| scalar_luma(
-                        s, d, qx, qy, w, h
-                    ),
-                    |s: &RecCursor<'_>, d: &mut PlaneCursorMut<'_>| mc_luma(s, d, qx, qy, w, h)
-                );
-            }
-        }
-        // The half-pel refinement shapes, which only ever run over this cursor.
-        for (w, h) in [(17, 16), (17, 8), (9, 16), (9, 8)] {
-            pair!(
-                |s: &PlaneCursor<'_>, d: &mut PlaneCursorMut<'_>| scalar_hor_ver20(s, d, w, h),
-                |s: &RecCursor<'_>, d: &mut PlaneCursorMut<'_>| mc_hor_ver20(s, d, w, h)
-            );
-        }
-        for (w, h) in [(16, 17), (16, 9), (8, 17), (8, 9)] {
-            pair!(
-                |s: &PlaneCursor<'_>, d: &mut PlaneCursorMut<'_>| scalar_hor_ver02(s, d, w, h),
-                |s: &RecCursor<'_>, d: &mut PlaneCursorMut<'_>| mc_hor_ver02(s, d, w, h)
-            );
-        }
-        for (w, h) in [(17, 17), (17, 9), (9, 17), (9, 9)] {
-            pair!(
-                |s: &PlaneCursor<'_>, d: &mut PlaneCursorMut<'_>| scalar_hor_ver22(s, d, w, h),
-                |s: &RecCursor<'_>, d: &mut PlaneCursorMut<'_>| mc_hor_ver22(s, d, w, h)
-            );
-        }
-        for (w, h) in [(8, 8), (8, 4), (4, 8), (4, 4), (4, 2), (2, 4), (2, 2)] {
-            for (mx, my) in [(0i16, 0i16), (3, 5), (1, 0), (0, 7)] {
-                pair!(
-                    |s: &PlaneCursor<'_>, d: &mut PlaneCursorMut<'_>| {
-                        if (mx & 7) == 0 && (my & 7) == 0 {
-                            mc_copy(s, d, w, h)
-                        } else {
-                            mc_chroma_with_frag_mv(s, d, mx, my, w, h)
-                        }
-                    },
-                    |s: &RecCursor<'_>, d: &mut PlaneCursorMut<'_>| mc_chroma(s, d, mx, my, w, h)
-                );
-            }
-        }
-        // `pixel_avg`'s second operand is the reference block itself in four of the
-        // quarter-pixel candidates, so it too sees this cursor.
-        for (w, h) in [(16, 16), (16, 8), (8, 16), (8, 8)] {
-            let a = filled_plane();
-            want.iter_mut().for_each(|b| *b = 0);
-            got.iter_mut().for_each(|b| *b = 0);
-            {
-                let ca = PlaneCursor::new(&a, src_c, STRIDE);
-                let cb = PlaneCursor::new(&base, src_c, STRIDE);
-                scalar_pixel_avg(
-                    &mut PlaneCursorMut::new(&mut want, dst_c, STRIDE),
-                    &ca,
-                    &cb,
-                    w,
-                    h,
-                );
-            }
-            {
-                let ca = PlaneCursor::new(&a, src_c, STRIDE);
-                let cb = RecCursor::over_owned(&mut base, src_c, STRIDE);
-                pixel_avg(
-                    &mut PlaneCursorMut::new(&mut got, dst_c, STRIDE),
-                    &ca,
-                    &cb,
-                    w,
-                    h,
-                );
-            }
-            assert_eq!(want, got, "pixel_avg via RecCursor at {w}x{h}");
         }
     }
 }

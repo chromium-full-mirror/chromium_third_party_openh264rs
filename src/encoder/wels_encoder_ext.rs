@@ -37,7 +37,8 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::c_char;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::encoder::au_set::{WelsWritePpsSyntax, WelsWriteSpsNal, WelsWriteSubsetSpsSyntax};
 use crate::encoder::nal_encap::EWelsNalRefIdc::NRI_PRI_HIGHEST;
@@ -75,7 +76,9 @@ use crate::encoder::au_set::{
 use crate::encoder::encoder_context::{
     MAX_DQ_LAYER_NUM, MAX_PPS_COUNT, PARA_SET_TYPE, SParaSetOffsetVariable,
 };
-use crate::encoder::encoder_ext::{GetMultipleThreadIdc, WelsInitEncoderExt, WelsUninitEncoderExt};
+use crate::encoder::encoder_ext::{
+    GetMultipleThreadIdc, WelsInitEncoderExt, WelsUninitEncoderExt, sync_layer_deblocking_params,
+};
 use crate::encoder::param_svc::{GetLogFactor, SExistingParasetList};
 use crate::encoder::svc_motion_estimate::CheckInRangeCloseOpen;
 
@@ -193,10 +196,9 @@ pub fn WELS_POWER2_IF(v: u32) -> bool {
 }
 
 pub fn WelsTime() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_micros() as i64,
-        Err(_) => 0,
-    }
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_micros().min(i64::MAX as u128) as i64
 }
 
 pub use crate::common::wels_trace::{WelsLog, WelsTraceCallback, welsCodecTrace};
@@ -617,6 +619,8 @@ pub fn WelsEncoderParamAdjust(
         || (pOldParam.bEnableLongTermReference != pNewParam.bEnableLongTermReference)
         || (pOldParam.iLTRRefNum != pNewParam.iLTRRefNum)
         || (pOldParam.iMultipleThreadIdc != pNewParam.iMultipleThreadIdc)
+        || (pOldParam.iMultipleThreadIdc > 1
+            && pOldParam.bUseLoadBalancing != pNewParam.bUseLoadBalancing)
         || (pOldParam.bEnableBackgroundDetection != pNewParam.bEnableBackgroundDetection)
         || (pOldParam.bEnableAdaptiveQuant != pNewParam.bEnableAdaptiveQuant)
         || (pOldParam.eSpsPpsIdStrategy != pNewParam.eSpsPpsIdStrategy);
@@ -829,6 +833,8 @@ pub fn WelsEncoderParamAdjust(
         pOldParam.iLoopFilterDisableIdc = pNewParam.iLoopFilterDisableIdc;
         pOldParam.iLoopFilterAlphaC0Offset = pNewParam.iLoopFilterAlphaC0Offset;
         pOldParam.iLoopFilterBetaOffset = pNewParam.iLoopFilterBetaOffset;
+        pOldParam.bDeblockingParallelFlag = pNewParam.bDeblockingParallelFlag;
+        pOldParam.bUseLoadBalancing = pNewParam.bUseLoadBalancing;
 
         /* Rate Control */
         pOldParam.iRCMode = pNewParam.iRCMode;
@@ -862,6 +868,17 @@ pub fn WelsEncoderParamAdjust(
             iIndexD += 1;
             if iIndexD >= pOldParam.iSpatialLayerNum {
                 break;
+            }
+        }
+
+        // Propagate updated deblocking filter parameters into every active DQ layer,
+        // since slice headers and `PerformDeblockingFilter` / `PreprocessSliceCoding`
+        // read from `SDqLayer` rather than `pSvcParam`.
+        let sParamCopy = *ctx.param();
+        let iNumLayers = sParamCopy.iSpatialLayerNum as usize;
+        for d in 0..iNumLayers {
+            if let Some(pDqLayer) = ctx.ppDqLayerList.get_mut(d).and_then(|l| l.as_deref_mut()) {
+                sync_layer_deblocking_params(pDqLayer, &sParamCopy, d);
             }
         }
     }
@@ -2157,3 +2174,129 @@ use crate::encoder::paraset_strategy::{
     ctx_strategy_and_out, ctx_strategy_and_paraset_arrays, ctx_strategy_and_pps,
 };
 use crate::encoder::vlc_encoder::BsWriter;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::wels_trace::SLogContext;
+
+    /// Issue #6: `WelsTime()` uses a monotonic `Instant` epoch and never goes backwards.
+    #[test]
+    fn wels_time_is_monotonic_and_non_negative() {
+        let mut prev = WelsTime();
+        assert!(prev >= 0);
+        for _ in 0..1000 {
+            let now = WelsTime();
+            assert!(now >= prev, "WelsTime went backward: {prev} -> {now}");
+            prev = now;
+        }
+    }
+
+    /// Issue #9: `WelsEncoderParamAdjust` updates active `SDqLayer` deblocking
+    /// parameters in the no-reset path and properly handles `bUseLoadBalancing`
+    /// changes (triggering a reset when multithreaded and updating `pOldParam`).
+    #[test]
+    fn param_adjust_reconfigures_load_balancing_and_loop_filter() {
+        let make_param = |threads: u16,
+                          slice_mode: crate::SliceMode,
+                          slices: u32,
+                          lb: bool,
+                          idc: i32,
+                          alpha: i32,
+                          beta: i32| {
+            let mut ext = SEncParamExt::default();
+            SWelsSvcCodingParam::FillDefaultExt(&mut ext);
+            ext.iPicWidth = 320;
+            ext.iPicHeight = 192;
+            ext.iTargetBitrate = 500_000;
+            ext.fMaxFrameRate = 30.0;
+            ext.iSpatialLayerNum = 1;
+            ext.iMultipleThreadIdc = threads;
+            ext.bUseLoadBalancing = lb;
+            ext.iLoopFilterDisableIdc = idc;
+            ext.iLoopFilterAlphaC0Offset = alpha;
+            ext.iLoopFilterBetaOffset = beta;
+            ext.sSpatialLayers[0].iVideoWidth = 320;
+            ext.sSpatialLayers[0].iVideoHeight = 192;
+            ext.sSpatialLayers[0].iSpatialBitrate = 500_000;
+            ext.sSpatialLayers[0].fFrameRate = 30.0;
+            ext.sSpatialLayers[0].sSliceArgument.uiSliceMode = slice_mode;
+            ext.sSpatialLayers[0].sSliceArgument.uiSliceNum = slices;
+            let mut p = SWelsSvcCodingParam::default();
+            assert_eq!(p.ParamTranscode(&ext), 0);
+            assert_eq!(p.DetermineTemporalSettings(), 0);
+            p
+        };
+
+        // Multithreaded case: 2 threads, 2 fixed slices, lb=false, idc=2.
+        let mut init_param = make_param(2, SM_FIXEDSLCNUM_SLICE, 2, false, 2, 0, 0);
+        let mut pCtx: Option<Box<sWelsEncCtx>> = None;
+        assert_eq!(
+            WelsInitEncoderExt(&mut pCtx, &mut init_param, SLogContext::default(), None),
+            0
+        );
+        {
+            let ctx = pCtx.as_deref().unwrap();
+            let dq = ctx.ppDqLayerList[0].as_deref().unwrap();
+            assert!(!ctx.param().bUseLoadBalancing);
+            assert_eq!(dq.iLoopFilterDisableIdc, 2);
+            assert!(dq.bDeblockingParallelFlag);
+        }
+
+        // No-reset update: change iLoopFilterDisableIdc to 1 and alpha/beta offsets.
+        let mut adj_lf_off = make_param(2, SM_FIXEDSLCNUM_SLICE, 2, false, 1, 3, -2);
+        assert_eq!(WelsEncoderParamAdjust(&mut pCtx, &mut adj_lf_off), 0);
+        {
+            let ctx = pCtx.as_deref().unwrap();
+            let dq = ctx.ppDqLayerList[0].as_deref().unwrap();
+            assert_eq!(ctx.param().iLoopFilterDisableIdc, 1);
+            assert_eq!(dq.iLoopFilterDisableIdc, 1);
+            assert_eq!(dq.iLoopFilterAlphaC0Offset, 6);
+            assert_eq!(dq.iLoopFilterBetaOffset, -4);
+        }
+
+        // No-reset update: request iLoopFilterDisableIdc = 0 on MT -> rewritten to 2
+        // with parallel deblocking re-enabled.
+        let mut adj_lf_on = make_param(2, SM_FIXEDSLCNUM_SLICE, 2, false, 0, 0, 0);
+        assert_eq!(WelsEncoderParamAdjust(&mut pCtx, &mut adj_lf_on), 0);
+        {
+            let ctx = pCtx.as_deref().unwrap();
+            let dq = ctx.ppDqLayerList[0].as_deref().unwrap();
+            assert_eq!(ctx.param().iLoopFilterDisableIdc, 2);
+            assert_eq!(dq.iLoopFilterDisableIdc, 2);
+            assert!(dq.bDeblockingParallelFlag);
+        }
+
+        // Toggle bUseLoadBalancing false -> true -> false on MT (triggers reset).
+        let mut adj_lb_on = make_param(2, SM_FIXEDSLCNUM_SLICE, 2, true, 2, 0, 0);
+        assert_eq!(WelsEncoderParamAdjust(&mut pCtx, &mut adj_lb_on), 0);
+        assert!(pCtx.as_deref().unwrap().param().bUseLoadBalancing);
+
+        let mut adj_lb_off = make_param(2, SM_FIXEDSLCNUM_SLICE, 2, false, 2, 0, 0);
+        assert_eq!(WelsEncoderParamAdjust(&mut pCtx, &mut adj_lb_off), 0);
+        assert!(!pCtx.as_deref().unwrap().param().bUseLoadBalancing);
+
+        WelsUninitEncoderExt(pCtx);
+
+        // Single-threaded case: toggling bUseLoadBalancing updates pOldParam without reset,
+        // and changing iLoopFilterDisableIdc updates SDqLayer in place.
+        let mut st_init = make_param(1, SM_SINGLE_SLICE, 1, false, 0, 0, 0);
+        let mut pCtxSt: Option<Box<sWelsEncCtx>> = None;
+        assert_eq!(
+            WelsInitEncoderExt(&mut pCtxSt, &mut st_init, SLogContext::default(), None),
+            0
+        );
+        let mut st_adj = make_param(1, SM_SINGLE_SLICE, 1, true, 1, -1, 2);
+        assert_eq!(WelsEncoderParamAdjust(&mut pCtxSt, &mut st_adj), 0);
+        {
+            let ctx = pCtxSt.as_deref().unwrap();
+            let dq = ctx.ppDqLayerList[0].as_deref().unwrap();
+            assert!(ctx.param().bUseLoadBalancing);
+            assert_eq!(dq.iLoopFilterDisableIdc, 1);
+            assert_eq!(dq.iLoopFilterAlphaC0Offset, -2);
+            assert_eq!(dq.iLoopFilterBetaOffset, 4);
+            assert!(!dq.bDeblockingParallelFlag);
+        }
+        WelsUninitEncoderExt(pCtxSt);
+    }
+}

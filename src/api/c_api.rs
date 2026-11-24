@@ -1807,9 +1807,8 @@ mod send_verdict {
     ///   and [`SPosOffset`](crate::decoder::parameter_sets::SPosOffset) rather than raw
     ///   plane pointers, minting `pDst` at emission time in `EmitBufferedPicture`.
     /// * [`Encoder`] owns its context, [`WorkerPool`](crate::encoder::worker_pool::WorkerPool),
-    ///   and trace state; [`SharedCells`](crate::encoder::rec_view::SharedCells) is
-    ///   `Send` for `T: Copy + Send` and all per-frame views are cleared before
-    ///   `WelsEncoderEncodeExt` returns.
+    ///   and trace state — all pure safe owned values, with per-worker picture bands
+    ///   borrowed only inside the scoped multithreaded fork.
     #[test]
     fn the_cores_are_send() {
         fn assert_send<T: Send>() {}

@@ -16,7 +16,6 @@ pub mod param_svc;
 pub mod paraset_strategy;
 pub mod picture;
 pub mod rc;
-pub mod rec_view;
 pub mod ref_list_mgr_svc;
 pub mod sample;
 pub mod set_mb_syn_cabac;

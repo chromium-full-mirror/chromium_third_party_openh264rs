@@ -40,11 +40,14 @@
 #![forbid(unsafe_code)]
 
 use crate::encoder::decode_mb_aux::{
-    idct_four_t4_rec_in_place_view, idct_four_t4_rec_to_view, idct_t4_rec_on_mb_in_place_view,
+    idct_four_t4_rec, idct_four_t4_rec_in_place, idct_t4_rec_on_mb_in_place,
 };
 use crate::encoder::encode_mb_aux::{blk_four4x4, blk_mb256};
-use crate::encoder::picture::{PicRef, RecPicId, SPicture, SrcPicId};
-use crate::encoder::rec_view::{RecCursor, RecPicView};
+use crate::encoder::picture::{
+    EncPicBand, PaddedPlane, PicRef, PlaneBandMut, RecPicBand, RecPicId, SPicture, SlicePicBands,
+    SrcPicId, TakenPicData, split_planes_by_mb_rows, split_planes_by_mb_rows_into,
+};
+use crate::safe::plane::PlaneCursor;
 use crate::{MAX_LAYER_NUM_OF_FRAME, SFrameBSInfo, SSliceArgument, SliceMode};
 use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
 
@@ -574,21 +577,6 @@ pub fn ctx_pic_ref(pCtx: &sWelsEncCtx, r: PicRef) -> Option<&SPicture> {
     }
 }
 
-/// Exclusive counterpart to [`ctx_pic_ref`], used on the frame setup path before the
-/// slice fork to build [`crate::encoder::rec_view::RoPicView`]s with write-derived
-/// provenance (`Vec::as_mut_ptr`).
-#[inline]
-pub fn ctx_pic_mut(pCtx: &mut sWelsEncCtx, r: PicRef) -> Option<&mut SPicture> {
-    let did = pCtx.uiDependencyId as usize;
-    match r {
-        PicRef::Rec(id) => pCtx.ref_list_mut(did).map(|pRefList| pRefList.pic_mut(id)),
-        PicRef::Src(id) => pCtx
-            .pVpp
-            .as_mut()
-            .map(|vpp| vpp.m_pSpatialPicPool.get_mut(id)),
-    }
-}
-
 /// The reconstruction picture this layer references, resolved through the reference
 /// list the layer was stamped with. `None` before the first inter frame, or on a
 /// layer not yet initialised for a frame.
@@ -638,40 +626,232 @@ pub fn layer_ref_feature_storage<'a>(
         .as_deref()
 }
 
-/// The layer's route to the reconstruction picture — a shared view whose writes go
-/// through `&self`. Two workers may hold it at the same time;
-/// [`crate::encoder::rec_view`] carries the argument for why it is sound.
-///
-/// `None` means no frame has started, or the picture is unbound. Stamped by
-/// `WelsInitCurrentLayer`, so it is the current frame's only while the frame it was
-/// stamped for is still in progress.
-#[inline(always)]
-pub(crate) fn layer_rec_view(pLayer: &SDqLayer) -> Option<&RecPicView> {
-    pLayer.pRecView.as_ref()
+/// Temporarily moves out the mutable pixel planes and per-MB side arrays of the
+/// current layer's reconstruction picture (`pDecPic`), source picture (`pEncPic`), and
+/// optional distinct VAA current picture (`vaa.pCurPic`), so they can be safely carved
+/// into disjoint MB-row [`SlicePicBands`] while `&sWelsEncCtx` is borrowed shared across
+/// worker threads. Restored by [`restore`](Self::restore).
+pub struct TakenFramePics {
+    did: usize,
+    id_dec: Option<RecPicId>,
+    rec_data: TakenPicData,
+    id_enc: Option<SrcPicId>,
+    enc_planes: [PaddedPlane; 3],
+    vaa_updates_enc: bool,
+    vaa_cur_separate: Option<(SrcPicId, [PaddedPlane; 3])>,
 }
 
-/// [`layer_rec_view`] for consumers inside a frame, past `PreprocessSliceCoding`'s
-/// stamp. Valid only while the frame it was stamped for is still in progress.
-#[inline(always)]
-pub(crate) fn layer_rec_view_expect(pLayer: &SDqLayer) -> &RecPicView {
-    static EMPTY_REC_VIEW: RecPicView = RecPicView::empty();
-    layer_rec_view(pLayer).unwrap_or(&EMPTY_REC_VIEW)
-}
+impl TakenFramePics {
+    fn empty() -> Self {
+        Self {
+            did: 0,
+            id_dec: None,
+            rec_data: TakenPicData::empty(),
+            id_enc: None,
+            enc_planes: [
+                PaddedPlane::empty(0),
+                PaddedPlane::empty(0),
+                PaddedPlane::empty(0),
+            ],
+            vaa_updates_enc: false,
+            vaa_cur_separate: None,
+        }
+    }
 
-/// The frame's source planes, as `layer_rec_view` is its reconstruction planes.
-///
-/// `None` on a layer whose frame has not been bound yet.
-#[inline(always)]
-pub(crate) fn layer_enc_view(pLayer: &SDqLayer) -> Option<&crate::encoder::rec_view::RoPicView> {
-    pLayer.pEncView.as_ref()
-}
+    /// Takes the mutable pixel planes and per-MB side arrays for the current layer out of
+    /// `pCtx`. Must be paired with [`restore`](Self::restore) on every exit path.
+    pub fn take(pCtx: &mut sWelsEncCtx) -> Self {
+        let Some(pCurLayer) = current_layer_ref(pCtx) else {
+            return Self::empty();
+        };
+        let did = pCurLayer.sLayerInfo.sNalHeaderExt.uiDependencyId as usize;
+        let id_dec = pCurLayer.pDecPic;
+        let id_enc = pCurLayer.pEncPic;
+        debug_assert!(
+            id_dec.is_none() || id_dec != pCurLayer.pRefPic,
+            "current reconstruction picture must not alias reference picture"
+        );
+        let (vaa_cur, vaa_ref) = pCtx.vaa().map_or((None, None), |v| (v.pCurPic, v.pRefPic));
 
-/// [`layer_enc_view`] for the call sites inside a frame, past the bind.
-#[inline(always)]
-pub(crate) fn layer_enc_view_expect(pLayer: &SDqLayer) -> &crate::encoder::rec_view::RoPicView {
-    static EMPTY_RO_VIEW: crate::encoder::rec_view::RoPicView =
-        crate::encoder::rec_view::RoPicView::empty();
-    layer_enc_view(pLayer).unwrap_or(&EMPTY_RO_VIEW)
+        let rec_data = match (id_dec, pCtx.ref_list_mut(did)) {
+            (Some(id), Some(rl)) => rl.pic_mut(id).take_data(),
+            _ => TakenPicData::empty(),
+        };
+        let enc_planes = match (id_enc, pCtx.pVpp.as_deref_mut()) {
+            (Some(id), Some(vpp)) => vpp.m_pSpatialPicPool.get_mut(id).take_planes(),
+            _ => [
+                PaddedPlane::empty(0),
+                PaddedPlane::empty(0),
+                PaddedPlane::empty(0),
+            ],
+        };
+        let vaa_updates_enc = vaa_cur.is_some() && vaa_cur == id_enc;
+        let vaa_cur_separate = match (vaa_cur, pCtx.pVpp.as_deref_mut()) {
+            (Some(id), Some(vpp)) if Some(id) != id_enc && Some(id) != vaa_ref => {
+                Some((id, vpp.m_pSpatialPicPool.get_mut(id).take_planes()))
+            }
+            _ => None,
+        };
+        Self {
+            did,
+            id_dec,
+            rec_data,
+            id_enc,
+            enc_planes,
+            vaa_updates_enc,
+            vaa_cur_separate,
+        }
+    }
+
+    /// Borrows all taken pictures as a single whole-frame [`SlicePicBands`]
+    /// (single-threaded path).
+    pub fn whole_bands(&mut self) -> SlicePicBands<'_> {
+        let rec = self.rec_data.whole_rec_band();
+        let [ey, eu, ev] = &mut self.enc_planes;
+        let enc_planes = [
+            ey.whole_band_mut(),
+            eu.whole_band_mut(),
+            ev.whole_band_mut(),
+        ];
+        let vaa_sep = self.vaa_cur_separate.as_mut().map(|(_, p)| {
+            let [vy, vu, vv] = p;
+            [
+                vy.whole_band_mut(),
+                vu.whole_band_mut(),
+                vv.whole_band_mut(),
+            ]
+        });
+        SlicePicBands {
+            rec,
+            enc: EncPicBand::from_planes(enc_planes, self.vaa_updates_enc, vaa_sep),
+        }
+    }
+
+    /// Splits the taken pictures into disjoint [`SlicePicBands`] aligned to the given
+    /// MB-row ranges `[(row_start, row_end), ...]`, writing into `out[..mb_row_ranges.len()]`
+    /// without heap allocations for up to `MAX_THREADS_NUM` bands.
+    pub fn split_bands_into<'a>(
+        &'a mut self,
+        mb_row_ranges: &[(usize, usize)],
+        mb_width: usize,
+        out: &mut [SlicePicBands<'a>],
+    ) {
+        let n = mb_row_ranges.len();
+        assert!(out.len() >= n);
+        if n <= MAX_THREADS_NUM {
+            let mut rec_bands =
+                std::array::from_fn::<_, MAX_THREADS_NUM, _>(|_| RecPicBand::empty());
+            let mut enc_planes = std::array::from_fn::<_, MAX_THREADS_NUM, _>(|_| {
+                [
+                    PlaneBandMut::empty(),
+                    PlaneBandMut::empty(),
+                    PlaneBandMut::empty(),
+                ]
+            });
+            let mut vaa_sep_planes = std::array::from_fn::<_, MAX_THREADS_NUM, _>(|_| {
+                [
+                    PlaneBandMut::empty(),
+                    PlaneBandMut::empty(),
+                    PlaneBandMut::empty(),
+                ]
+            });
+            self.rec_data
+                .split_rec_bands_into(mb_row_ranges, mb_width, &mut rec_bands[..n]);
+            split_planes_by_mb_rows_into(&mut self.enc_planes, mb_row_ranges, &mut enc_planes[..n]);
+            let has_vaa_sep = if let Some((_, ref mut planes)) = self.vaa_cur_separate {
+                split_planes_by_mb_rows_into(planes, mb_row_ranges, &mut vaa_sep_planes[..n]);
+                true
+            } else {
+                false
+            };
+            let vaa_updates_enc = self.vaa_updates_enc;
+            for i in 0..n {
+                let rec = std::mem::replace(&mut rec_bands[i], RecPicBand::empty());
+                let enc_p = std::mem::replace(
+                    &mut enc_planes[i],
+                    [
+                        PlaneBandMut::empty(),
+                        PlaneBandMut::empty(),
+                        PlaneBandMut::empty(),
+                    ],
+                );
+                let vaa_sep = if has_vaa_sep {
+                    Some(std::mem::replace(
+                        &mut vaa_sep_planes[i],
+                        [
+                            PlaneBandMut::empty(),
+                            PlaneBandMut::empty(),
+                            PlaneBandMut::empty(),
+                        ],
+                    ))
+                } else {
+                    None
+                };
+                out[i] = SlicePicBands {
+                    rec,
+                    enc: EncPicBand::from_planes(enc_p, vaa_updates_enc, vaa_sep),
+                };
+            }
+        } else {
+            let bands = self.split_bands(mb_row_ranges, mb_width);
+            for (slot, band) in out[..n].iter_mut().zip(bands) {
+                *slot = band;
+            }
+        }
+    }
+
+    /// Splits the taken pictures into disjoint [`SlicePicBands`] aligned to the given
+    /// MB-row ranges `[(row_start, row_end), ...]`.
+    pub fn split_bands(
+        &mut self,
+        mb_row_ranges: &[(usize, usize)],
+        mb_width: usize,
+    ) -> Vec<SlicePicBands<'_>> {
+        let rec_bands = self.rec_data.split_rec_bands(mb_row_ranges, mb_width);
+        let enc_plane_bands = split_planes_by_mb_rows(&mut self.enc_planes, mb_row_ranges);
+        let mut vaa_sep_bands: Vec<Option<[PlaneBandMut<'_>; 3]>> =
+            if let Some((_, ref mut planes)) = self.vaa_cur_separate {
+                split_planes_by_mb_rows(planes, mb_row_ranges)
+                    .into_iter()
+                    .map(Some)
+                    .collect()
+            } else {
+                (0..mb_row_ranges.len()).map(|_| None).collect()
+            };
+        let vaa_updates_enc = self.vaa_updates_enc;
+        rec_bands
+            .into_iter()
+            .zip(enc_plane_bands)
+            .zip(vaa_sep_bands.drain(..))
+            .map(|((rec, enc_p), vaa_sep)| SlicePicBands {
+                rec,
+                enc: EncPicBand::from_planes(enc_p, vaa_updates_enc, vaa_sep),
+            })
+            .collect()
+    }
+
+    /// Restores every taken plane and side array back into `pCtx`.
+    pub fn restore(mut self, pCtx: &mut sWelsEncCtx) {
+        self.restore_mut(pCtx);
+    }
+
+    /// Restores every taken plane and side array back into `pCtx`, leaving `self` empty.
+    /// Safe to call from a `Drop` guard.
+    pub fn restore_mut(&mut self, pCtx: &mut sWelsEncCtx) {
+        let taken = std::mem::replace(self, Self::empty());
+        if let (Some(id), Some(rl)) = (taken.id_dec, pCtx.ref_list_mut(taken.did)) {
+            rl.pic_mut(id).restore_data(taken.rec_data);
+        }
+        if let (Some(id), Some(vpp)) = (taken.id_enc, pCtx.pVpp.as_deref_mut()) {
+            vpp.m_pSpatialPicPool
+                .get_mut(id)
+                .restore_planes(taken.enc_planes);
+        }
+        if let (Some((id, planes)), Some(vpp)) = (taken.vaa_cur_separate, pCtx.pVpp.as_deref_mut())
+        {
+            vpp.m_pSpatialPicPool.get_mut(id).restore_planes(planes);
+        }
+    }
 }
 
 pub struct SDqLayer {
@@ -718,30 +898,6 @@ pub struct SDqLayer {
     /// The source picture this frame encodes from, as a slot of the spatial pool in
     /// `pCtx->pVpp`. Stamped by `WelsInitCurrentLayer`.
     pub pEncPic: Option<SrcPicId>,
-    /// The route to the picture every worker writes, built per frame by
-    /// `PreprocessSliceCoding`: three planes and four per-macroblock side arrays,
-    /// shared and writable through `&self` — see [`crate::encoder::rec_view`] for the
-    /// soundness argument.
-    ///
-    /// While this is `Some`, nothing may take `&mut` to the same picture through the
-    /// pool (`pic_mut(idDec)`): that retag makes the captured bases stale and, under
-    /// the fork, races on `SRefList` itself. It is rebuilt every frame, and cleared
-    /// before the layer ends.
-    pub(crate) pRecView: Option<RecPicView>,
-
-    /// The frame's source planes as a read-only view — the counterpart to `pRecView`.
-    ///
-    /// `PlaneCursor`s taken from it bounds-check against the whole allocation, so the
-    /// top and left borders a motion search legally reaches stay reads.
-    ///
-    /// Rebuilt every frame with `pRecView`: the pool may hand the next frame a
-    /// different slot, so a view is only valid for the frame that built it.
-    pub(crate) pEncView: Option<crate::encoder::rec_view::RoPicView>,
-    /// The frame's reference reconstruction picture (`pRefPic`) and reference source
-    /// picture (`pRefOri[0]`) as read-only views, stamped before the slice fork and
-    /// cleared at frame end.
-    pub(crate) pRefView: Option<crate::encoder::rec_view::RoPicView>,
-    pub(crate) pRefOriView: Option<crate::encoder::rec_view::RoPicView>,
     /// The source pictures behind the reference list — slots of the preprocessor's
     /// spatial pool, resolved through `pCtx->pVpp` (both readers hold the context).
     pub pRefOri: [Option<PicRef>; MAX_REF_PIC_COUNT as usize],
@@ -791,13 +947,7 @@ impl SDqLayer {
             // Zero here means "no slice segmentation yet"; `InitSlicePEncCtx` sets
             // the mode, the geometry and the map.
             sSliceEncCtx: SSliceCtx::default(),
-            // Plane aliases into the reconstructed and source pictures, re-aimed at
-            // every frame by `WelsInitCurrentLayer`; `None` means "no frame started".
             iCsStride: [0; 3],
-            pRecView: None,
-            pEncView: None,
-            pRefView: None,
-            pRefOriView: None,
             iEncStride: [0; 3],
             // The macroblock records, sized by `InitMbListD` once the geometry is
             // known.
@@ -905,6 +1055,9 @@ pub type PWelsCodingSliceFunc = fn(
     // ranges, on the single-threaded side straight off a `&mut MbArray`. The
     // bodies move the cursor with `set_cur`.
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    // This worker's exclusive horizontal MB-row bands of the reconstruction and
+    // source pictures (`pDecPic`, `pEncPic`, and optional distinct `vaa.pCurPic`).
+    bands: &mut SlicePicBands<'_>,
     // The CABAC restore scratch, threaded like the pair above: the size-limited
     // fork takes the partition's buffer beside its bitstream slot, the
     // single-threaded callers take it around the call. `None` for CAVLC dynamic
@@ -1464,69 +1617,74 @@ pub fn WelsSliceHeaderExtWrite(
 // `WelsInterMbEncode` lives in `svc_mode_decision.rs` — C++:
 // `svc_mode_decision.cpp`.
 
-pub fn WelsIMbChromaEncode(pEncCtx: &sWelsEncCtx, pCurMb: &mut SMB, pMbCache: &mut SMbCache) {
-    let pCurLayer = current_layer_expect(pEncCtx);
+pub fn WelsIMbChromaEncode(
+    pEncCtx: &sWelsEncCtx,
+    pCurMb: &mut SMB,
+    pMbCache: &mut SMbCache,
+    bands: &mut SlicePicBands<'_>,
+) {
     let kiBestPredOff = best_pred_intra_chroma_off(
         pMbCache.uiMemPredLumaHalf,
         pMbCache.uiBestPredIntraChromaHalf,
     );
-    let view_chroma = layer_rec_view_expect(pCurLayer);
     let (kiChrOrgX, kiChrOrgY) = pMbCache.SPicData.chroma_origin();
 
-    let encView = layer_enc_view_expect(pCurLayer);
     let pFunc = pEncCtx.func_list();
     let pfDctFourT4 = pFunc.pfDctFourT4;
 
     //cb
     pfDctFourT4(
         &mut pMbCache.sCoeffLevel,
-        &pMbCache.SPicData.mb_cursor_ro(encView, 1),
-        &RecCursor::over_owned(&mut pMbCache.sMemPredMb, kiBestPredOff, 8),
+        &pMbCache.SPicData.mb_cursor_enc(&bands.enc, 1),
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff, 8),
     );
     crate::encoder::svc_encode_mb::WelsEncRecUV(pFunc, pCurMb, pMbCache, 0, 1);
     // The prediction is `sMemPredMb`'s intra-chroma half at stride 8, an owned arena.
-    idct_four_t4_rec_to_view(
-        &view_chroma.plane(1).cursor(kiChrOrgX, kiChrOrgY),
-        &pMbCache.sMemPredMb[kiBestPredOff..],
-        8,
+    idct_four_t4_rec(
+        &mut bands.rec.plane_mut(1).cursor_mut(kiChrOrgX, kiChrOrgY),
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff, 8),
         blk_four4x4(&pMbCache.sCoeffLevel, 0),
     );
 
     //cr
     pfDctFourT4(
         &mut pMbCache.sCoeffLevel[64..],
-        &pMbCache.SPicData.mb_cursor_ro(encView, 2),
-        &RecCursor::over_owned(&mut pMbCache.sMemPredMb, kiBestPredOff + 64, 8),
+        &pMbCache.SPicData.mb_cursor_enc(&bands.enc, 2),
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff + 64, 8),
     );
     crate::encoder::svc_encode_mb::WelsEncRecUV(pFunc, pCurMb, pMbCache, 64, 2);
-    idct_four_t4_rec_to_view(
-        &view_chroma.plane(2).cursor(kiChrOrgX, kiChrOrgY),
-        &pMbCache.sMemPredMb[kiBestPredOff + 64..],
-        8,
+    idct_four_t4_rec(
+        &mut bands.rec.plane_mut(2).cursor_mut(kiChrOrgX, kiChrOrgY),
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff + 64, 8),
         blk_four4x4(&pMbCache.sCoeffLevel, 64),
     );
 }
 
-pub fn WelsPMbChromaEncode(pEncCtx: &sWelsEncCtx, pSlice: &mut SSlice, pCurMb: &mut SMB) {
-    let pCurLayer = current_layer_expect(pEncCtx);
+#[inline]
+pub fn WelsPMbChromaEncode(
+    pEncCtx: &sWelsEncCtx,
+    pSlice: &mut SSlice,
+    pCurMb: &mut SMB,
+    cEncCb: &PlaneCursor<'_>,
+    cEncCr: &PlaneCursor<'_>,
+) {
     let pMbCache = &mut pSlice.sMbCacheInfo;
     // This path starts at `pCoeffLevel + 256` (`svc_encode_slice.cpp:499`) where the
     // intra path starts at 0, which is why `WelsEncRecUV` takes the offset as a
     // parameter rather than deriving it from `iUV`.
     let kiBestPredOff = mem_pred_chroma_off(pMbCache.uiMemPredLumaHalf);
 
-    let encView = layer_enc_view_expect(pCurLayer);
     let pFunc = pEncCtx.func_list();
     let dct = pFunc.pfDctFourT4;
     dct(
         &mut pMbCache.sCoeffLevel[256..],
-        &pMbCache.SPicData.mb_cursor_ro(encView, 1),
-        &RecCursor::over_owned(&mut pMbCache.sMemPredMb, kiBestPredOff, 8),
+        cEncCb,
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff, 8),
     );
     dct(
         &mut pMbCache.sCoeffLevel[320..],
-        &pMbCache.SPicData.mb_cursor_ro(encView, 2),
-        &RecCursor::over_owned(&mut pMbCache.sMemPredMb, kiBestPredOff + 64, 8),
+        cEncCr,
+        &PlaneCursor::new(&pMbCache.sMemPredMb, kiBestPredOff + 64, 8),
     );
 
     // `svc_encode_slice.cpp:WelsPMbChromaEncode` quantises both chroma planes here.
@@ -1534,38 +1692,22 @@ pub fn WelsPMbChromaEncode(pEncCtx: &sWelsEncCtx, pSlice: &mut SSlice, pCurMb: &
     crate::encoder::svc_encode_mb::WelsEncRecUV(pFunc, pCurMb, &mut *pMbCache, 320, 2);
 }
 
+#[inline]
 pub fn OutputPMbWithoutConstructCsRsNoCopy(
-    _pCtx: &sWelsEncCtx,
-    pDq: Option<&SDqLayer>,
     pSlice: &mut SSlice,
     pMb: &SMB,
+    rec: &mut RecPicBand<'_>,
 ) {
-    let Some(pDq) = pDq else {
-        return;
-    };
     let mb_type = pMb.uiMbType;
     //intra have been reconstructed, NO COPY from CS to pDecPic--
     if (IS_INTER(mb_type) && !IS_SKIP(mb_type)) || IS_I_BL(mb_type) {
-        let pMbCache = &mut pSlice.sMbCacheInfo;
-        // The in-place family: `pRec` is `pPred` at all three of these sites. The
-        // view carries the strides, both stamped by `WelsInitCurrentLayer` from one
-        // `SPicture::stride(i)`.
-        let view = layer_rec_view_expect(pDq);
-        let (lx, ly) = pMbCache.SPicData.luma_origin();
-        let (cx, cy) = pMbCache.SPicData.chroma_origin();
+        let pMbCache = &pSlice.sMbCacheInfo;
+        let (mut cY, mut cCb, mut cCr) =
+            rec.mb_cursors_mut(pMbCache.SPicData.iMbX, pMbCache.SPicData.iMbY);
 
-        idct_t4_rec_on_mb_in_place_view(
-            &view.plane(0).cursor(lx, ly),
-            blk_mb256(&pMbCache.sCoeffLevel, 0),
-        );
-        idct_four_t4_rec_in_place_view(
-            &view.plane(1).cursor(cx, cy),
-            blk_four4x4(&pMbCache.sCoeffLevel, 256),
-        );
-        idct_four_t4_rec_in_place_view(
-            &view.plane(2).cursor(cx, cy),
-            blk_four4x4(&pMbCache.sCoeffLevel, 320),
-        );
+        idct_t4_rec_on_mb_in_place(&mut cY, blk_mb256(&pMbCache.sCoeffLevel, 0));
+        idct_four_t4_rec_in_place(&mut cCb, blk_four4x4(&pMbCache.sCoeffLevel, 256));
+        idct_four_t4_rec_in_place(&mut cCr, blk_four4x4(&pMbCache.sCoeffLevel, 320));
     }
 }
 
@@ -1579,6 +1721,7 @@ pub fn UpdateQpForOverflow(pCurMb: &mut SMB, kuiChromaQpIndexOffset: u8) {
 // Macroblock Search & Traversal Loops
 // ============================================================================
 
+#[inline]
 pub fn WelsGetNextMbOfSlice(pSliceSeg: &SSliceCtx, kiMbXY: i32) -> i32 {
     if kiMbXY < 0 || kiMbXY >= pSliceSeg.iMbNumInFrame {
         return -1;
@@ -1609,6 +1752,7 @@ pub fn WelsGetNextMbOfSlice(pSliceSeg: &SSliceCtx, kiMbXY: i32) -> i32 {
     }
 }
 
+#[inline]
 pub fn WelsInitInterMDStruc<'a>(
     pCurMb: &SMB,
     pMvdCostTable: MvdCostCursor<'a>,
@@ -1633,6 +1777,7 @@ pub fn WelsISliceMdEnc(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     _pRestoreBuf: Option<&mut [u8]>,
     _pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -1696,6 +1841,7 @@ pub fn WelsISliceMdEnc(
             &mut sMd,
             pSlice,
             pMbs,
+            bands,
             pSliceBsBuf,
             pCtxOutBs,
             &mut sDss,
@@ -1708,11 +1854,10 @@ pub fn WelsISliceMdEnc(
 
         pMbs.cur_mut().uiSliceIdc = kiSliceIdx as u16;
 
-        let kpRecView = layer_rec_view_expect(pCurLayer);
         let pMbCache = &mut pSlice.sMbCacheInfo;
         {
             (func_list.pfMdBackgroundInfoUpdate)(
-                kpRecView,
+                &mut bands.rec,
                 pMbs.cur_mut(),
                 pMbCache.bCollocatedPredFlag,
                 I_SLICE,
@@ -1747,6 +1892,7 @@ fn WelsMdWriteIntraMbWithReencoding<const DYNAMIC: bool>(
     sMd: &mut SWelsMD,
     pSlice: &mut SSlice,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     sDss: &mut SDynamicSlicingStack<'_>,
@@ -1758,7 +1904,7 @@ fn WelsMdWriteIntraMbWithReencoding<const DYNAMIC: bool>(
         {
             let pMbCache = &mut pSlice.sMbCacheInfo;
             sMd.iLambda = g_kiQpCostTable[pMbs.cur().uiLumaQp as usize];
-            WelsMdIntraMb(pEncCtx, sMd, pMbs.cur_mut(), &mut *pMbCache);
+            WelsMdIntraMb(pEncCtx, sMd, pMbs.cur_mut(), &mut *pMbCache, bands);
             UpdateNonZeroCountCache(pMbs.cur(), &mut *pMbCache);
         }
 
@@ -1787,6 +1933,7 @@ pub fn WelsISliceMdEncDynamic(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     mut pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -1852,6 +1999,7 @@ pub fn WelsISliceMdEncDynamic(
             &mut sMd,
             pSlice,
             pMbs,
+            bands,
             pSliceBsBuf,
             pCtxOutBs,
             &mut sDss,
@@ -1990,33 +2138,18 @@ fn StashPopMbStatusOfSlice(
     pSlice.uiLastMbQp = sDss.uiLastMbQp;
 }
 
-/// The macroblock's nine plane cursors, once: everything below reads them off
-/// `pMd`. The C++ computes the same nine pointers here, off `kiMbX`/`kiMbY`.
+/// The macroblock's three read-only reference plane cursors and side info, once:
+/// everything below reads them off `pMd`.
 #[inline(always)]
 fn refresh_mb_cursors<'a>(pMd: &mut SWelsMD<'a>, pMbs: &crate::safe::mb_grid::MbWindow<'_, SMB>) {
     if pMd.sctx.is_some() {
-        // The three views and the reference picture's three entries, taken
-        // before either write: the cursors are built straight into `pMd.mbc`
-        // only if nothing borrows `pMd` at the assignment.
-        let (enc, refv, rec, mbi) = {
+        let (ref_pic, mbi) = {
             let sc = pMd.sc();
-            (
-                sc.enc,
-                sc.refv(),
-                sc.rec,
-                // The reference picture's three entries for this macroblock.
-                MbSideInfo::at(sc, pMbs.cur().iMbXY),
-            )
+            (sc.ref_pic(), MbSideInfo::at(sc, pMbs.cur().iMbXY))
         };
         let cur = pMbs.cur();
         pMd.mbi = mbi;
-        pMd.mbc = Some(MbCursors::from_views(
-            enc,
-            refv,
-            rec,
-            cur.iMbX as i32,
-            cur.iMbY as i32,
-        ));
+        pMd.mbc = MbCursors::from_ref_pic(ref_pic, cur.iMbX as i32, cur.iMbY as i32);
     }
 }
 
@@ -2038,12 +2171,12 @@ fn WelsMdWriteMbWithReencoding<'a, const DYNAMIC: bool>(
     pSlice: &mut SSlice,
     pMd: &mut SWelsMD<'a>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     sDss: &mut SDynamicSlicingStack<'_>,
     func_list: &SWelsFuncPtrList,
     _pCurLayer: &SDqLayer,
-    kpRecView: &RecPicView,
     pMvdCostTable: MvdCostCursor<'a>,
     kiMvdInterTableStride: i32,
     kiCtxRefPicType: i32,
@@ -2061,21 +2194,30 @@ fn WelsMdWriteMbWithReencoding<'a, const DYNAMIC: bool>(
                 first = false;
                 let pMbCache = &mut pSlice.sMbCacheInfo;
                 crate::encoder::svc_base_layer_md::WelsMdIntraInit(&mut split, &mut *pMbCache);
-                WelsMdInterInit(pMd.sc(), &pMd.mbi, pEncCtx.iMvRange, pSlice, &mut split);
+                WelsMdInterInit(
+                    pMd.sc(),
+                    &pMd.mbi,
+                    pEncCtx.iMvRange,
+                    pSlice,
+                    &mut split,
+                    &mut bands.rec,
+                );
             }
             WelsInitInterMDStruc(split.cur(), pMvdCostTable, kiMvdInterTableStride, pMd);
             if let Some(func) = func_list.pfInterMd {
-                func(pEncCtx, pMd, &mut *pSlice, &mut split);
+                func(pEncCtx, pMd, &mut *pSlice, &mut split, bands);
             }
             let bCollocatedPredFlag = pSlice.sMbCacheInfo.bCollocatedPredFlag;
 
             //step (4): save from the MD process for future use
             let pCurMb = split.cur_mut();
             crate::encoder::svc_base_layer_md::WelsMdInterSaveSadAndRefMbType(
-                kpRecView, pCurMb, pMd,
+                &mut bands.rec,
+                pCurMb,
+                pMd,
             );
             (func_list.pfMdBackgroundInfoUpdate)(
-                kpRecView,
+                &mut bands.rec,
                 pCurMb,
                 bCollocatedPredFlag,
                 kiCtxRefPicType,
@@ -2121,6 +2263,7 @@ pub fn WelsMdInterMbLoop<'a>(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     _pRestoreBuf: Option<&mut [u8]>,
     _pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2149,8 +2292,6 @@ pub fn WelsMdInterMbLoop<'a>(
     // The function list, once for the slice: the table is written only before the
     // fork.
     let func_list = pEncCtx.func_list();
-    // The reconstruction view, once for the slice.
-    let kpRecView = layer_rec_view_expect(pCurLayer);
 
     let mut sDss = SDynamicSlicingStack::default();
 
@@ -2186,12 +2327,12 @@ pub fn WelsMdInterMbLoop<'a>(
             pSlice,
             pMd,
             pMbs,
+            bands,
             pSliceBsBuf,
             pCtxOutBs,
             &mut sDss,
             func_list,
             pCurLayer,
-            kpRecView,
             pMvdCostTable,
             kiMvdInterTableStride,
             kiCtxRefPicType,
@@ -2205,7 +2346,7 @@ pub fn WelsMdInterMbLoop<'a>(
         {
             let pCurMb = pMbs.cur_mut();
             pCurMb.uiSliceIdc = kiSliceIdx as u16;
-            OutputPMbWithoutConstructCsRsNoCopy(pEncCtx, Some(pCurLayer), pSlice, &*pCurMb);
+            OutputPMbWithoutConstructCsRsNoCopy(pSlice, &*pCurMb, &mut bands.rec);
             func_list.pfRc.WelsRcMbInfoUpdate(
                 pEncCtx,
                 pCurMb,
@@ -2242,6 +2383,7 @@ pub fn WelsMdInterMbLoopOverDynamicSlice<'a>(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     mut pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2268,7 +2410,6 @@ pub fn WelsMdInterMbLoopOverDynamicSlice<'a>(
     // As `WelsMdInterMbLoop`: resolved once for the slice.
     let kiCtxRefPicType = ctx_ref_pic(pEncCtx).map_or(0, |p| p.iPictureType);
     let func_list = pEncCtx.func_list();
-    let kpRecView = layer_rec_view_expect(pCurLayer);
 
     let mut sDss = SDynamicSlicingStack::default();
     if pEncCtx.param().iEntropyCodingModeFlag != 0 {
@@ -2309,12 +2450,12 @@ pub fn WelsMdInterMbLoopOverDynamicSlice<'a>(
             pSlice,
             pMd,
             pMbs,
+            bands,
             pSliceBsBuf,
             pCtxOutBs,
             &mut sDss,
             func_list,
             pCurLayer,
-            kpRecView,
             pMvdCostTable,
             kiMvdInterTableStride,
             kiCtxRefPicType,
@@ -2353,7 +2494,7 @@ pub fn WelsMdInterMbLoopOverDynamicSlice<'a>(
         {
             let pCurMb = pMbs.cur_mut();
             pCurMb.uiSliceIdc = kiSliceIdx as u16;
-            OutputPMbWithoutConstructCsRsNoCopy(pEncCtx, Some(pCurLayer), pSlice, &*pCurMb);
+            OutputPMbWithoutConstructCsRsNoCopy(pSlice, &*pCurMb, &mut bands.rec);
             func_list.pfRc.WelsRcMbInfoUpdate(
                 pEncCtx,
                 pCurMb,
@@ -2391,15 +2532,13 @@ pub fn WelsPSliceMdEnc(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
     let kpShExt = &pSlice.sSliceHeaderExt;
     let kiSliceFirstMbXY = kpShExt.sSliceHeader.iFirstMbInSlice;
-    // The layer's reference views are stamped before the slice fork and borrowed here
-    // through `SWelsMD::sctx` for the duration of the macroblock loop.
-    let sctx = current_layer_ref(pEncCtx)
-        .map(|l| MdSliceCtx::build(pEncCtx, l, l.pRefView.as_ref(), l.pRefOriView.as_ref()));
+    let sctx = current_layer_ref(pEncCtx).map(|l| MdSliceCtx::build(pEncCtx, l));
     // Fully zeroed; every field is assigned before it is read.
     let mut sMd = SWelsMD::default();
     sMd.sctx = sctx.as_ref();
@@ -2416,6 +2555,7 @@ pub fn WelsPSliceMdEnc(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2428,14 +2568,13 @@ pub fn WelsPSliceMdEncDynamic(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
     let kpShExt = &pSlice.sSliceHeaderExt;
     let kiSliceFirstMbXY = kpShExt.sSliceHeader.iFirstMbInSlice;
-    // As `WelsPSliceMdEnc`: the layer's stamped reference views are borrowed for the slice.
-    let sctx = current_layer_ref(pEncCtx)
-        .map(|l| MdSliceCtx::build(pEncCtx, l, l.pRefView.as_ref(), l.pRefOriView.as_ref()));
+    let sctx = current_layer_ref(pEncCtx).map(|l| MdSliceCtx::build(pEncCtx, l));
     let mut sMd = SWelsMD::default();
     sMd.sctx = sctx.as_ref();
     sMd.uiRef = kpShExt.sSliceHeader.uiRefIndex;
@@ -2451,6 +2590,7 @@ pub fn WelsPSliceMdEncDynamic(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2462,6 +2602,7 @@ pub fn WelsCodePSlice(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2483,6 +2624,7 @@ pub fn WelsCodePSlice(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2494,6 +2636,7 @@ pub fn WelsCodePOverDynamicSlice(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2513,6 +2656,7 @@ pub fn WelsCodePOverDynamicSlice(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2524,6 +2668,7 @@ pub fn WelsCodePSlice_c(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2533,6 +2678,7 @@ pub fn WelsCodePSlice_c(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2544,6 +2690,7 @@ pub fn WelsCodePOverDynamicSlice_c(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2553,6 +2700,7 @@ pub fn WelsCodePOverDynamicSlice_c(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2564,6 +2712,7 @@ pub fn WelsISliceMdEnc_c(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2573,6 +2722,7 @@ pub fn WelsISliceMdEnc_c(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2584,6 +2734,7 @@ pub fn WelsISliceMdEncDynamic_c(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2593,6 +2744,7 @@ pub fn WelsISliceMdEncDynamic_c(
         pSliceBsBuf,
         pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     )
@@ -2676,6 +2828,7 @@ pub fn WelsCodeOneSlice(
     pSliceBsBuf: &mut [u8],
     pCtxOutBs: &mut Option<&mut BsWriter>,
     pMbs: &mut crate::safe::mb_grid::MbWindow<'_, SMB>,
+    bands: &mut SlicePicBands<'_>,
     pRestoreBuf: Option<&mut [u8]>,
     pNextSlice: Option<&mut SSlice>,
 ) -> i32 {
@@ -2752,6 +2905,7 @@ pub fn WelsCodeOneSlice(
         &mut *pSliceBsBuf,
         &mut *pCtxOutBs,
         pMbs,
+        bands,
         pRestoreBuf,
         pNextSlice,
     );
@@ -3786,7 +3940,7 @@ mod tests {
     /// Miri, with the second frame inter-coded so the ME/MD/reconstruction paths run.
     /// Every assertion is on frames 0 and 1.
     ///
-    /// Needs `-Zmiri-disable-isolation` for `WelsTime()` (`SystemTime::now()`, the
+    /// Needs `-Zmiri-disable-isolation` for `WelsTime()` (`Instant::now()`, the
     /// library's one clock site, which does not reach the bitstream). Ignored under
     /// Miri on cost: its axes, CABAC over LOW_COMPLEXITY on a single slice, are
     /// covered there by the size-limited and CAVLC probes.
@@ -4171,16 +4325,14 @@ mod tests {
 
     /// `SM_SIZELIMITED_SLICE` at two threads, with a mid-row slice boundary asserted
     /// through `EncodedFrame::first_mbs`. The mode reaches
-    /// `EncodeSizeLimitedSlicesForked`, where the workers are partitions rather than
-    /// slices: `UpdateSlicepEncCtxWithPartition` cuts the 49-macroblock frame in two at
-    /// macroblock 24, which is not a multiple of the 7-macroblock row. The assertion
-    /// fails if the boundaries ever become a row grid, which would make this the
-    /// row-aligned probe twice.
+    /// `EncodeSizeLimitedSlicesForked`, where each worker owns an MB-row-aligned
+    /// partition (`UpdateSlicepEncCtxWithPartition` cuts the 7x7 grid into 4 + 3 rows
+    /// at MB 28) while byte-capped slices *within* a partition still split mid-row.
     ///
     /// 112x112 for `MIN_NUM_MB_PER_SLICE`'s reason (see the probe above), and
     /// `uiSliceSizeConstraint` above `MAX_MACROBLOCK_SIZE_IN_BYTE` because
     /// `SliceArgumentValidation` refuses anything at or below it — 1000 rather than
-    /// 600 so the IDR comes out in nine slices rather than sixteen.
+    /// 600 so the IDR comes out in multiple slices with mid-row splits.
     #[cfg(feature = "c-api")]
     #[test]
     fn fork_join_encodes_a_frame_whose_slice_boundary_is_mid_row() {
@@ -4226,8 +4378,7 @@ mod tests {
         );
 
         // A slice starting at a macroblock that is not the start of a row shares its
-        // first row with the previous slice — the case no `&mut [u8]` over the plane
-        // can express.
+        // first row with the previous slice inside the same worker's MB-row band.
         for f in &frames {
             assert!(
                 f.first_mbs

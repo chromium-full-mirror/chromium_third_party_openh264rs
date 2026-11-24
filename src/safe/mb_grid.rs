@@ -612,6 +612,47 @@ impl<'a, T> MbSplit<'a, T> {
     }
 }
 
+/// A read-only contiguous band of a per-macroblock side array, indexed by global raster
+/// address `mb_xy`.
+///
+/// Built from a worker's carved `&[T]` slice covering `[base .. base + data.len())`, so
+/// reading outside the worker's own band panics immediately.
+#[derive(Clone, Copy, Debug)]
+pub struct MbSlice<'a, T> {
+    data: &'a [T],
+    base: usize,
+}
+
+impl<'a, T: Copy> MbSlice<'a, T> {
+    /// Wraps `data`, whose element 0 corresponds to global raster address `base`.
+    #[inline(always)]
+    pub const fn new(data: &'a [T], base: usize) -> Self {
+        Self { data, base }
+    }
+
+    /// An empty slice covering no macroblocks.
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self { data: &[], base: 0 }
+    }
+
+    /// Entry at global raster address `mb_xy`.
+    #[inline(always)]
+    pub fn get(&self, mb_xy: usize) -> T {
+        self.data[mb_xy - self.base]
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 /// Reference lists per macroblock — the decoder's `LIST_A`.
 ///
 /// Declared here rather than imported so this module keeps depending on nothing;

@@ -2056,39 +2056,30 @@ mod tests {
 
     /// Every shape the codec calls motion compensation with reaches a const
     /// instantiation, and none falls through to a run-time-shape kernel. Drives every
-    /// entry of the shape tables at the head of this module over both operand
-    /// storages: the plane cursor the decoder hands the kernels and the shared cell
-    /// view the encoder does.
+    /// entry of the shape tables at the head of this module.
     #[test]
     fn mc_shapes_all_reach_a_const_arm() {
         let base = filled_plane();
-        let mut cells = filled_plane();
         let mut dst = vec![0u8; STRIDE * ROWS];
         let (src_c, dst_c) = (10 * STRIDE + 10, 20 * STRIDE + 10);
 
         let fallbacks = runtime_shapes_during(|| {
             let src = PlaneCursor::new(&base, src_c, STRIDE);
-            let rec = crate::encoder::rec_view::RecCursor::over_owned(&mut cells, src_c, STRIDE);
-            // Both operand storages, at each shape; a closure cannot stand in for
-            // the source because the kernels are generic over it.
-            macro_rules! both {
+            macro_rules! run {
                 ($call:ident $(, $arg:expr)*) => {{
                     kernels::mc::$call(&src, &mut PlaneCursorMut::new(&mut dst, dst_c, STRIDE) $(, $arg)*);
-                    kernels::mc::$call(&rec, &mut PlaneCursorMut::new(&mut dst, dst_c, STRIDE) $(, $arg)*);
                 }};
             }
             for &(w, h) in SHAPES_LUMA.iter().chain(SHAPES_REFINE_HOR.iter()) {
-                both!(mc_hor_ver20, w, h);
+                run!(mc_hor_ver20, w, h);
             }
             for &(w, h) in SHAPES_LUMA.iter().chain(SHAPES_REFINE_VER.iter()) {
-                both!(mc_hor_ver02, w, h);
+                run!(mc_hor_ver02, w, h);
             }
             for &(w, h) in SHAPES_LUMA.iter().chain(SHAPES_REFINE_CEN.iter()) {
-                both!(mc_hor_ver22, w, h);
+                run!(mc_hor_ver22, w, h);
             }
             for &(w, h) in SHAPES_LUMA.iter() {
-                // `pixel_avg`'s two operands are a scratch plane and either another
-                // scratch plane or the reference, so both storages appear as `b`.
                 let a = PlaneCursor::new(&base, src_c, STRIDE);
                 kernels::mc::pixel_avg(
                     &mut PlaneCursorMut::new(&mut dst, dst_c, STRIDE),
@@ -2097,22 +2088,15 @@ mod tests {
                     w,
                     h,
                 );
-                kernels::mc::pixel_avg(
-                    &mut PlaneCursorMut::new(&mut dst, dst_c, STRIDE),
-                    &a,
-                    &rec,
-                    w,
-                    h,
-                );
                 for qy in 0..4i16 {
                     for qx in 0..4i16 {
-                        both!(mc_luma, qx, qy, w, h);
+                        run!(mc_luma, qx, qy, w, h);
                     }
                 }
             }
             for &(w, h) in SHAPES_CHROMA.iter() {
                 for (mx, my) in [(0i16, 0i16), (3, 5)] {
-                    both!(mc_chroma, mx, my, w, h);
+                    run!(mc_chroma, mx, my, w, h);
                 }
             }
         });

@@ -9,9 +9,8 @@
 
 use super::lanes::{ld8, ld8_u16, ld16, st8_u16};
 use super::sse2_token;
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::svc_motion_estimate;
-use crate::safe::plane::{BlockRows, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursor, RefSamples};
 use crate::simd::{
     simd_entry,
     tokens::{Avx2Token, Sse2Token},
@@ -148,12 +147,12 @@ fn sliding_diff8_256(b: __m256i, t: __m256i) -> __m256i {
 
 simd_entry! {
     #[target_feature(enable = "sse2")]
-    fn sum_8x8_single(cRef: &RecCursor<'_>, _token: Sse2Token) -> i32 {
+    fn sum_8x8_single(cRef: &PlaneCursor<'_>, _token: Sse2Token) -> i32 {
         let s = cRef.span::<8, 8>(0, 0);
         let ([q0, q1], st) = s.all_2_quads::<8>();
         let zero = _mm_setzero_si128();
-        let (r0, r1, r2, r3) = <RecCursor<'_> as RefSamples>::Span::read_quad::<8>(q0, st);
-        let (r4, r5, r6, r7) = <RecCursor<'_> as RefSamples>::Span::read_quad::<8>(q1, st);
+        let (r0, r1, r2, r3) = <PlaneCursor<'_> as RefSamples>::Span::read_quad::<8>(q0, st);
+        let (r4, r5, r6, r7) = <PlaneCursor<'_> as RefSamples>::Span::read_quad::<8>(q1, st);
         let mut acc = _mm_sad_epu8(ld8(&r0), zero);
         acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&r1), zero));
         acc = _mm_add_epi64(acc, _mm_sad_epu8(ld8(&r2), zero));
@@ -166,13 +165,13 @@ simd_entry! {
     }
 
     #[target_feature(enable = "sse2")]
-    fn sum_16x16_single(cRef: &RecCursor<'_>, _token: Sse2Token) -> i32 {
+    fn sum_16x16_single(cRef: &PlaneCursor<'_>, _token: Sse2Token) -> i32 {
         let s = cRef.span::<16, 16>(0, 0);
         let (qs, st) = s.all_4_quads::<16>();
         let zero = _mm_setzero_si128();
         let mut acc = _mm_setzero_si128();
         for q in qs {
-            let (r0, r1, r2, r3) = <RecCursor<'_> as RefSamples>::Span::read_quad::<16>(q, st);
+            let (r0, r1, r2, r3) = <PlaneCursor<'_> as RefSamples>::Span::read_quad::<16>(q, st);
             acc = _mm_add_epi64(acc, _mm_sad_epu8(ld16(&r0), zero));
             acc = _mm_add_epi64(acc, _mm_sad_epu8(ld16(&r1), zero));
             acc = _mm_add_epi64(acc, _mm_sad_epu8(ld16(&r2), zero));
@@ -183,13 +182,13 @@ simd_entry! {
     }
 
     #[target_feature(enable = "avx2")]
-    fn sum_16x16_single_avx2(cRef: &RecCursor<'_>, _token: Avx2Token) -> i32 {
+    fn sum_16x16_single_avx2(cRef: &PlaneCursor<'_>, _token: Avx2Token) -> i32 {
         let s = cRef.span::<16, 16>(0, 0);
         let (qs, st) = s.all_4_quads::<16>();
         let zero = _mm256_setzero_si256();
         let mut acc = _mm256_setzero_si256();
         for q in qs {
-            let (r0, r1, r2, r3) = <RecCursor<'_> as RefSamples>::Span::read_quad::<16>(q, st);
+            let (r0, r1, r2, r3) = <PlaneCursor<'_> as RefSamples>::Span::read_quad::<16>(q, st);
             let v0 = _mm256_set_m128i(ld16(&r1), ld16(&r0));
             let v1 = _mm256_set_m128i(ld16(&r3), ld16(&r2));
             acc = _mm256_add_epi64(acc, _mm256_sad_epu8(v0, zero));
@@ -773,7 +772,7 @@ simd_entry! {
 
 #[cold]
 #[inline(never)]
-fn sum_of_16x16_single_block_fallback(cRef: &RecCursor<'_>) -> i32 {
+fn sum_of_16x16_single_block_fallback(cRef: &PlaneCursor<'_>) -> i32 {
     if let Some(avx2) = Avx2Token::try_new_enabled() {
         return sum_16x16_single_avx2(cRef, avx2);
     }
@@ -845,12 +844,12 @@ fn sum_of_16x16_block_of_frame_fallback(
 }
 
 #[inline]
-pub fn sum_of_8x8_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_8x8_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     sum_8x8_single(cRef, sse2_token())
 }
 
 #[inline]
-pub fn sum_of_16x16_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_16x16_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     if let Some(avx2) = Avx2Token::try_fast_enabled() {
         return sum_16x16_single_avx2(cRef, avx2);
     }
@@ -943,7 +942,7 @@ fn sea_lanes04(v: __m128i) -> __m128i {
 
 simd_entry! {
     #[target_feature(enable = "sse2")]
-    fn sea_rows16(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
+    fn sea_rows16(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
         let rows = a0.len();
         let a1 = &mut a1[..rows];
         let z = _mm_setzero_si128();
@@ -968,7 +967,7 @@ simd_entry! {
     }
 
     #[target_feature(enable = "sse2")]
-    fn sea_rows8(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
+    fn sea_rows8(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: Sse2Token) {
         let rows = a0.len();
         let a1 = &mut a1[..rows];
         let z = _mm_setzero_si128();
@@ -995,7 +994,7 @@ simd_entry! {
     /// A ragged tail overlaps the previous chunk rather than reading past the end.
     #[target_feature(enable = "sse2")]
     fn sea_cols<const N: usize>(
-        c: &RecCursor<'_>,
+        c: &PlaneCursor<'_>,
         a0: &mut [u16],
         a1: &mut [u16],
         _token: Sse2Token,
@@ -1085,7 +1084,7 @@ simd_entry! {
 }
 
 #[inline]
-pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_row_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     match N {
         16 => sea_rows16(c, a0, a1, sse2_token()),
         8 => sea_rows8(c, a0, a1, sse2_token()),
@@ -1094,7 +1093,7 @@ pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: 
 }
 
 #[inline]
-pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_col_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     sea_cols::<N>(c, a0, a1, sse2_token());
 }
 
@@ -1265,8 +1264,8 @@ mod tests {
             }
         }
 
-        let mut all_ff = vec![255u8; 32 * 32];
-        let cursor_ff = RecCursor::over_owned(&mut all_ff, 0, 32);
+        let all_ff = vec![255u8; 32 * 32];
+        let cursor_ff = PlaneCursor::new(&all_ff, 0, 32);
         assert_eq!(sum_of_8x8_single_block(&cursor_ff), 64 * 255);
         assert_eq!(
             sum_of_8x8_single_block(&cursor_ff),

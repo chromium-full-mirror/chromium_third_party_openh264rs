@@ -26,7 +26,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 //! Encoder core context and state machine.
 //!
 //! C++: `codec/encoder/core/inc/encoder_context.h`, `codec/encoder/core/src/encoder.cpp`.
@@ -178,50 +178,44 @@ impl SPicData {
         ((self.iMbX + self.iMbY * stride) as isize) << shift
     }
 
-    /// The macroblock cursor, taken from a picture view.
-    ///
-    /// Hands back a [`RecCursor`](crate::encoder::rec_view::RecCursor), not a
-    /// `PlaneCursor`: the source picture is written in-fork by
-    /// `VaaBackgroundMbDataUpdate`, so its planes live behind the shared seam and no
-    /// `&[u8]` may span them.
-    #[inline]
-    pub fn mb_cursor_ro<'a>(
+    /// Read cursor anchored at this macroblock in the source picture band.
+    #[inline(always)]
+    pub fn mb_cursor_enc<'a>(
         &self,
-        view: &'a crate::encoder::rec_view::RoPicView,
+        enc: &'a crate::encoder::picture::EncPicBand<'_>,
         plane: usize,
-    ) -> crate::encoder::rec_view::RecCursor<'a> {
-        let (x, y) = if plane == 0 {
-            self.luma_origin()
-        } else {
-            self.chroma_origin()
-        };
-        view.plane(plane).cursor(x, y)
+    ) -> crate::safe::plane::PlaneCursor<'a> {
+        enc.mb_cursor(plane, self.iMbX, self.iMbY)
     }
 
-    /// The macroblock cursor over the reconstruction view — the write half's counterpart
-    /// to [`mb_cursor_ro`](Self::mb_cursor_ro).
-    #[inline]
+    /// Read cursor anchored at this macroblock in the reconstruction picture band.
+    #[inline(always)]
     pub fn mb_cursor_rec<'a>(
         &self,
-        view: &'a RecPicView,
+        rec: &'a crate::encoder::picture::RecPicBand<'_>,
         plane: usize,
-    ) -> crate::encoder::rec_view::RecCursor<'a> {
-        let (x, y) = if plane == 0 {
-            self.luma_origin()
-        } else {
-            self.chroma_origin()
-        };
-        view.plane(plane).cursor(x, y)
+    ) -> crate::safe::plane::PlaneCursor<'a> {
+        rec.mb_cursor(plane, self.iMbX, self.iMbY)
+    }
+
+    /// Write cursor anchored at this macroblock in the reconstruction picture band.
+    #[inline(always)]
+    pub fn mb_cursor_rec_mut<'a>(
+        &self,
+        rec: &'a mut crate::encoder::picture::RecPicBand<'_>,
+        plane: usize,
+    ) -> crate::safe::plane::PlaneCursorMut<'a> {
+        rec.mb_cursor_mut(plane, self.iMbX, self.iMbY)
     }
 
     /// The macroblock's origin in luma samples — `(iMbX << 4, iMbY << 4)`.
-    #[inline]
+    #[inline(always)]
     pub fn luma_origin(&self) -> (isize, isize) {
         ((self.iMbX as isize) << 4, (self.iMbY as isize) << 4)
     }
 
     /// The macroblock's origin in chroma samples — `(iMbX << 3, iMbY << 3)`.
-    #[inline]
+    #[inline(always)]
     pub fn chroma_origin(&self) -> (isize, isize) {
         ((self.iMbX as isize) << 3, (self.iMbY as isize) << 3)
     }
@@ -2328,7 +2322,6 @@ use crate::encoder::deblocking::DeblockingInit;
 use crate::encoder::decode_mb_aux::WelsInitReconstructionFuncs;
 use crate::encoder::encode_mb_aux::WelsInitEncodingFuncs;
 use crate::encoder::md::{InitFillNeighborCacheInterFunc, InitIntraAnalysisVaaInfo};
-use crate::encoder::rec_view::RecPicView;
 use crate::encoder::sample::WelsInitSampleSadFunc;
 use crate::encoder::svc_encode_slice::{LayerIdx, ctx_sps_ref};
 use crate::encoder::svc_mode_decision::WelsInitSCDPskipFunc;
@@ -2337,23 +2330,13 @@ use crate::encoder::svc_set_mb_syn_cavlc::CavlcParamCal_c;
 use crate::encoder::vlc_encoder::BsWriter;
 
 #[cfg(test)]
-mod with_vpp_provenance {
+mod with_vpp_tests {
     use super::*;
     use crate::encoder::picture::{SPicture, SrcPicPool};
-    use crate::encoder::rec_view::RoPicView;
     use crate::encoder::wels_preprocess::CWelsPreProcess;
 
-    /// [`with_vpp`] moves the preprocessor's `Box` out of the context and stores it back.
-    /// `SDqLayer::pEncView` is an `RoPicView` built off a picture in the pool; its captured
-    /// pointers are `root_ptr_shared()` into each plane's `buf: Vec<u8>`, and a `Vec`'s
-    /// buffer is a separate allocation, so retagging the `CWelsPreProcess` block does not
-    /// touch those stacks.
-    ///
-    /// The frame's ordering in miniature: stamp the view, run `with_vpp`, read through the
-    /// view.
     #[test]
-    #[allow(unsafe_code)]
-    fn with_vpp_does_not_pop_a_view_built_off_the_spatial_pool() {
+    fn with_vpp_preserves_spatial_pool_and_restores_box() {
         let mut ctx = sWelsEncCtx::new();
         let mut vpp = CWelsPreProcess::default();
 
@@ -2363,8 +2346,6 @@ mod with_vpp_provenance {
         vpp.m_pSpatialPicPool = SrcPicPool::new(vec![pic]);
         ctx.pVpp = Some(Box::new(vpp));
 
-        // `WelsInitCurrentLayer`'s stamp, in miniature: a read-only view of a pooled source
-        // picture, held past the call below as the layer holds it for the frame.
         let id = ctx
             .pVpp
             .as_ref()
@@ -2373,36 +2354,17 @@ mod with_vpp_provenance {
             .ids()
             .next()
             .expect("one slot");
-        // SAFETY: `pic` inside `m_pSpatialPicPool` stays alive and unaliased for the
-        // duration of this test.
-        let view = unsafe {
-            RoPicView::build(
-                ctx.pVpp
-                    .as_mut()
-                    .expect("just installed")
-                    .m_pSpatialPicPool
-                    .get_mut(id),
-            )
-        };
 
-        // The take-and-restore. If this retag popped the view's captured pointers, the
-        // reads below are through a dead tag.
         with_vpp(&mut ctx, |pVpp, _pCtx| {
-            assert!(
-                !pVpp.m_pSpatialPicPool.ids().next().is_none(),
-                "the pool survives the move"
-            );
+            let p = pVpp.m_pSpatialPicPool.get(id);
+            assert_eq!(p.plane(0).at(0, 0), 0x5A);
+            assert_eq!(p.plane(0).at(3, 2), 0xC3);
         });
 
-        assert_eq!(
-            view.plane(0).at(0, 0),
-            0x5A,
-            "the view still reads its own plane"
-        );
-        assert_eq!(view.plane(0).at(3, 2), 0xC3);
-
-        // The slot is restored, which the closure form guarantees on every path.
         assert!(ctx.pVpp.is_some(), "with_vpp restores the box");
+        let p = ctx_vpp_ref(&ctx).m_pSpatialPicPool.get(id);
+        assert_eq!(p.plane(0).at(0, 0), 0x5A);
+        assert_eq!(p.plane(0).at(3, 2), 0xC3);
     }
 
     #[test]

@@ -13,9 +13,8 @@ use core::arch::aarch64::*;
 
 use super::lanes::{ld8, ld8_u16, ld16, st8_u16};
 use super::neon_token;
-use crate::encoder::rec_view::RecCursor;
 use crate::encoder::svc_motion_estimate;
-use crate::safe::plane::{BlockRows, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursor, RefSamples};
 use crate::simd::{simd_entry, tokens::NeonToken};
 
 #[inline]
@@ -49,7 +48,7 @@ fn sliding_diff8(bot16: &[u8], top16: &[u8]) -> uint16x8_t {
 
 simd_entry! {
     #[target_feature(enable = "neon")]
-    fn sum_8x8_single(cRef: &RecCursor<'_>, _token: NeonToken) -> i32 {
+    fn sum_8x8_single(cRef: &PlaneCursor<'_>, _token: NeonToken) -> i32 {
         let s = cRef.span::<8, 8>(0, 0);
         let mut acc = vaddl_u8(ld8(&s.row::<8>(0, 0)), ld8(&s.row::<8>(1, 0)));
         acc = vaddw_u8(acc, ld8(&s.row::<8>(2, 0)));
@@ -62,7 +61,7 @@ simd_entry! {
     }
 
     #[target_feature(enable = "neon")]
-    fn sum_16x16_single(cRef: &RecCursor<'_>, _token: NeonToken) -> i32 {
+    fn sum_16x16_single(cRef: &PlaneCursor<'_>, _token: NeonToken) -> i32 {
         let s = cRef.span::<16, 16>(0, 0);
         let mut acc0 = vpaddlq_u8(ld16(&s.row::<16>(0, 0)));
         let mut acc1 = vpaddlq_u8(ld16(&s.row::<16>(1, 0)));
@@ -269,12 +268,12 @@ simd_entry! {
 }
 
 #[inline]
-pub fn sum_of_8x8_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_8x8_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     sum_8x8_single(cRef, neon_token())
 }
 
 #[inline]
-pub fn sum_of_16x16_single_block(cRef: &RecCursor<'_>) -> i32 {
+pub fn sum_of_16x16_single_block(cRef: &PlaneCursor<'_>) -> i32 {
     sum_16x16_single(cRef, neon_token())
 }
 
@@ -322,7 +321,7 @@ pub fn sum_of_16x16_block_of_frame(
 
 simd_entry! {
     #[target_feature(enable = "neon")]
-    fn sea_rows16(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
+    fn sea_rows16(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
         let rows = a0.len();
         let a1 = &mut a1[..rows];
         let mut r = 0usize;
@@ -349,7 +348,7 @@ simd_entry! {
     }
 
     #[target_feature(enable = "neon")]
-    fn sea_rows8(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
+    fn sea_rows8(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16], _token: NeonToken) {
         let rows = a0.len();
         let a1 = &mut a1[..rows];
         let mut r = 0usize;
@@ -376,7 +375,7 @@ simd_entry! {
     /// A ragged tail overlaps the previous chunk rather than reading past the end.
     #[target_feature(enable = "neon")]
     fn sea_cols<const N: usize>(
-        c: &RecCursor<'_>,
+        c: &PlaneCursor<'_>,
         a0: &mut [u16],
         a1: &mut [u16],
         _token: NeonToken,
@@ -465,7 +464,7 @@ simd_entry! {
 }
 
 #[inline]
-pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_row_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     match N {
         16 => sea_rows16(c, a0, a1, neon_token()),
         8 => sea_rows8(c, a0, a1, neon_token()),
@@ -474,7 +473,7 @@ pub fn sea_row_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: 
 }
 
 #[inline]
-pub fn sea_col_half_sums<const N: usize>(c: &RecCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
+pub fn sea_col_half_sums<const N: usize>(c: &PlaneCursor<'_>, a0: &mut [u16], a1: &mut [u16]) {
     sea_cols::<N>(c, a0, a1, neon_token());
 }
 
@@ -567,8 +566,8 @@ mod tests {
         }
 
         // All-255 and all-0 single block & frame saturation tests (max sum 16320 / 65280)
-        let mut all_ff = vec![255u8; 32 * 32];
-        let cursor_ff = RecCursor::over_owned(&mut all_ff, 0, 32);
+        let all_ff = vec![255u8; 32 * 32];
+        let cursor_ff = PlaneCursor::new(&all_ff, 0, 32);
         assert_eq!(sum_of_8x8_single_block(&cursor_ff), 64 * 255);
         assert_eq!(
             sum_of_8x8_single_block(&cursor_ff),

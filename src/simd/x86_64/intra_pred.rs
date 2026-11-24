@@ -20,8 +20,7 @@ use core::arch::x86_64::*;
 
 use super::lanes::{ld8, ld16, st16, st32, to8, to16};
 use super::{sse2_token, ssse3_token};
-use crate::encoder::rec_view::RecCursor;
-use crate::safe::plane::{BlockRows, PlaneCursorMut, RefSamples};
+use crate::safe::plane::{BlockRows, PlaneCursor, PlaneCursorMut, RefSamples};
 use crate::simd::{
     simd_entry,
     tokens::{Avx2Token, Sse2Token, Ssse3Token},
@@ -36,7 +35,7 @@ use crate::simd::{
 // ============================================================================
 
 /// Where a predictor's rows go. The `enc_`/`dec_` pairs share their neighbour reads
-/// (`RefSamples::at` and `row_n`, which `RecCursor` and `PlaneCursorMut` both
+/// (`RefSamples::at` and `row_n`, which `PlaneCursor` and `PlaneCursorMut` both
 /// implement) and every line of arithmetic; they differ only at the store — the
 /// encoder fills a packed candidate buffer at a fixed pitch, the decoder writes back
 /// through the same cursor it read from.
@@ -282,7 +281,7 @@ fn pred_h<const N: usize, S: RefSamples, O: PredOut>(src: &S, out: &mut O, rows:
 
 /// Vertical 16x16 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i16x16_luma_pred_v(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_v(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     pred_v::<16, _, _>(rec, &mut Packed::<16>(pred), 16)
 }
 
@@ -295,7 +294,7 @@ pub fn dec_i16x16_luma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 
 /// Horizontal 16x16 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i16x16_luma_pred_h(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_h(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     pred_h::<16, _, _>(rec, &mut Packed::<16>(pred), 16)
 }
 
@@ -310,7 +309,7 @@ pub fn dec_i16x16_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 
 /// DC 16x16 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i16x16_luma_pred_dc(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_dc(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     let mean = i16x16_dc_mean::<_, true, true>(rec, sse2_token());
     fill_rows(&mut Packed::<16>(pred), 16, &[mean; 16])
 }
@@ -344,7 +343,7 @@ pub fn dec_i16x16_luma_pred_dc_na(pred: &mut PlaneCursorMut<'_>) {
 
 /// Plane 16x16 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i16x16_luma_pred_plane(pred: &mut [u8; 256], rec: &RecCursor<'_>) {
+pub fn enc_i16x16_luma_pred_plane(pred: &mut [u8; 256], rec: &PlaneCursor<'_>) {
     let (top_shift, left_shift, lt_shift) = i16x16_plane_coeffs(rec);
     i16x16_plane_fill(
         &mut Packed::<16>(pred),
@@ -368,7 +367,7 @@ pub fn dec_i16x16_luma_pred_plane(pred: &mut PlaneCursorMut<'_>) {
 
 /// Vertical Chroma 8x8 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_chroma_pred_v(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_v(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     pred_v::<8, _, _>(rec, &mut Packed::<8>(pred), 8)
 }
 
@@ -381,7 +380,7 @@ pub fn dec_chroma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 
 /// Horizontal Chroma 8x8 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_chroma_pred_h(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_h(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     pred_h::<8, _, _>(rec, &mut Packed::<8>(pred), 8)
 }
 
@@ -396,7 +395,7 @@ pub fn dec_chroma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 
 /// DC Chroma 8x8 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_dc(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     let (top, bot) = chroma_dc_rows(rec);
     let out = &mut Packed::<8>(pred);
     for dy in 0..4 {
@@ -450,7 +449,7 @@ pub fn dec_chroma_pred_dc_top(pred: &mut PlaneCursorMut<'_>) {
 
 /// Plane Chroma 8x8 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_chroma_pred_plane(pred: &mut [u8; 64], rec: &RecCursor<'_>) {
+pub fn enc_chroma_pred_plane(pred: &mut [u8; 64], rec: &PlaneCursor<'_>) {
     let (top_shift, left_shift, lt_shift) = chroma_plane_coeffs(rec);
     chroma_plane_fill(
         &mut Packed::<8>(pred),
@@ -497,7 +496,7 @@ simd_entry! {
 
 /// Vertical 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_v(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_v(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     let top = rec.row_n::<4>(-1, 0);
     i4x4_v(pred, top, sse2_token());
 }
@@ -515,7 +514,7 @@ pub fn dec_i4x4_luma_pred_v(pred: &mut PlaneCursorMut<'_>) {
 
 /// Horizontal 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_h(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_h(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     let l0 = rec.at(-1, 0) as i8;
     let l1 = rec.at(-1, 1) as i8;
     let l2 = rec.at(-1, 2) as i8;
@@ -535,7 +534,7 @@ pub fn dec_i4x4_luma_pred_h(pred: &mut PlaneCursorMut<'_>) {
 
 /// DC 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_dc(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_dc(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     let top = rec.row_n::<4>(-1, 0);
     let mut sum = 4i32;
     for y in 0..4 {
@@ -746,7 +745,7 @@ simd_entry! {
 
 /// Diagonal Down-Left (DDL) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_ddl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_ddl(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_ddl(rec, sse2_token());
 }
 
@@ -759,7 +758,7 @@ pub fn dec_i4x4_luma_pred_ddl(pred: &mut PlaneCursorMut<'_>) {
 
 /// Diagonal Down-Right (DDR) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_ddr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_ddr(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_ddr(rec, sse2_token());
 }
 
@@ -772,7 +771,7 @@ pub fn dec_i4x4_luma_pred_ddr(pred: &mut PlaneCursorMut<'_>) {
 
 /// Vertical Right (VR) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_vr(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_vr(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_vr(rec, sse2_token());
 }
 
@@ -785,7 +784,7 @@ pub fn dec_i4x4_luma_pred_vr(pred: &mut PlaneCursorMut<'_>) {
 
 /// Horizontal Down (HD) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_hd(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_hd(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_hd(rec, sse2_token());
 }
 
@@ -798,7 +797,7 @@ pub fn dec_i4x4_luma_pred_hd(pred: &mut PlaneCursorMut<'_>) {
 
 /// Vertical Left (VL) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_vl(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_vl(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_vl(rec, sse2_token());
 }
 
@@ -811,7 +810,7 @@ pub fn dec_i4x4_luma_pred_vl(pred: &mut PlaneCursorMut<'_>) {
 
 /// Horizontal Up (HU) 4x4 predictor for packed candidate buffer (encoder).
 #[inline]
-pub fn enc_i4x4_luma_pred_hu(pred: &mut [u8; 16], rec: &RecCursor<'_>) {
+pub fn enc_i4x4_luma_pred_hu(pred: &mut [u8; 16], rec: &PlaneCursor<'_>) {
     *pred = i4x4_hu(rec, sse2_token());
 }
 
@@ -836,8 +835,8 @@ fn reduce256(acc: __m256i) -> i32 {
 #[inline(never)]
 fn combined3_sad_narrow(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     let mut pred_v = [0u8; 256];
@@ -847,15 +846,15 @@ fn combined3_sad_narrow(
     crate::encoder::get_intra_predictor::WelsI16x16LumaPredH_c(&mut pred_h, rec);
     crate::encoder::get_intra_predictor::WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
     let sad_v = crate::common::sad_common::sample_sad::<16, 16, _>(
-        &RecCursor::over_owned(&mut pred_v, 0, 16),
+        &PlaneCursor::new(&pred_v, 0, 16),
         enc,
     );
     let sad_h = crate::common::sad_common::sample_sad::<16, 16, _>(
-        &RecCursor::over_owned(&mut pred_h, 0, 16),
+        &PlaneCursor::new(&pred_h, 0, 16),
         enc,
     );
     let sad_dc = crate::common::sad_common::sample_sad::<16, 16, _>(
-        &RecCursor::over_owned(&mut pred_dc, 0, 16),
+        &PlaneCursor::new(&pred_dc, 0, 16),
         enc,
     );
     let cost_v = sad_v + lambda;
@@ -877,8 +876,8 @@ simd_entry! {
     #[target_feature(enable = "avx2")]
     fn intra_16x16_combined3_sad_avx2(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
         _token: Avx2Token,
     ) -> (u8, i32) {
@@ -978,8 +977,8 @@ simd_entry! {
     #[target_feature(enable = "sse2")]
     fn intra_16x16_combined3_sad_sse2(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
         _token: Sse2Token,
     ) -> (u8, i32) {
@@ -1077,8 +1076,8 @@ simd_entry! {
 #[inline(never)]
 fn intra_16x16_combined3_sad_fallback(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_new_enabled() {
@@ -1097,8 +1096,8 @@ fn intra_16x16_combined3_sad_fallback(
 #[inline(always)]
 pub fn intra_16x16_combined3_sad(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_fast_enabled() {
@@ -1107,7 +1106,7 @@ pub fn intra_16x16_combined3_sad(
     intra_16x16_combined3_sad_fallback(pred, rec, enc, lambda)
 }
 
-type EncSpan<'a> = <RecCursor<'a> as RefSamples>::Span<'a>;
+type EncSpan<'a> = <PlaneCursor<'a> as RefSamples>::Span<'a>;
 
 /// 1D 4-point Hadamard transform scaled by 4 (`<< 2`), returning `(sum, [4*g0, 4*g1, 4*g2, 4*g3])`.
 #[inline(always)]
@@ -1452,8 +1451,8 @@ simd_entry! {
     #[target_feature(enable = "ssse3")]
     fn intra_4x4_combined3_satd_ssse3(
         pred: &mut [u8; 16],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda_dc: i32,
         lambda_h: i32,
         lambda_v: i32,
@@ -1532,8 +1531,8 @@ simd_entry! {
     #[target_feature(enable = "avx2")]
     fn intra_16x16_combined3_satd_avx2(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
         _token: Avx2Token,
     ) -> (u8, i32) {
@@ -1626,8 +1625,8 @@ simd_entry! {
     #[target_feature(enable = "ssse3")]
     fn intra_16x16_combined3_satd_ssse3(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
         _token: Ssse3Token,
     ) -> (u8, i32) {
@@ -1716,10 +1715,10 @@ simd_entry! {
     #[target_feature(enable = "avx2")]
     fn intra_chroma_8x8_combined3_sad_avx2(
         pred_cb_cr: &mut [u8; 128],
-        rec_cb: &RecCursor<'_>,
-        enc_cb: &RecCursor<'_>,
-        rec_cr: &RecCursor<'_>,
-        enc_cr: &RecCursor<'_>,
+        rec_cb: &PlaneCursor<'_>,
+        enc_cb: &PlaneCursor<'_>,
+        rec_cr: &PlaneCursor<'_>,
+        enc_cr: &PlaneCursor<'_>,
         lambda: i32,
         _token: Avx2Token,
     ) -> (u8, i32) {
@@ -1893,10 +1892,10 @@ simd_entry! {
     #[target_feature(enable = "sse2")]
     fn intra_chroma_8x8_combined3_sad_sse2(
         pred_cb_cr: &mut [u8; 128],
-        rec_cb: &RecCursor<'_>,
-        enc_cb: &RecCursor<'_>,
-        rec_cr: &RecCursor<'_>,
-        enc_cr: &RecCursor<'_>,
+        rec_cb: &PlaneCursor<'_>,
+        enc_cb: &PlaneCursor<'_>,
+        rec_cr: &PlaneCursor<'_>,
+        enc_cr: &PlaneCursor<'_>,
         lambda: i32,
         _token: Sse2Token,
     ) -> (u8, i32) {
@@ -2002,10 +2001,10 @@ simd_entry! {
     #[target_feature(enable = "avx2")]
     fn intra_chroma_8x8_combined3_satd_avx2(
         pred_cb_cr: &mut [u8; 128],
-        rec_cb: &RecCursor<'_>,
-        enc_cb: &RecCursor<'_>,
-        rec_cr: &RecCursor<'_>,
-        enc_cr: &RecCursor<'_>,
+        rec_cb: &PlaneCursor<'_>,
+        enc_cb: &PlaneCursor<'_>,
+        rec_cr: &PlaneCursor<'_>,
+        enc_cr: &PlaneCursor<'_>,
         lambda: i32,
         _token: Avx2Token,
     ) -> (u8, i32) {
@@ -2117,10 +2116,10 @@ simd_entry! {
     #[target_feature(enable = "ssse3")]
     fn intra_chroma_8x8_combined3_satd_ssse3(
         pred_cb_cr: &mut [u8; 128],
-        rec_cb: &RecCursor<'_>,
-        enc_cb: &RecCursor<'_>,
-        rec_cr: &RecCursor<'_>,
-        enc_cr: &RecCursor<'_>,
+        rec_cb: &PlaneCursor<'_>,
+        enc_cb: &PlaneCursor<'_>,
+        rec_cr: &PlaneCursor<'_>,
+        enc_cr: &PlaneCursor<'_>,
         lambda: i32,
         _token: Ssse3Token,
     ) -> (u8, i32) {
@@ -2251,8 +2250,8 @@ simd_entry! {
 #[inline(never)]
 fn intra_16x16_combined3_satd_fallback(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_new_enabled() {
@@ -2265,10 +2264,10 @@ fn intra_16x16_combined3_satd_fallback(
 #[inline(never)]
 fn intra_chroma_8x8_combined3_sad_fallback(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_new_enabled() {
@@ -2291,10 +2290,10 @@ fn intra_chroma_8x8_combined3_sad_fallback(
 #[inline(never)]
 fn intra_chroma_8x8_combined3_satd_fallback(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_new_enabled() {
@@ -2320,8 +2319,8 @@ fn intra_chroma_8x8_combined3_satd_fallback(
 #[inline(always)]
 pub fn intra_4x4_combined3_satd(
     pred: &mut [u8; 16],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda_dc: i32,
     lambda_h: i32,
     lambda_v: i32,
@@ -2335,8 +2334,8 @@ pub fn intra_4x4_combined3_satd(
 #[inline(always)]
 pub fn intra_16x16_combined3_satd(
     pred: &mut [u8; 256],
-    rec: &RecCursor<'_>,
-    enc: &RecCursor<'_>,
+    rec: &PlaneCursor<'_>,
+    enc: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_fast_enabled() {
@@ -2349,10 +2348,10 @@ pub fn intra_16x16_combined3_satd(
 #[inline(always)]
 pub fn intra_chroma_8x8_combined3_sad(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_fast_enabled() {
@@ -2369,10 +2368,10 @@ pub fn intra_chroma_8x8_combined3_sad(
 #[inline(always)]
 pub fn intra_chroma_8x8_combined3_satd(
     pred_cb_cr: &mut [u8; 128],
-    rec_cb: &RecCursor<'_>,
-    enc_cb: &RecCursor<'_>,
-    rec_cr: &RecCursor<'_>,
-    enc_cr: &RecCursor<'_>,
+    rec_cb: &PlaneCursor<'_>,
+    enc_cb: &PlaneCursor<'_>,
+    rec_cr: &PlaneCursor<'_>,
+    enc_cr: &PlaneCursor<'_>,
     lambda: i32,
 ) -> (u8, i32) {
     if let Some(token) = Avx2Token::try_fast_enabled() {
@@ -2391,12 +2390,11 @@ pub fn intra_chroma_8x8_combined3_satd(
 mod tests {
     use super::*;
     use crate::encoder::get_intra_predictor::*;
-    use crate::encoder::rec_view::shared_plane_for_test;
     use crate::safe::plane::PaddedPlane;
     fn reference_combined3_sad(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
     ) -> (u8, i32) {
         let mut pred_v = [0u8; 256];
@@ -2407,15 +2405,15 @@ mod tests {
         WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
 
         let sad_v = crate::common::sad_common::sample_sad::<16, 16, _>(
-            &RecCursor::over_owned(&mut pred_v, 0, 16),
+            &PlaneCursor::new(&pred_v, 0, 16),
             enc,
         );
         let sad_h = crate::common::sad_common::sample_sad::<16, 16, _>(
-            &RecCursor::over_owned(&mut pred_h, 0, 16),
+            &PlaneCursor::new(&pred_h, 0, 16),
             enc,
         );
         let sad_dc = crate::common::sad_common::sample_sad::<16, 16, _>(
-            &RecCursor::over_owned(&mut pred_dc, 0, 16),
+            &PlaneCursor::new(&pred_dc, 0, 16),
             enc,
         );
 
@@ -2443,15 +2441,13 @@ mod tests {
     #[test]
     fn test_intra_16x16_combined3_sad_parity() {
         for seed in [13u8, 42, 107, 233] {
-            let mut p_rec = test_plane(32, 32, 16, 64);
+            let p_rec = test_plane(32, 32, 16, 64);
             let mut p_enc = test_plane(32, 32, 16, 64);
             // Perturb top-left sample with test seed.
             p_enc.set(0, 0, seed);
 
-            let v_rec = shared_plane_for_test(&mut p_rec);
-            let v_enc = shared_plane_for_test(&mut p_enc);
-            let rec = v_rec.cursor(0, 0);
-            let enc = v_enc.cursor(0, 0);
+            let rec = p_rec.cursor(0, 0);
+            let enc = p_enc.cursor(0, 0);
 
             for lambda in [0, 5, 10, 50, 100] {
                 let mut pred_simd = [0u8; 256];
@@ -2547,8 +2543,8 @@ mod tests {
 
     fn reference_4x4_combined3_satd(
         pred: &mut [u8; 16],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda_dc: i32,
         lambda_h: i32,
         lambda_v: i32,
@@ -2561,13 +2557,13 @@ mod tests {
         WelsI4x4LumaPredV_c(&mut pred_v, rec);
 
         let cost_dc =
-            crate::encoder::sample::satd_4x4(&RecCursor::over_owned(&mut pred_dc, 0, 4), enc)
+            crate::encoder::sample::satd_4x4(&PlaneCursor::new(&pred_dc, 0, 4), enc)
                 + lambda_dc;
         let cost_h =
-            crate::encoder::sample::satd_4x4(&RecCursor::over_owned(&mut pred_h, 0, 4), enc)
+            crate::encoder::sample::satd_4x4(&PlaneCursor::new(&pred_h, 0, 4), enc)
                 + lambda_h;
         let cost_v =
-            crate::encoder::sample::satd_4x4(&RecCursor::over_owned(&mut pred_v, 0, 4), enc)
+            crate::encoder::sample::satd_4x4(&PlaneCursor::new(&pred_v, 0, 4), enc)
                 + lambda_v;
 
         let mut best_mode = 2i8;
@@ -2588,8 +2584,8 @@ mod tests {
 
     fn reference_16x16_combined3_satd(
         pred: &mut [u8; 256],
-        rec: &RecCursor<'_>,
-        enc: &RecCursor<'_>,
+        rec: &PlaneCursor<'_>,
+        enc: &PlaneCursor<'_>,
         lambda: i32,
     ) -> (u8, i32) {
         let mut pred_v = [0u8; 256];
@@ -2600,13 +2596,13 @@ mod tests {
         WelsI16x16LumaPredDc_c(&mut pred_dc, rec);
 
         let cost_v =
-            crate::encoder::sample::satd_16x16(&RecCursor::over_owned(&mut pred_v, 0, 16), enc)
+            crate::encoder::sample::satd_16x16(&PlaneCursor::new(&pred_v, 0, 16), enc)
                 + lambda;
         let cost_h =
-            crate::encoder::sample::satd_16x16(&RecCursor::over_owned(&mut pred_h, 0, 16), enc)
+            crate::encoder::sample::satd_16x16(&PlaneCursor::new(&pred_h, 0, 16), enc)
                 + lambda * 3;
         let cost_dc =
-            crate::encoder::sample::satd_16x16(&RecCursor::over_owned(&mut pred_dc, 0, 16), enc)
+            crate::encoder::sample::satd_16x16(&PlaneCursor::new(&pred_dc, 0, 16), enc)
                 + lambda * 3;
 
         let mut best_mode = 0u8;
@@ -2627,15 +2623,15 @@ mod tests {
 
     fn reference_chroma_combined3(
         pred_cb_cr: &mut [u8; 128],
-        rec_cb: &RecCursor<'_>,
-        enc_cb: &RecCursor<'_>,
-        rec_cr: &RecCursor<'_>,
-        enc_cr: &RecCursor<'_>,
+        rec_cb: &PlaneCursor<'_>,
+        enc_cb: &PlaneCursor<'_>,
+        rec_cr: &PlaneCursor<'_>,
+        enc_cr: &PlaneCursor<'_>,
         lambda: i32,
         use_satd: bool,
     ) -> (u8, i32) {
-        let cost8x8 = |p: &mut [u8; 64], e: &RecCursor<'_>| -> i32 {
-            let c = RecCursor::over_owned(p, 0, 8);
+        let cost8x8 = |p: &mut [u8; 64], e: &PlaneCursor<'_>| -> i32 {
+            let c = PlaneCursor::new(p, 0, 8);
             if use_satd {
                 crate::encoder::sample::satd_8x8(&c, e)
             } else {
@@ -2686,12 +2682,10 @@ mod tests {
             pairs.push((random_plane(&mut seed), random_plane(&mut seed)));
         }
 
-        for (case_idx, (mut p_rec, mut p_enc)) in pairs.into_iter().enumerate() {
-            let v_rec = shared_plane_for_test(&mut p_rec);
-            let v_enc = shared_plane_for_test(&mut p_enc);
+        for (case_idx, (p_rec, p_enc)) in pairs.into_iter().enumerate() {
             for (ax, ay) in [(0isize, 0isize), (4, 0), (8, 12), (12, 12)] {
-                let rec = v_rec.cursor(ax, ay);
-                let enc = v_enc.cursor(ax, ay);
+                let rec = p_rec.cursor(ax, ay);
+                let enc = p_enc.cursor(ax, ay);
                 for (ldc, lh, lv) in [
                     (0, 0, 0),
                     (4, 16, 16),
@@ -2728,12 +2722,10 @@ mod tests {
             pairs.push((random_plane(&mut seed), random_plane(&mut seed)));
         }
 
-        for (case_idx, (mut p_rec, mut p_enc)) in pairs.into_iter().enumerate() {
-            let v_rec = shared_plane_for_test(&mut p_rec);
-            let v_enc = shared_plane_for_test(&mut p_enc);
+        for (case_idx, (p_rec, p_enc)) in pairs.into_iter().enumerate() {
             for (ax, ay) in [(0isize, 0isize), (16, 0), (0, 16), (8, 8)] {
-                let rec = v_rec.cursor(ax, ay);
-                let enc = v_enc.cursor(ax, ay);
+                let rec = p_rec.cursor(ax, ay);
+                let enc = p_enc.cursor(ax, ay);
                 for lambda in [0, 1, 7, 25, 100] {
                     let mut pred_ref = [0u8; 256];
                     let want = reference_16x16_combined3_satd(&mut pred_ref, &rec, &enc, lambda);
@@ -2807,17 +2799,12 @@ mod tests {
             ));
         }
 
-        for (case_idx, (mut r_cb, mut e_cb, mut r_cr, mut e_cr)) in quads.into_iter().enumerate() {
-            let vr_cb = shared_plane_for_test(&mut r_cb);
-            let ve_cb = shared_plane_for_test(&mut e_cb);
-            let vr_cr = shared_plane_for_test(&mut r_cr);
-            let ve_cr = shared_plane_for_test(&mut e_cr);
-
+        for (case_idx, (r_cb, e_cb, r_cr, e_cr)) in quads.into_iter().enumerate() {
             for (ax, ay) in [(0isize, 0isize), (8, 8), (16, 4)] {
-                let c_rcb = vr_cb.cursor(ax, ay);
-                let c_ecb = ve_cb.cursor(ax, ay);
-                let c_rcr = vr_cr.cursor(ax, ay);
-                let c_ecr = ve_cr.cursor(ax, ay);
+                let c_rcb = r_cb.cursor(ax, ay);
+                let c_ecb = e_cb.cursor(ax, ay);
+                let c_rcr = r_cr.cursor(ax, ay);
+                let c_ecr = e_cr.cursor(ax, ay);
 
                 for lambda in [0, 1, 5, 20, 80] {
                     // SAD
@@ -2921,9 +2908,8 @@ mod tests {
 
     #[test]
     fn test_i16x16_luma_pred_parity() {
-        let mut p = test_plane(32, 32, 16, 64);
-        let view = shared_plane_for_test(&mut p);
-        let rec = view.cursor(0, 0);
+        let p = test_plane(32, 32, 16, 64);
+        let rec = p.cursor(0, 0);
 
         // V
         let mut pred_c = [0u8; 256];
@@ -2956,9 +2942,8 @@ mod tests {
 
     #[test]
     fn test_chroma_pred_parity() {
-        let mut p = test_plane(32, 32, 16, 64);
-        let view = shared_plane_for_test(&mut p);
-        let rec = view.cursor(0, 0);
+        let p = test_plane(32, 32, 16, 64);
+        let rec = p.cursor(0, 0);
 
         // V
         let mut pred_c = [0u8; 64];
@@ -2991,9 +2976,8 @@ mod tests {
 
     #[test]
     fn test_i4x4_luma_pred_parity() {
-        let mut p = test_plane(32, 32, 16, 64);
-        let view = shared_plane_for_test(&mut p);
-        let rec = view.cursor(0, 0);
+        let p = test_plane(32, 32, 16, 64);
+        let rec = p.cursor(0, 0);
 
         // V
         let mut pred_c = [0u8; 16];

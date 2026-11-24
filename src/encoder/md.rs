@@ -137,82 +137,51 @@ pub struct SWelsMD_sMe<'a> {
 }
 
 /// **Everything the P-slice mode decision would otherwise re-resolve per macroblock**,
-/// resolved once for the slice — the layer, the three picture views, the PPS chroma QP
-/// offset and the cost-function slots.
+/// resolved once for the slice — the layer, the read-only reference pictures, the PPS
+/// chroma QP offset and the cost-function slots.
 ///
-/// Built where the slice's layer is known, and **never carried across layers or
-/// frames**: `layer_ref_pic` resolves through the layer's own dependency id, and the
-/// views are the ones stamped for the frame in progress. It is per-worker by
-/// construction — `RecCursor` is not `Send`, so a worker makes its own.
-///
-/// `Copy`: 120 bytes of references, scalars and function pointers, every one of them
-/// loop-invariant.
+/// Mutable reconstruction and source planes are NOT stored here; each worker receives its
+/// own exclusive [`SlicePicBands`](crate::encoder::picture::SlicePicBands) covering its
+/// MB-row band.
 #[derive(Clone, Copy)]
 pub struct MdSliceCtx<'a> {
     /// `current_layer_expect`.
     pub layer: &'a SDqLayer,
     /// `sWelsEncCtx::func_list`.
     pub func: &'a SWelsFuncPtrList,
-    /// `layer_enc_view_expect` — the frame's source planes.
-    pub enc: &'a crate::encoder::rec_view::RoPicView,
-    /// `layer_rec_view_expect` — the reconstruction seam.
-    pub rec: &'a RecPicView,
-    /// `layer_ref_view_expect`, **built once for the slice** and borrowed from the
-    /// caller that owns it. `None` where no reference picture is bound, which on a P
-    /// slice does not happen and on the shared helpers may.
-    pub refv: Option<&'a crate::encoder::rec_view::RoPicView>,
-    /// `pLayer.pRefOri[0]`, built once for the slice when present (`JudgeStaticSkip` /
-    /// `JudgeScrollSkip`).
-    pub ref_ori_v: Option<&'a crate::encoder::rec_view::RoPicView>,
-    /// The reference picture itself — `pRefMbQp`, `uiRefMbType`, `pMbSkipSad`,
-    /// `iPictureType`. `None` exactly where [`refv`](Self::refv) is.
+    /// The reference picture (`pRefPic`) — pixel planes plus `pRefMbQp`, `uiRefMbType`,
+    /// `pMbSkipSad`, `iPictureType`.
     pub ref_pic: Option<&'a SPicture>,
-    /// `sWelsEncCtx::vaa_expect` — the background flags and the two source views.
+    /// `pLayer.pRefOri[0]` when distinct from the current mutable source/rec pictures
+    /// (`JudgeStaticSkip` / `JudgeScrollSkip`).
+    pub ref_ori: Option<&'a SPicture>,
+    /// `sWelsEncCtx::vaa_expect` — the background flags and VAA metadata.
     pub vaa: &'a crate::encoder::wels_preprocess::SVAAFrameInfo,
-    /// `SVAAFrameInfo::pCurView` / `pRefView`, unwrapped here rather than at every
-    /// call: they are `None` together, when background detection is off, and
-    /// `VaaBackgroundMbDataUpdate` is the only reader.
-    pub vaa_cur: Option<&'a crate::encoder::rec_view::RoPicView>,
-    pub vaa_ref: Option<&'a crate::encoder::rec_view::RoPicView>,
+    /// Read-only VAA reference source picture (`vaa.pRefPic`), or `None` when background
+    /// detection is off or aliases the current source picture.
+    pub vaa_ref: Option<&'a SPicture>,
     /// The active PPS's `uiChromaQpIndexOffset`.
     pub chroma_qp_offset: i32,
     /// `ctx_ref_pic(..).map_or(0, |p| p.iPictureType)` — the **context's** reference
     /// picture, resolved through the context's own dependency id, so not
-    /// [`ref_pic`](Self::ref_pic), which is the *layer's*. Held as a value: nothing may
-    /// write the context during a slice, every worker holding it shared.
+    /// [`ref_pic`](Self::ref_pic), which is the *layer's*.
     pub ctx_ref_pic_type: i32,
     pub mb_width: i32,
     pub mb_height: i32,
     /// The cost slots this path calls, unwrapped once. `pfMdCost` is stamped
     /// per frame by `PreprocessSliceCoding`, so the selection is slice-invariant.
-    ///
-    /// **`sad16` stays a slot where `sad8` is a direct call**: the AVX2 arm of
-    /// `WelsInitSampleSadFunc` overwrites `pfSampleSad[16x16]` with
-    /// `sample_sad_16x16_avx2` where the host has AVX2, so that slot is *not* one
-    /// function on every build. Nothing overrides `pfSampleSad[8x8]`.
     pub sad16: PSampleSadSatdCostFunc,
     pub satd16: PSampleSadSatdCostFunc,
     pub md_cost16: PSampleSadSatdCostFunc,
 }
 
-/// The nine plane cursors a macroblock's mode decision reads, **built once per
-/// macroblock** where the C++ computes nine pointers from `kiMbX`/`kiMbY`.
-///
-/// Each field is one `SharedPlane::cursor` call — a raw-parts slice and a
-/// multiply-add — hoisted to the top of the loop.
-///
-/// `Copy` — a `RecCursor` is a slice, an offset and a stride.
+/// The three read-only reference plane cursors for a macroblock, built once per
+/// macroblock from `sc.ref_pic()`.
 #[derive(Clone, Copy)]
 pub struct MbCursors<'a> {
-    pub enc_y: RecCursor<'a>,
-    pub enc_cb: RecCursor<'a>,
-    pub enc_cr: RecCursor<'a>,
-    pub ref_y: RecCursor<'a>,
-    pub ref_cb: RecCursor<'a>,
-    pub ref_cr: RecCursor<'a>,
-    pub rec_y: RecCursor<'a>,
-    pub rec_cb: RecCursor<'a>,
-    pub rec_cr: RecCursor<'a>,
+    pub ref_y: PlaneCursor<'a>,
+    pub ref_cb: PlaneCursor<'a>,
+    pub ref_cr: PlaneCursor<'a>,
 }
 
 /// The reference picture's three per-macroblock entries, **taken once** where
@@ -242,7 +211,7 @@ impl MbSideInfo {
     ///
     /// # Panics
     /// If no reference picture is bound; every P macroblock requires one.
-    #[inline]
+    #[inline(always)]
     pub fn at(sc: &MdSliceCtx<'_>, mb_xy: i32) -> Self {
         let xy = mb_xy as usize;
         let rp = sc.ref_pic();
@@ -256,34 +225,40 @@ impl MbSideInfo {
 }
 
 impl<'a> MdSliceCtx<'a> {
-    /// Resolves the slice's context, once, from the layer the slice belongs to.
-    ///
-    /// `ref_view` is passed in rather than built here: the caller owns the `RoPicView`
-    /// for the slice's whole scope and the context borrows it, which is what makes one
-    /// build serve every macroblock.
+    /// Resolves the slice's read-only context once from the layer the slice belongs to.
     #[inline]
-    pub fn build(
-        pCtx: &'a sWelsEncCtx,
-        pLayer: &'a SDqLayer,
-        ref_view: Option<&'a crate::encoder::rec_view::RoPicView>,
-        ref_ori_view: Option<&'a crate::encoder::rec_view::RoPicView>,
-    ) -> Self {
+    pub fn build(pCtx: &'a sWelsEncCtx, pLayer: &'a SDqLayer) -> Self {
+        use crate::encoder::picture::PicRef;
         use crate::encoder::svc_encode_slice as ses;
         use crate::encoder::svc_mode_decision::BLOCK_16x16;
         let func = pCtx.func_list();
         let sdf = &func.sSampleDealingFuncs;
         let vaa = pCtx.vaa_expect();
+        let vpp = pCtx.pVpp.as_deref();
+        let id_enc = pLayer.pEncPic;
+        let id_dec = pLayer.pDecPic;
+        let did = pLayer.sLayerInfo.sNalHeaderExt.uiDependencyId as usize;
+        let ref_ori = match pLayer.pRefOri[0] {
+            Some(PicRef::Src(id)) if Some(id) != id_enc && Some(id) != vaa.pCurPic => {
+                vpp.map(|v| v.m_pSpatialPicPool.get(id))
+            }
+            Some(PicRef::Rec(id)) if Some(id) != id_dec => pCtx.ref_list(did).map(|rl| rl.pic(id)),
+            _ => None,
+        };
+        let vaa_ref = vaa.pRefPic.and_then(|id| {
+            if Some(id) == id_enc || Some(id) == vaa.pCurPic {
+                None
+            } else {
+                vpp.map(|v| v.m_pSpatialPicPool.get(id))
+            }
+        });
         Self {
             layer: pLayer,
             func,
-            enc: layer_enc_view_expect(pLayer),
-            rec: ses::layer_rec_view_expect(pLayer),
-            refv: ref_view,
-            ref_ori_v: ref_ori_view,
             ref_pic: ses::layer_ref_pic(pCtx, pLayer),
+            ref_ori,
             vaa,
-            vaa_cur: vaa.pCurView.as_ref(),
-            vaa_ref: vaa.pRefView.as_ref(),
+            vaa_ref,
             chroma_qp_offset: ses::layer_pps_ref(pCtx, pLayer)
                 .map_or(0, |p| p.uiChromaQpIndexOffset) as i32,
             ctx_ref_pic_type: ses::ctx_ref_pic(pCtx).map_or(0, |p| p.iPictureType),
@@ -310,62 +285,46 @@ impl<'a> MdSliceCtx<'a> {
         }
         self.ref_pic.unwrap_or_else(default_pic)
     }
-
-    /// The reference picture's shared read-only view, built once per slice.
-    #[inline(always)]
-    pub fn refv(&self) -> &'a crate::encoder::rec_view::RoPicView {
-        static EMPTY_RO_VIEW: crate::encoder::rec_view::RoPicView =
-            crate::encoder::rec_view::RoPicView::empty();
-        self.refv.unwrap_or(&EMPTY_RO_VIEW)
-    }
 }
 
 impl<'a> MbCursors<'a> {
-    /// The nine cursors of the macroblock at `(mb_x, mb_y)`.
-    #[inline]
-    pub fn at(sc: &MdSliceCtx<'a>, mb_x: i32, mb_y: i32) -> Self {
-        let refv = sc.refv();
-        Self::from_views(sc.enc, refv, sc.rec, mb_x, mb_y)
+    /// Empty placeholder cursors for paths that never run P-slice mode decision.
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            ref_y: PlaneCursor::empty(),
+            ref_cb: PlaneCursor::empty(),
+            ref_cr: PlaneCursor::empty(),
+        }
     }
 
-    /// [`at`](Self::at) from the three views themselves.
-    ///
-    /// The loop stamps through this rather than through `at`, so that the borrow of
-    /// `SWelsMD::sctx` the views come from has ended before the result is written back
-    /// to `SWelsMD::mbc` — with the borrow live the nine cursors go through a stack
-    /// temporary.
-    #[inline]
-    pub fn from_views(
-        enc: &'a crate::encoder::rec_view::RoPicView,
-        refv: &'a crate::encoder::rec_view::RoPicView,
-        rec: &'a RecPicView,
-        mb_x: i32,
-        mb_y: i32,
-    ) -> Self {
+    /// The three reference cursors of the macroblock at `(mb_x, mb_y)`.
+    #[inline(always)]
+    pub fn at(sc: &MdSliceCtx<'a>, mb_x: i32, mb_y: i32) -> Self {
+        Self::from_ref_pic(sc.ref_pic(), mb_x, mb_y)
+    }
+
+    /// [`at`](Self::at) directly from the reference picture.
+    #[inline(always)]
+    pub fn from_ref_pic(ref_pic: &'a SPicture, mb_x: i32, mb_y: i32) -> Self {
         let (lx, ly) = ((mb_x as isize) << 4, (mb_y as isize) << 4);
         let (cx, cy) = ((mb_x as isize) << 3, (mb_y as isize) << 3);
         Self {
-            enc_y: enc.plane(0).cursor(lx, ly),
-            enc_cb: enc.plane(1).cursor(cx, cy),
-            enc_cr: enc.plane(2).cursor(cx, cy),
-            ref_y: refv.plane(0).cursor(lx, ly),
-            ref_cb: refv.plane(1).cursor(cx, cy),
-            ref_cr: refv.plane(2).cursor(cx, cy),
-            rec_y: rec.plane(0).cursor(lx, ly),
-            rec_cb: rec.plane(1).cursor(cx, cy),
-            rec_cr: rec.plane(2).cursor(cx, cy),
+            ref_y: ref_pic.plane(0).cursor(lx, ly),
+            ref_cb: ref_pic.plane(1).cursor(cx, cy),
+            ref_cr: ref_pic.plane(2).cursor(cx, cy),
         }
     }
 }
 
 #[repr(C)]
 pub struct SWelsMD<'a> {
-    /// The slice's resolved context, and the macroblock's cursors — `None` on the
-    /// paths that never built one (an I slice, and the unit tests), which is why
+    /// The slice's resolved context, and the macroblock's cursors — `None` / empty on
+    /// the paths that never built one (an I slice, and the unit tests), which is why
     /// every reader goes through [`SWelsMD::sc`] / [`SWelsMD::mbc`] rather than
     /// touching the fields.
     pub sctx: Option<&'a MdSliceCtx<'a>>,
-    pub mbc: Option<MbCursors<'a>>,
+    pub mbc: MbCursors<'a>,
     /// The reference picture's entries for this macroblock, stamped beside `mbc`.
     /// Zero on the paths that stamp nothing (an I slice, and the unit tests), which
     /// is also where nothing reads it.
@@ -404,20 +363,13 @@ impl<'a> SWelsMD<'a> {
                 static DEFAULT_VAA: std::sync::OnceLock<
                     crate::encoder::wels_preprocess::SVAAFrameInfo,
                 > = std::sync::OnceLock::new();
-                static EMPTY_RO: crate::encoder::rec_view::RoPicView =
-                    crate::encoder::rec_view::RoPicView::empty();
-                static EMPTY_REC: RecPicView = RecPicView::empty();
                 MdSliceCtx {
                     layer: DEFAULT_LAYER.get_or_init(SDqLayer::default),
                     func: DEFAULT_FUNC.get_or_init(SWelsFuncPtrList::default),
-                    enc: &EMPTY_RO,
-                    rec: &EMPTY_REC,
-                    refv: None,
-                    ref_ori_v: None,
                     ref_pic: None,
+                    ref_ori: None,
                     vaa: DEFAULT_VAA
                         .get_or_init(crate::encoder::wels_preprocess::SVAAFrameInfo::default),
-                    vaa_cur: None,
                     vaa_ref: None,
                     chroma_qp_offset: 0,
                     ctx_ref_pic_type: 0,
@@ -432,22 +384,10 @@ impl<'a> SWelsMD<'a> {
         self.sctx.unwrap_or_else(default_sc)
     }
 
-    /// The current macroblock's plane cursors.
+    /// The current macroblock's reference plane cursors.
     #[inline(always)]
     pub fn mbc(&self) -> &MbCursors<'a> {
-        static EMPTY_MBC: crate::encoder::rec_view::EmptySync<MbCursors<'static>> =
-            crate::encoder::rec_view::EmptySync(MbCursors {
-                enc_y: RecCursor::empty(),
-                enc_cb: RecCursor::empty(),
-                enc_cr: RecCursor::empty(),
-                ref_y: RecCursor::empty(),
-                ref_cb: RecCursor::empty(),
-                ref_cr: RecCursor::empty(),
-                rec_y: RecCursor::empty(),
-                rec_cb: RecCursor::empty(),
-                rec_cr: RecCursor::empty(),
-            });
-        self.mbc.as_ref().unwrap_or(&EMPTY_MBC.0)
+        &self.mbc
     }
 }
 
@@ -455,7 +395,7 @@ impl Default for SWelsMD<'_> {
     fn default() -> Self {
         Self {
             sctx: None,
-            mbc: None,
+            mbc: MbCursors::empty(),
             mbi: MbSideInfo::default(),
             iLambda: 0,
             pMvdCost: MvdCostCursor::none(),
@@ -475,8 +415,6 @@ impl Default for SWelsMD<'_> {
     }
 }
 
-pub type PCopyFunc =
-    unsafe extern "C" fn(pDst: *mut u8, iStrideD: i32, pSrc: *mut u8, iStrideS: i32);
 /// `PSampleSadSatdCostFunc` (`wels_func_ptr_def.h:127`) — one SAD or SATD of two
 /// equal-shaped blocks, the cost-table slot type of `SSampleDealingFunc::pfSampleSad`
 /// and `pfSampleSatd`.
@@ -485,7 +423,7 @@ pub type PCopyFunc =
 /// source macroblock, a reference block displaced by a candidate vector, or a
 /// prediction buffer in the arena — and each kernel reads `W` x `H` samples from both
 /// and nothing else. The block shape is the slot's index (`BLOCK_16x16` ..).
-pub type PSampleSadSatdCostFunc = fn(&RecCursor<'_>, &RecCursor<'_>) -> i32;
+pub type PSampleSadSatdCostFunc = fn(&PlaneCursor<'_>, &PlaneCursor<'_>) -> i32;
 
 /// The four fractional-pixel refinement planes, as **offsets** into the one buffer
 /// they all point into.
@@ -503,7 +441,7 @@ pub struct SMeRefinePointer {
     /// inter-prediction buffer, selected out of `SWelsFuncPtrList`'s `pfCopy*` table by
     /// partition shape in `WelsMdInterMbRefinement` and consumed once at the end of
     /// `MeRefineFracPixel`.
-    pub pfCopyBlockByMode: Option<fn(&RecCursor<'_>, &mut PlaneCursorMut<'_>)>,
+    pub pfCopyBlockByMode: Option<fn(&PlaneCursor<'_>, &mut PlaneCursorMut<'_>)>,
 }
 
 /// Plane bases inside `SMbCache.sBufferInterPredMe`, in bytes.
@@ -591,7 +529,7 @@ fn quar_candidate(
     span: usize,
     a: &MeQuarSource,
     b: &MeQuarSource,
-    cRef: &RecCursor<'_>,
+    cRef: &PlaneCursor<'_>,
     w: usize,
     h: usize,
 ) {
@@ -800,22 +738,19 @@ pub const fn best_pred_i4x4_blk4_off(uiBestPredI4x4Blk4Half: u8) -> usize {
     16 * uiBestPredI4x4Blk4Half as usize
 }
 
-/// `kpMbSkipSad` is the reconstruction picture's whole `pMbSkipSad` array, not a cursor
-/// into it; the four neighbour reads index `iMbXY + <offset>` against the root.
+/// `kpMbSkipSad` is this worker's slice of the reconstruction picture's `pMbSkipSad`
+/// array; the four neighbour reads index `iMbXY + <offset>` within the slice's MB rows,
+/// guarded by the slice-scoped `uiNeighborAvail`.
 ///
-/// Those reads are of *neighbouring* macroblocks — under multi-threading, of
-/// macroblocks that may belong to another worker's slice. They are guarded by the
-/// slice-scoped `uiNeighborAvail`, so the reads never cross.
-///
-/// `pVaaBgMbFlag` is the whole array too, indexed the same way; it lives on the one
+/// `pVaaBgMbFlag` is the whole array, indexed the same way; it lives on the one
 /// `SVAAFrameInfo` every worker shares.
 pub type PFillInterNeighborCacheFunc = fn(
     pMbCache: &mut SMbCache,
     mbs: &MbSplit<'_, SMB>,
     pVaaBgMbFlag: &[i8],
-    kpMbSkipSad: &SharedMbArray<i32>,
+    kpMbSkipSad: MbSlice<'_, i32>,
 );
-pub type PGetVarianceFromIntraVaaFunc = extern "C" fn(cEnc: &RecCursor<'_>) -> i32;
+pub type PGetVarianceFromIntraVaaFunc = fn(cEnc: &PlaneCursor<'_>) -> i32;
 // The four SADs arrive as the `[i32; 4]` `SVAACalcResult::pSad8x8` stores per
 // macroblock.
 pub type PGetMbSignFromInterVaaFunc = fn(kpSad8x8: &[i32; 4]) -> u8;
@@ -828,11 +763,10 @@ pub use crate::encoder::encoder_context::BLOCK_SIZE_ALL;
 pub use crate::encoder::encoder_context::SDCTCoeff;
 pub use crate::encoder::encoder_context::SPicData;
 pub use crate::encoder::encoder_context::sWelsEncCtx;
-use crate::encoder::rec_view::{RecCursor, RecPicView, SharedMbArray};
 pub use crate::encoder::svc_encode_slice::SDqLayer;
-use crate::encoder::svc_encode_slice::layer_enc_view_expect;
 pub use crate::encoder::svc_motion_estimate::PSample4SadCostFunc;
 pub use crate::encoder::wels_func_ptr_def::SWelsFuncPtrList;
+use crate::safe::mb_grid::MbSlice;
 use crate::safe::plane::{PlaneCursor, PlaneCursorMut};
 
 /// Which sibling cost array a selector in [`SSampleDealingFunc`] names.
@@ -1067,7 +1001,7 @@ fn fill_neighbor_cache_inter<const BGD: bool>(
     pMbCache: &mut SMbCache,
     mbs: &MbSplit<'_, SMB>,
     pVaaBgMbFlag: &[i8],
-    kpMbSkipSad: &SharedMbArray<i32>,
+    kpMbSkipSad: MbSlice<'_, i32>,
 ) {
     let uiNeighborAvail = mbs.cur().uiNeighborAvail as u32;
     let kiMbXY = mbs.cur().iMbXY as isize;
@@ -1224,7 +1158,7 @@ pub fn FillNeighborCacheInterWithoutBGD(
     pMbCache: &mut SMbCache,
     mbs: &MbSplit<'_, SMB>,
     _pVaaBgMbFlag: &[i8],
-    kpMbSkipSad: &SharedMbArray<i32>,
+    kpMbSkipSad: MbSlice<'_, i32>,
 ) {
     fill_neighbor_cache_inter::<false>(pMbCache, mbs, _pVaaBgMbFlag, kpMbSkipSad);
 }
@@ -1234,7 +1168,7 @@ pub fn FillNeighborCacheInterWithBGD(
     pMbCache: &mut SMbCache,
     mbs: &MbSplit<'_, SMB>,
     pVaaBgMbFlag: &[i8],
-    kpMbSkipSad: &SharedMbArray<i32>,
+    kpMbSkipSad: MbSlice<'_, i32>,
 ) {
     fill_neighbor_cache_inter::<true>(pMbCache, mbs, pVaaBgMbFlag, kpMbSkipSad);
 }
@@ -1301,7 +1235,7 @@ pub fn MdInterAnalysisVaaInfo_c(kpSad8x8: &[i32; 4]) -> u8 {
 }
 
 #[inline(always)]
-pub extern "C" fn AnalysisVaaInfoIntra_c(cEnc: &RecCursor<'_>) -> i32 {
+pub fn AnalysisVaaInfoIntra_c(cEnc: &PlaneCursor<'_>) -> i32 {
     use crate::safe::plane::{BlockRows, RefSamples};
     let span = cEnc.span::<16, 16>(0, 0);
     let mut iSumAvg: i32 = 0;
@@ -1335,7 +1269,7 @@ pub extern "C" fn InitIntraAnalysisVaaInfo(pFuncList: &mut SWelsFuncPtrList, _ku
 }
 
 #[inline(always)]
-pub fn MdIntraAnalysisVaaInfo(_pEncCtx: &sWelsEncCtx, cEncMb: &RecCursor<'_>) -> bool {
+pub fn MdIntraAnalysisVaaInfo(_pEncCtx: &sWelsEncCtx, cEncMb: &PlaneCursor<'_>) -> bool {
     let kiVariance = AnalysisVaaInfoIntra_c(cEncMb);
     kiVariance >= INTRA_VARIANCE_SAD_THRESHOLD
 }
@@ -1364,8 +1298,8 @@ pub fn MeRefineQuarPixel(
     pMe: &mut SWelsME<'_>,
     pMeRefine: &mut SMeRefinePointer,
     pMbCache: &mut SMbCache,
-    cEnc: &RecCursor<'_>,
-    cRef: &RecCursor<'_>,
+    cEnc: &PlaneCursor<'_>,
+    cRef: &PlaneCursor<'_>,
     kiWidth: i32,
     kiHeight: i32,
     pParams: &mut SQuarRefineParams,
@@ -1389,8 +1323,8 @@ pub fn MeRefineQuarPixel(
         h,
     );
     let mut iCurCost = {
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
             0,
             ME_REFINE_BUF_STRIDE as usize,
         );
@@ -1414,8 +1348,8 @@ pub fn MeRefineQuarPixel(
         h,
     );
     iCurCost = {
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
             0,
             ME_REFINE_BUF_STRIDE as usize,
         );
@@ -1439,8 +1373,8 @@ pub fn MeRefineQuarPixel(
         h,
     );
     iCurCost = {
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
             0,
             ME_REFINE_BUF_STRIDE as usize,
         );
@@ -1464,8 +1398,8 @@ pub fn MeRefineQuarPixel(
         h,
     );
     iCurCost = {
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[pMeRefine.quar_pix_tmp()..][..span],
             0,
             ME_REFINE_BUF_STRIDE as usize,
         );
@@ -1487,8 +1421,9 @@ pub fn MeRefineQuarPixel(
 ///
 /// `kiMemPredInterOff`, the destination of the final copy, is a `usize` offset into
 /// `sMemPredMb`.
-pub extern "C" fn MeRefineFracPixel(
+pub fn MeRefineFracPixel(
     sc: &MdSliceCtx<'_>,
+    cEnc: &PlaneCursor<'_>,
     kiMemPredInterOff: usize,
     pMe: &mut SWelsME<'_>,
     pMeRefine: &mut SMeRefinePointer,
@@ -1503,14 +1438,11 @@ pub extern "C" fn MeRefineFracPixel(
 
     let mut iHalfMvx = iMvx;
     let mut iHalfMvy = iMvy;
-    // The two blocks, by coordinate. `sMv` is quarter-pel here and the integer search
-    // left `pRefMb` at its whole-sample part, so `>> 2` is the displacement.
+    // The reference block by coordinate. `sMv` is quarter-pel here and the integer
+    // search left `pRefMb` at its whole-sample part, so `>> 2` is the displacement.
     let kiBlockX = pMe.iCurMeBlockPixX as isize;
     let kiBlockY = pMe.iCurMeBlockPixY as isize;
-    let pEncPicture = sc.enc;
-    let cEnc = pEncPicture.plane(0).cursor(kiBlockX, kiBlockY);
-    let pRefPicture = sc.refv();
-    let cRef = pRefPicture.plane(0).cursor(
+    let cRef = sc.ref_pic().plane(0).cursor(
         kiBlockX + ((iMvx as isize) >> 2),
         kiBlockY + ((iMvy as isize) >> 2),
     );
@@ -1556,7 +1488,7 @@ pub extern "C" fn MeRefineFracPixel(
                 (iMvy - pMe.sMvp.iMvY) as i32,
             );
     } else {
-        iBestCost = pfMeCost(&cEnc, &cRef)
+        iBestCost = pfMeCost(cEnc, &cRef)
             + COST_MVD(
                 pMe.pMvdCost,
                 (iMvx - pMe.sMvp.iMvX) as i32,
@@ -1584,12 +1516,12 @@ pub extern "C" fn MeRefineFracPixel(
     // computed before either comparison.
     let (iCostTop, iCostBottom) = {
         let off = pMeRefine.half_pix_v();
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[off..][..kiBufStride + span_wh(kiW, kiH)],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[off..][..kiBufStride + span_wh(kiW, kiH)],
             0,
             kiBufStride,
         );
-        (pfMeCost(&cEnc, &cTmp), pfMeCost(&cEnc, &cTmp.advance(0, 1)))
+        (pfMeCost(cEnc, &cTmp), pfMeCost(cEnc, &cTmp.advance(0, 1)))
     };
 
     // (0, -2) [TOP]
@@ -1633,12 +1565,12 @@ pub extern "C" fn MeRefineFracPixel(
     // plane the filter just wrote; one cursor over it, as above.
     let (iCostLeft, iCostRight) = {
         let off = pMeRefine.half_pix_h();
-        let cTmp = RecCursor::over_owned(
-            &mut pMbCache.sBufferInterPredMe[off..][..1 + span_wh(kiW, kiH)],
+        let cTmp = PlaneCursor::new(
+            &pMbCache.sBufferInterPredMe[off..][..1 + span_wh(kiW, kiH)],
             0,
             kiBufStride,
         );
-        (pfMeCost(&cEnc, &cTmp), pfMeCost(&cEnc, &cTmp.advance(1, 0)))
+        (pfMeCost(cEnc, &cTmp), pfMeCost(cEnc, &cTmp.advance(1, 0)))
     };
 
     // (-2, 0) [LEFT]
@@ -1822,7 +1754,7 @@ pub extern "C" fn MeRefineFracPixel(
         pMe,
         pMeRefine,
         pMbCache,
-        &cEnc,
+        cEnc,
         &cRef,
         iWidth,
         iHeight,
@@ -1865,8 +1797,8 @@ pub extern "C" fn MeRefineFracPixel(
                 sBufferInterPredMe,
                 ..
             } = &mut *pMbCache;
-            let cSrc = RecCursor::over_owned(
-                &mut sBufferInterPredMe[off..][..span_wh(kiW, kiH)],
+            let cSrc = PlaneCursor::new(
+                &sBufferInterPredMe[off..][..span_wh(kiW, kiH)],
                 0,
                 kiBufStride,
             );
