@@ -247,6 +247,12 @@ fn sad_rows(rows: &mut Vec<Row>) {
     );
     row!(
         *rows,
+        "sad 16x8",
+        |_| sample_sad::<16, 8, _>(&black_box(a), &black_box(b)) as u64,
+        |_| isa::sad::sample_sad_16x8(&black_box(a), &black_box(b)) as u64
+    );
+    row!(
+        *rows,
         "sad 8x8",
         |_| sample_sad::<8, 8, _>(&black_box(a), &black_box(b)) as u64,
         |_| isa::sad::sample_sad_8x8(&black_box(a), &black_box(b)) as u64
@@ -271,6 +277,20 @@ fn sad_rows(rows: &mut Vec<Row>) {
         |_| {
             let mut s = [0; 4];
             isa::sad::sample_sad_four_16x16(&black_box(a), &black_box(b), &mut s);
+            four(&mut s)
+        }
+    );
+    row!(
+        *rows,
+        "sad-four 16x8",
+        |_| {
+            let mut s = [0; 4];
+            sample_sad_four::<16, 8, _>(&black_box(a), &black_box(b), &mut s);
+            four(&mut s)
+        },
+        |_| {
+            let mut s = [0; 4];
+            isa::sad::sample_sad_four_16x8(&black_box(a), &black_box(b), &mut s);
             four(&mut s)
         }
     );
